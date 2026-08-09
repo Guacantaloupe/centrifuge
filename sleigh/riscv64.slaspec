@@ -1,0 +1,119 @@
+// RISC-V RV64IM (no compressed) language module for the ghra SLEIGH-lite engine
+// Spec language subset documented in include/ghra/sleigh.hpp and ROADMAP v0.3
+
+define space ram size=8 type=ram_space default;
+define space regs size=8 type=register_space;
+
+define register offset=0 size=8 [
+  zero ra sp gp tp t0 t1 t2 s0 s1 a0 a1 a2 a3 a4 a5 a6 a7
+  s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 t3 t4 t5 t6
+];
+
+token t32 (4) {
+  opcode = (6:0);
+  rd     = (11:7);
+  funct3 = (14:12);
+  rs1    = (19:15);
+  rs2    = (24:20);
+  funct7 = (31:25);
+  imm12  = (31:20);
+  imm20  = (31:12);
+  shamt  = (25:20);
+  simm12 = (31:25)@5, (11:7)@0;
+  bimm12 = (31:31)@12, (7:7)@11, (30:25)@5, (11:8)@1;
+  jimm20 = (31:31)@20, (19:12)@12, (20:20)@11, (30:21)@1;
+}
+
+attach variables [ rd ] [ zero ra sp gp tp t0 t1 t2 s0 s1 a0 a1 a2 a3 a4 a5 a6 a7 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 t3 t4 t5 t6 ];
+attach variables [ rs1 ] [ zero ra sp gp tp t0 t1 t2 s0 s1 a0 a1 a2 a3 a4 a5 a6 a7 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 t3 t4 t5 t6 ];
+attach variables [ rs2 ] [ zero ra sp gp tp t0 t1 t2 s0 s1 a0 a1 a2 a3 a4 a5 a6 a7 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 t3 t4 t5 t6 ];
+
+// ---- system / misc ----
+:ecall is opcode=0x73 & funct3=0 & imm12=0 & rs1=0 & rd=0 { };
+:ebreak is opcode=0x73 & funct3=0 & imm12=1 & rs1=0 & rd=0 { };
+:fence is opcode=0x0F & funct3=0 { };
+:fence.i is opcode=0x0F & funct3=1 { };
+
+// ---- upper immediates ----
+:lui rd, imm is opcode=0x37 & rd & imm20:imm { rd = sext(imm, 20) << 12; };
+:auipc rd, imm is opcode=0x17 & rd & imm20:imm { rd = inst_start + (sext(imm, 20) << 12); };
+
+// ---- jumps (specific forms first) ----
+:call target is opcode=0x6F & rd=1 & jimm20:target { ra = inst_next; call inst_next + sext(target, 21); };
+:jal rd, target is opcode=0x6F & rd & jimm20:target { rd = inst_next; goto inst_next + sext(target, 21); };
+:ret is opcode=0x67 & funct3=0 & rd=0 & rs1=1 & imm12=0 { return; };
+:jalr rd, rs1, imm is opcode=0x67 & funct3=0 & rd & rs1 & imm12:imm { rd = inst_next; goto rs1 + sext(imm, 12); };
+
+// ---- branches ----
+:beq rs1, rs2, target is opcode=0x63 & funct3=0 & rs1 & rs2 & bimm12:target { if (rs1 == rs2) goto inst_next + sext(target, 12); };
+:bne rs1, rs2, target is opcode=0x63 & funct3=1 & rs1 & rs2 & bimm12:target { if (rs1 != rs2) goto inst_next + sext(target, 12); };
+:blt rs1, rs2, target is opcode=0x63 & funct3=4 & rs1 & rs2 & bimm12:target { if (rs1 s< rs2) goto inst_next + sext(target, 12); };
+:bge rs1, rs2, target is opcode=0x63 & funct3=5 & rs1 & rs2 & bimm12:target { if (rs1 s>= rs2) goto inst_next + sext(target, 12); };
+:bltu rs1, rs2, target is opcode=0x63 & funct3=6 & rs1 & rs2 & bimm12:target { if (rs1 < rs2) goto inst_next + sext(target, 12); };
+:bgeu rs1, rs2, target is opcode=0x63 & funct3=7 & rs1 & rs2 & bimm12:target { if (rs1 >= rs2) goto inst_next + sext(target, 12); };
+
+// ---- loads ----
+:lb rd, rs1, imm is opcode=0x03 & funct3=0 & rd & rs1 & imm12:imm { rd = sext(load(rs1 + sext(imm, 12), 1), 8); };
+:lh rd, rs1, imm is opcode=0x03 & funct3=1 & rd & rs1 & imm12:imm { rd = sext(load(rs1 + sext(imm, 12), 2), 16); };
+:lw rd, rs1, imm is opcode=0x03 & funct3=2 & rd & rs1 & imm12:imm { rd = sext(load(rs1 + sext(imm, 12), 4), 32); };
+:ld rd, rs1, imm is opcode=0x03 & funct3=3 & rd & rs1 & imm12:imm { rd = load(rs1 + sext(imm, 12), 8); };
+:lbu rd, rs1, imm is opcode=0x03 & funct3=4 & rd & rs1 & imm12:imm { rd = zext(load(rs1 + sext(imm, 12), 1), 8); };
+:lhu rd, rs1, imm is opcode=0x03 & funct3=5 & rd & rs1 & imm12:imm { rd = zext(load(rs1 + sext(imm, 12), 2), 16); };
+:lwu rd, rs1, imm is opcode=0x03 & funct3=6 & rd & rs1 & imm12:imm { rd = zext(load(rs1 + sext(imm, 12), 4), 32); };
+
+// ---- stores ----
+:sb rs2, rs1, imm is opcode=0x23 & funct3=0 & rs2 & rs1 & simm12:imm { *(rs1 + sext(imm, 12)) = zext(rs2, 8); };
+:sh rs2, rs1, imm is opcode=0x23 & funct3=1 & rs2 & rs1 & simm12:imm { *(rs1 + sext(imm, 12)) = zext(rs2, 16); };
+:sw rs2, rs1, imm is opcode=0x23 & funct3=2 & rs2 & rs1 & simm12:imm { *(rs1 + sext(imm, 12)) = zext(rs2, 32); };
+:sd rs2, rs1, imm is opcode=0x23 & funct3=3 & rs2 & rs1 & simm12:imm { *(rs1 + sext(imm, 12)) = rs2; };
+
+// ---- OP-IMM ----
+:addi rd, rs1, imm is opcode=0x13 & funct3=0 & rd & rs1 & imm12:imm { rd = rs1 + sext(imm, 12); };
+:slti rd, rs1, imm is opcode=0x13 & funct3=2 & rd & rs1 & imm12:imm { rd = rs1 s< sext(imm, 12); };
+:sltiu rd, rs1, imm is opcode=0x13 & funct3=3 & rd & rs1 & imm12:imm { rd = rs1 < sext(imm, 12); };
+:xori rd, rs1, imm is opcode=0x13 & funct3=4 & rd & rs1 & imm12:imm { rd = rs1 ^ sext(imm, 12); };
+:ori rd, rs1, imm is opcode=0x13 & funct3=6 & rd & rs1 & imm12:imm { rd = rs1 | sext(imm, 12); };
+:andi rd, rs1, imm is opcode=0x13 & funct3=7 & rd & rs1 & imm12:imm { rd = rs1 & sext(imm, 12); };
+:slli rd, rs1, shamt is opcode=0x13 & funct3=1 & funct7=0 & rd & rs1 & shamt { rd = rs1 << shamt; };
+:srli rd, rs1, shamt is opcode=0x13 & funct3=5 & funct7=0 & rd & rs1 & shamt { rd = rs1 >> shamt; };
+:srai rd, rs1, shamt is opcode=0x13 & funct3=5 & funct7=0x20 & rd & rs1 & shamt { rd = rs1 s>> shamt; };
+
+// ---- OP-IMM-32 ----
+:addiw rd, rs1, imm is opcode=0x1B & funct3=0 & rd & rs1 & imm12:imm { rd = sext(rs1 + sext(imm, 12), 32); };
+:slliw rd, rs1, shamt is opcode=0x1B & funct3=1 & funct7=0 & rd & rs1 & shamt { rd = sext(rs1 << shamt, 32); };
+:srliw rd, rs1, shamt is opcode=0x1B & funct3=5 & funct7=0 & rd & rs1 & shamt { rd = sext(rs1 >> shamt, 32); };
+:sraiw rd, rs1, shamt is opcode=0x1B & funct3=5 & funct7=0x20 & rd & rs1 & shamt { rd = sext(rs1 s>> shamt, 32); };
+
+// ---- OP ----
+:add rd, rs1, rs2 is opcode=0x33 & funct3=0 & funct7=0 & rd & rs1 & rs2 { rd = rs1 + rs2; };
+:sub rd, rs1, rs2 is opcode=0x33 & funct3=0 & funct7=0x20 & rd & rs1 & rs2 { rd = rs1 - rs2; };
+:sll rd, rs1, rs2 is opcode=0x33 & funct3=1 & funct7=0 & rd & rs1 & rs2 { rd = rs1 << rs2; };
+:slt rd, rs1, rs2 is opcode=0x33 & funct3=2 & funct7=0 & rd & rs1 & rs2 { rd = rs1 s< rs2; };
+:sltu rd, rs1, rs2 is opcode=0x33 & funct3=3 & funct7=0 & rd & rs1 & rs2 { rd = rs1 < rs2; };
+:xor rd, rs1, rs2 is opcode=0x33 & funct3=4 & funct7=0 & rd & rs1 & rs2 { rd = rs1 ^ rs2; };
+:srl rd, rs1, rs2 is opcode=0x33 & funct3=5 & funct7=0 & rd & rs1 & rs2 { rd = rs1 >> rs2; };
+:sra rd, rs1, rs2 is opcode=0x33 & funct3=5 & funct7=0x20 & rd & rs1 & rs2 { rd = rs1 s>> rs2; };
+:or rd, rs1, rs2 is opcode=0x33 & funct3=6 & funct7=0 & rd & rs1 & rs2 { rd = rs1 | rs2; };
+:and rd, rs1, rs2 is opcode=0x33 & funct3=7 & funct7=0 & rd & rs1 & rs2 { rd = rs1 & rs2; };
+
+// ---- M extension ----
+:mul rd, rs1, rs2 is opcode=0x33 & funct3=0 & funct7=1 & rd & rs1 & rs2 { rd = rs1 * rs2; };
+:mulh rd, rs1, rs2 is opcode=0x33 & funct3=1 & funct7=1 & rd & rs1 & rs2 { rd = rs1 * rs2; };
+:mulhsu rd, rs1, rs2 is opcode=0x33 & funct3=2 & funct7=1 & rd & rs1 & rs2 { rd = rs1 * rs2; };
+:mulhu rd, rs1, rs2 is opcode=0x33 & funct3=3 & funct7=1 & rd & rs1 & rs2 { rd = rs1 * rs2; };
+:div rd, rs1, rs2 is opcode=0x33 & funct3=4 & funct7=1 & rd & rs1 & rs2 { rd = rs1 s/ rs2; };
+:divu rd, rs1, rs2 is opcode=0x33 & funct3=5 & funct7=1 & rd & rs1 & rs2 { rd = rs1 / rs2; };
+:rem rd, rs1, rs2 is opcode=0x33 & funct3=6 & funct7=1 & rd & rs1 & rs2 { rd = rs1 s% rs2; };
+:remu rd, rs1, rs2 is opcode=0x33 & funct3=7 & funct7=1 & rd & rs1 & rs2 { rd = rs1 % rs2; };
+
+// ---- OP-32 ----
+:addw rd, rs1, rs2 is opcode=0x3B & funct3=0 & funct7=0 & rd & rs1 & rs2 { rd = sext(rs1 + rs2, 32); };
+:subw rd, rs1, rs2 is opcode=0x3B & funct3=0 & funct7=0x20 & rd & rs1 & rs2 { rd = sext(rs1 - rs2, 32); };
+:sllw rd, rs1, rs2 is opcode=0x3B & funct3=1 & funct7=0 & rd & rs1 & rs2 { rd = sext(rs1 << rs2, 32); };
+:srlw rd, rs1, rs2 is opcode=0x3B & funct3=5 & funct7=0 & rd & rs1 & rs2 { rd = sext(rs1 >> rs2, 32); };
+:sraw rd, rs1, rs2 is opcode=0x3B & funct3=5 & funct7=0x20 & rd & rs1 & rs2 { rd = sext(rs1 s>> rs2, 32); };
+:mulw rd, rs1, rs2 is opcode=0x3B & funct3=0 & funct7=1 & rd & rs1 & rs2 { rd = sext(rs1 * rs2, 32); };
+:divw rd, rs1, rs2 is opcode=0x3B & funct3=4 & funct7=1 & rd & rs1 & rs2 { rd = sext(rs1 s/ rs2, 32); };
+:divuw rd, rs1, rs2 is opcode=0x3B & funct3=5 & funct7=1 & rd & rs1 & rs2 { rd = sext(rs1 / rs2, 32); };
+:remw rd, rs1, rs2 is opcode=0x3B & funct3=6 & funct7=1 & rd & rs1 & rs2 { rd = sext(rs1 s% rs2, 32); };
+:remuw rd, rs1, rs2 is opcode=0x3B & funct3=7 & funct7=1 & rd & rs1 & rs2 { rd = sext(rs1 % rs2, 32); };

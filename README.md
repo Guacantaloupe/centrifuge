@@ -6,15 +6,16 @@ scripting API. `ghra` reimplements that architecture in C++17, one layer at a
 time, with **zero external dependencies** — no Capstone, no LLVM, no libopcodes.
 All loaders, disassemblers and analysis are written from scratch in C++17.
 
-## Status (v0.2)
+## Status (v0.3 part 1)
 
 | Layer            | Ghidra equivalent | ghra status |
 |------------------|-------------------|-------------|
 | Memory model     | Address space / program image | ✅ `MemoryImage` |
 | Loaders          | `LoaderService` (ELF, PE, ...) | ✅ ELF32/ELF64, PE32/PE32+ |
 | Symbol table     | Symbol table / exports         | ✅ symtab+dynsym, PE exports |
-| Disassembler     | Sleigh + language modules      | ✅ hand-written x86/x86-64 + RISC-V decoders (pure C++) |
-| Function discovery | `FunctionAnalyzer`           | 🟡 symbol seeds + recursive-descent scan |
+| Disassembler     | Sleigh + language modules      | ✅ hand-written x86/x86-64 + RISC-V **and** SLEIGH-lite spec engine (p-code) |
+| p-code           | `PcodeOps` / varnodes          | ✅ `PcodeInsn` + interpreter (constant folding + concrete eval) |
+| Function discovery | `FunctionAnalyzer`           | 🟡 symbol seeds + recursive-descent scan (works on both backends) |
 | Decompiler       | `DecompInterface` (p-code → C) | ⛔ next milestone |
 | GUI              | Ghidra window                  | ⛔ later (ImGui/Qt) |
 
@@ -34,6 +35,9 @@ ghra <file> info               # format, arch, entry, sections, symbols
 ghra <file> funcs              # discovered functions
 ghra <file> disasm <addr> [n]  # disassemble n instructions
 ghra <file> dump <addr> <size> # hexdump
+ghra spec <spec.slaspec> <file> disasm <addr> [n]  # spec-driven disasm
+ghra spec <spec.slaspec> <file> funcs             # analysis via spec engine
+ghra spec <spec.slaspec> <file> pcode <addr> [n]  # Ghidra-style p-code IR
 ```
 
 Example:
@@ -57,9 +61,12 @@ src/loader_pe.cpp       PE32/PE32+ loader (sections, export table)
 src/disasm.cpp          Disassembler abstraction + builtin backends
 src/disasm_x86.cpp      hand-written x86 / x86-64 decoder
 src/disasm_riscv.cpp    hand-written RV32I/RV64I + M + C decoder
+src/pcode.cpp           p-code IR (varnodes, ops, interpreter)
+src/sleigh.cpp          SLEIGH-lite: spec parser, pattern matcher, p-code emitter
+sleigh/riscv64.slaspec  RISC-V RV64IM language module (spec data, not code)
 src/analysis.cpp        function discovery pass
 tools/make_samples.cpp  C++ test-binary generator (no Python, no assembler)
-include/ghra/*.hpp      public API (memory, loader, disasm, analysis)
+include/ghra/*.hpp      public API (memory, loader, disasm, pcode, sleigh, analysis)
 ```
 
 Design notes:
@@ -74,20 +81,24 @@ Design notes:
 - `findFunctions()` seeds from symbols/exports/entry, then recursive-descent
   scans, following direct calls (promoting targets to functions) and direct
   jumps. Sizes come from next-function distance.
+- The SLEIGH-lite engine (`src/sleigh.cpp`) is the v0.3 milestone: it parses
+  `.slaspec`-style specs (spaces, registers, tokens/fields, attach variables,
+  constructors with bit patterns) and emits p-code with constant folding and
+  branch-target resolution. `sleigh/riscv64.slaspec` is the first language
+  module — new ISAs now mean writing a spec, not C++ tables.
 
 ## Validation
 
-The decoders are validated instruction-by-instruction against GNU binutils
+Decoders are validated instruction-by-instruction against GNU binutils
 objdump (an independent decoder):
 
-- notepad.exe: 600 instructions — 0 byte errors, 0 boundary mismatches
-- kernel32.dll: 1750 instructions — 0 byte errors, 0 boundary mismatches
-- real RISC-V ELF (riscv64-unknown-elf-gcc output): identical to objdump,
-  including compressed (C ext) instructions
-
-The x86 decoder covers the common legacy integer/branch/SSE system
-instruction set (exact lengths). VEX/EVEX and x87 are not decoded yet — the
-sweep stops there until the Sleigh milestone lands.
+- hand-written x86-64: notepad.exe 600 insns + kernel32.dll 1750 insns —
+  0 byte errors, 0 boundary mismatches
+- hand-written RISC-V: matches objdump incl. compressed instructions
+- SLEIGH-lite RISC-V spec: real compiler output (fib recursion, array
+  loops, stack frames) — 120 insns, 0 mismatches vs objdump
+- `tests/test_sleigh.cpp`: spec disassembly + p-code interpreter semantics
+  (add/mulw/addi sign-extension/load/store/branch targets)
 
 ## Tests
 

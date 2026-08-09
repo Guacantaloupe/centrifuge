@@ -17,6 +17,8 @@ add_library(ghra_core STATIC
   src/disasm.cpp
   src/disasm_x86.cpp
   src/disasm_riscv.cpp
+  src/pcode.cpp
+  src/sleigh.cpp
   src/analysis.cpp
 )
 target_include_directories(ghra_core PUBLIC include)
@@ -26,3 +28,7 @@ target_link_libraries(ghra PRIVATE ghra_core)
 
 # Test-sample generator (pure C++, writes ELF32/ELF64/PE32+ test binaries)
 add_executable(make_samples tools/make_samples.cpp)
+
+# SLEIGH-lite engine + p-code interpreter unit tests
+add_executable(test_sleigh tests/test_sleigh.cpp)
+target_link_libraries(test_sleigh PRIVATE ghra_core)

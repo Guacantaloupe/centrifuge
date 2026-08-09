@@ -26,17 +26,32 @@ byte-level decoder is written from scratch (this is what makes the project
 - Roadmap items promoted: **string discovery, CFG-based function discovery,
   xrefs, call graph** (next)
 
-## 🎯 v0.3 — The Sleigh gap: spec-driven disassembly
-Ghidra's disassembler is driven by `.sla` language specs. This is the
-defining milestone — it replaces the hand-written tables with a general
-engine:
-1. A **p-code engine**: varnodes, micro-ops (COPY, INT_ADD, BRANCH, CALL,
-   LOAD/STORE, ...), a tiny interpreter + validator
-2. A **SLEIGH parser** for a practical subset of `.slaspec` (constructor
-   tables, operand fields, pattern matching, semantic sections emitting p-code)
-3. Port the x86/RISC-V decoders onto Sleigh specs (new ISAs then come from
-   spec files, not C++ tables)
-4. `ghra <file> pcode <addr>` — dump p-code listings
+## 🎯 v0.3 — The Sleigh gap: spec-driven disassembly (in progress)
+
+**✅ v0.3 part 1 (done):**
+- **p-code engine** (`include/ghra/pcode.hpp`, `src/pcode.cpp`): varnodes
+  (register/const/unique/ram), ~35 ops (COPY, INT_*, BOOL_*, BRANCH,
+  CBRANCH, CALL, RETURN, LOAD, STORE, SUBPIECE, ...), a straight-line
+  `PcodeInsn` per instruction, and an interpreter used for both constant
+  folding (branch targets) and concrete semantic validation
+- **SLEIGH-lite parser** (`src/sleigh.cpp`): `define space/register`,
+  `token` with bit fields (incl. composed fields with `@` placement for
+  split immediates), `attach variables`, constructors
+  (`:name ops is pattern { pcode }`) with first-match pattern semantics;
+  emits p-code with incremental constant folding; classifies instructions
+  (RET/CALL/JMP/JCC) and resolves branch targets from the folded p-code
+- **First language module** `sleigh/riscv64.slaspec` (RV64IM, ~55
+  constructors) — validated against objdump on real compiler output
+  (0 mismatches on 120 insns); unit-tested via `test_sleigh`
+
+**Next (v0.3 part 2):**
+1. Full Sleigh language coverage: subtable constructors, `build`,
+   `define pcodeop`, exports of register-relative operands, `*` priority
+2. Port the x86-64 decoder onto a spec (biggest single spec: ~600
+   constructors) so Capstone-free x86 also runs on the engine
+3. Compressed RISC-V (C ext) in the spec
+4. `ghra <file> pcode <addr>` — done; next: CFG construction from p-code
+   (basic blocks + dominators) as the decompiler front end
 
 ## 🎯 v0.4 — Decompiler front end
 - P-code → CFG (basic blocks, dominators)

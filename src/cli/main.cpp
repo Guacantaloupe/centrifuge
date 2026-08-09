@@ -9,12 +9,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "ghra/analysis.hpp"
 #include "ghra/disasm.hpp"
 #include "ghra/loader.hpp"
+#include "ghra/pcode.hpp"
+#include "ghra/sleigh.hpp"
 
 using namespace ghra;
 
@@ -153,6 +157,95 @@ void usage(const char* argv0) {
     std::printf("  %s <file> funcs\n", argv0);
     std::printf("  %s <file> disasm <addr> [count]\n", argv0);
     std::printf("  %s <file> dump <addr> <size>\n", argv0);
+    std::printf("  %s spec <spec.slaspec> <file> disasm <addr> [count]\n",
+                argv0);
+    std::printf("  %s spec <spec.slaspec> <file> funcs\n", argv0);
+    std::printf("  %s spec <spec.slaspec> <file> pcode <addr> [count]\n",
+                argv0);
+}
+
+std::shared_ptr<SleighEngine> loadSpecEngine(const char* path) {
+    std::ifstream f(path);
+    if (!f) {
+        std::fprintf(stderr, "ghra: cannot open spec: %s\n", path);
+        return nullptr;
+    }
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    auto eng = std::make_shared<SleighEngine>();
+    std::string err;
+    if (!eng->loadSpec(ss.str(), err)) {
+        std::fprintf(stderr, "ghra: spec error: %s\n", err.c_str());
+        return nullptr;
+    }
+    return eng;
+}
+
+int cmdPcode(const SleighEngine& eng, const Program& p, uint64_t addr,
+             uint64_t count) {
+    auto read = [&](uint64_t a, void* buf, size_t n) {
+        return p.memory.read(a, buf, n);
+    };
+    for (uint64_t i = 0; i < count; ++i) {
+        PcodeInsn pi;
+        std::string err;
+        if (!eng.disassemble(read, addr, pi, err)) {
+            std::printf("; undecodable at %s\n", hexAddr(addr).c_str());
+            break;
+        }
+        std::printf("%s: %s\n", hexAddr(addr).c_str(), pi.text.c_str());
+        for (const auto& op : pi.ops) {
+            std::string s = pOpName(op.op);
+            s += " ";
+            if (op.out) s += pi.varnodeName(op.out);
+            if (op.in0) s += std::string(", ") + pi.varnodeName(op.in0);
+            if (op.in1) s += std::string(", ") + pi.varnodeName(op.in1);
+            if (op.in2) s += std::string(", ") + pi.varnodeName(op.in2);
+            std::printf("    %s\n", s.c_str());
+        }
+        addr += pi.size;
+    }
+    return 0;
+}
+
+int cmdSpec(int argc, char** argv) {
+    // argv[2]=spec argv[3]=binary argv[4]=cmd ...
+    auto eng = loadSpecEngine(argv[2]);
+    if (!eng) return 1;
+    std::string err;
+    auto prog = loadFile(argv[3], err);
+    if (!prog) {
+        std::fprintf(stderr, "ghra: %s\n", err.c_str());
+        return 1;
+    }
+    const std::string cmd = argv[4];
+    if (cmd == "funcs") {
+        SpecDisassembler d(eng);
+        return cmdFuncs(*prog, &d);
+    }
+    if (cmd == "disasm") {
+        if (argc < 6) { usage(argv[0]); return 1; }
+        uint64_t addr = 0, count = 16;
+        if (!parseAddr(argv[5], addr)) {
+            std::fprintf(stderr, "ghra: bad address '%s'\n", argv[5]);
+            return 1;
+        }
+        if (argc >= 7) count = std::strtoull(argv[6], nullptr, 0);
+        SpecDisassembler d(eng);
+        return cmdDisasm(*prog, d, addr, count);
+    }
+    if (cmd == "pcode") {
+        if (argc < 6) { usage(argv[0]); return 1; }
+        uint64_t addr = 0, count = 8;
+        if (!parseAddr(argv[5], addr)) {
+            std::fprintf(stderr, "ghra: bad address '%s'\n", argv[5]);
+            return 1;
+        }
+        if (argc >= 7) count = std::strtoull(argv[6], nullptr, 0);
+        return cmdPcode(*eng, *prog, addr, count);
+    }
+    usage(argv[0]);
+    return 1;
 }
 
 } // namespace
@@ -164,6 +257,8 @@ int main(int argc, char** argv) {
     }
     const std::string path = argv[1];
     const std::string cmd = argv[2];
+
+    if (path == "spec") return cmdSpec(argc, argv);
 
     std::string err;
     auto prog = loadFile(path, err);

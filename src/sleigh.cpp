@@ -750,7 +750,9 @@ bool SleighEngine::loadSpec(const std::string& text, std::string& err) {
                 return false;
             }
             i++;
-            ctors_.push_back(std::move(c));
+        for (const auto& ct : c.terms)
+            if (ct.field.rfind("vex", 0) == 0) c.requiresVex = true;
+        ctors_.push_back(std::move(c));
         } else {
             std::string dbg;
             for (size_t k = (i > 3 ? i - 3 : 0); k <= i; ++k)
@@ -1052,6 +1054,11 @@ bool SleighEngine::disassemble(
         bool rex = false, rexw = false, rexr = false, rexx = false,
              rexb = false, op66 = false, opF2 = false, opF3 = false,
              addr67 = false;
+        bool vex = false;
+        int vexMap = 1;   // 1=0F, 2=0F38, 3=0F3A
+        int vexVvvv = -1; // 0-15, -1 = unused
+        bool vexW = false, vexL = false;
+        int vexPP = 0;
         int opsz = 4; // operand size in bytes
         int prefixLen = 0;
         bool haveModrm = false;
@@ -1075,7 +1082,39 @@ bool SleighEngine::disassemble(
             else if (b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 ||
                      b == 0x64 || b == 0x65) {
                 p++;
-            } else if (b >= 0x40 && b <= 0x4F) {
+            }
+            else if (b == 0xC5 && p + 1 < got) {
+                // VEX2: R vvvv W L pp0  (map=0F, pp1=0)
+                const uint8_t b2 = raw[p + 1];
+                xc.vex = true;
+                xc.rexr = !(b2 >> 7) & 1;
+                xc.rexb = false;
+                xc.rexx = false;
+                xc.vexVvvv = (~((b2 >> 3) & 0xF)) & 0xF;
+                xc.vexW = (b2 >> 1) & 1;
+                xc.vexL = (b2 >> 2) & 1;
+                xc.vexPP = b2 & 1;
+                xc.vexMap = 1;
+                p += 2;
+                break; // VEX is self-contained
+            }
+            else if (b == 0xC4 && p + 2 < got) {
+                // VEX3: R X B mmmmm | vvvv W L pp
+                const uint8_t b2 = raw[p + 1];
+                const uint8_t b3 = raw[p + 2];
+                xc.vex = true;
+                xc.rexr = !(b2 >> 7) & 1;
+                xc.rexx = !((b2 >> 6) & 1);
+                xc.rexb = !((b2 >> 5) & 1);
+                xc.vexMap = b2 & 0x1F;
+                xc.vexVvvv = (~((b3 >> 3) & 0xF)) & 0xF;
+                xc.vexW = (b3 >> 7) & 1;
+                xc.vexL = (b3 >> 2) & 1;
+                xc.vexPP = b3 & 3;
+                p += 3;
+                break; // VEX is self-contained; no prefixes after it
+            }
+            else if (b >= 0x40 && b <= 0x4F) {
                 xc.rex = true;
                 xc.rexw = b & 8;
                 xc.rexr = b & 4;
@@ -1115,7 +1154,11 @@ bool SleighEngine::disassemble(
     std::vector<std::pair<std::string, std::string>> magicExports;
     auto isMagic = [&](const std::string& n) {
         return archX86_ &&
-               (n == "acc" || n == "pfxf2" || n == "pfxf3" || n == "pfx66" ||
+               (n == "rregv" || n == "rmregv" || n == "acc" || n == "vex" ||
+                n == "vexmap" ||
+                n == "vexvvvv" || n.rfind("vexvvvv", 0) == 0 ||
+                n == "vexw" || n == "vexL" || n == "vexpp" ||
+                n == "pfxf2" || n == "pfxf3" || n == "pfx66" ||
                 n == "pfxnone" || n == "rexw" || n == "opsz" || n == "modrm" ||
                 n.rfind("modrm", 0) == 0 || n == "rreg" ||
                 n.rfind("rreg", 0) == 0 || n == "rmreg" ||
@@ -1215,9 +1258,29 @@ bool SleighEngine::disassemble(
         opValues.clear();
         opFields.clear();
         magicExports.clear();
+        if (xc.vex != c.requiresVex) continue;
         for (const auto& t : c.terms) {
             const std::string& fn = t.field;
             if (isMagic(fn)) {
+                if (fn == "vex") {
+                    if (!xc.vex) { ok = false; break; }
+                    continue;
+                }
+                if (fn == "vexmap" || fn == "vexw" || fn == "vexL" ||
+                    fn == "vexpp") {
+                    const uint64_t v = fn == "vexmap"
+                                           ? static_cast<uint64_t>(xc.vexMap)
+                                       : fn == "vexw"
+                                           ? (xc.vexW ? 1 : 0)
+                                       : fn == "vexL"
+                                           ? (xc.vexL ? 1 : 0)
+                                           : static_cast<uint64_t>(xc.vexPP);
+                    if (t.kind != SpecCtor::Term::FIELD_EQ || v != t.value) {
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
                 if (fn == "pfxf2" || fn == "pfxf3" || fn == "pfx66" ||
                     fn == "pfxnone") {
                     const bool have = fn == "pfxf2" ? xc.opF2
@@ -1401,7 +1464,7 @@ bool SleighEngine::disassemble(
         };
         if (xc.ripRel) {
             char b[24];
-            std::snprintf(b, sizeof(b), "0x%llx",
+            std::snprintf(b, sizeof(b), "[0x%llx]",
                           static_cast<unsigned long long>(addr + insnSize +
                                                           xc.disp));
             return b;
@@ -1469,7 +1532,16 @@ bool SleighEngine::disassemble(
 
     // materialize magic exports (registers, addresses, immediates)
     for (const auto& [opname, mname] : magicExports) {
-        if (mname == "acc") {
+        if (mname == "rregv" || mname == "rmregv") {
+            const int sz = xc.vexL ? 32 : 16;
+            out.named[opname] = x86RegVarnode(mname == "rregv" ? xc.regReg
+                                                               : xc.rmReg,
+                                              sz);
+        } else if (mname == "vexvvvv" || mname.rfind("vexvvvv", 0) == 0) {
+            const int sz = mname.size() > 7 ? atoi(mname.c_str() + 7) / 8
+                                            : (xc.vexL ? 32 : 16);
+            out.named[opname] = x86RegVarnode(xc.vexVvvv, sz);
+        } else if (mname == "acc") {
             const int sz = xc.rexw ? 8 : xc.opsz;
             out.named[opname] = x86RegVarnode(0, sz);
         } else if (mname == "sreg") {
@@ -1488,8 +1560,7 @@ bool SleighEngine::disassemble(
         } else if (mname == "rmmem") {
             const uint64_t ea = materializeAddr();
             auto it = out.varnodes.find(ea);
-            if (it != out.varnodes.end() && it->second.kind == Varnode::UNIQUE)
-                it->second.name = addrText();
+            if (it != out.varnodes.end()) it->second.name = addrText();
             out.named[opname] = ea;
         } else if (mname == "ea") {
             out.named[opname] = materializeAddr();

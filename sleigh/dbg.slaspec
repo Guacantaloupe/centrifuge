@@ -1,8 +1,0 @@
-define arch x86;
-token t15 (15) {
-opcode = (7:0);
-op2 = (15:8);
-op3 = (23:16);
-}
-:mov dst, src is opcode=0x8B & modrm1 & rreg:dst & rmreg:src { dst = src; };
-:xgetbv is opcode=0x0F & op2=0x01 & modrm2 & rreg=0 & rmreg=0 { };

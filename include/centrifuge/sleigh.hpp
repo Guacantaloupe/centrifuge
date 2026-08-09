@@ -66,6 +66,7 @@ struct SpecCtor {
         uint64_t value = 0;  // FIELD_EQ
     };
     std::vector<Term> terms;
+    bool requiresVex = false; // pattern contains a vex* term
 
     // parsed semantics (owned nodes)
     struct SExpr;

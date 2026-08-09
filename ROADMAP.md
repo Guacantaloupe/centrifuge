@@ -26,32 +26,40 @@ byte-level decoder is written from scratch (this is what makes the project
 - Roadmap items promoted: **string discovery, CFG-based function discovery,
   xrefs, call graph** (next)
 
-## 🎯 v0.3 — The Sleigh gap: spec-driven disassembly (in progress)
+## ✅ v0.3 — The Sleigh gap: spec-driven disassembly (done)
+- **p-code engine** (`pcode.hpp/cpp`): varnodes, ~35 ops, `PcodeInsn` per
+  instruction, interpreter (constant folding + concrete semantics)
+- **SLEIGH-lite parser** (`sleigh.cpp`): spaces, registers, tokens with bit
+  fields (incl. composed `(msb:lsb)@shift` fields), attach variables,
+  constructors with first-match patterns; multi-token support (16-bit
+  compressed + 32-bit base); emits p-code with incremental folding;
+  classifies RET/CALL/JMP/JCC and resolves branch targets
+- **`sleigh/riscv64.slaspec`**: full RV64IMC language module (~90
+  constructors incl. compressed) — validated vs objdump on real compiler
+  output, 0 mismatches
+- `test_sleigh`: disassembly + interpreter semantics tests
+- Fixed a real semantic bug found via decompilation: RISC-V branch/jump
+  targets are PC-relative to the instruction itself, not the next
+  instruction
 
-**✅ v0.3 part 1 (done):**
-- **p-code engine** (`include/ghra/pcode.hpp`, `src/pcode.cpp`): varnodes
-  (register/const/unique/ram), ~35 ops (COPY, INT_*, BOOL_*, BRANCH,
-  CBRANCH, CALL, RETURN, LOAD, STORE, SUBPIECE, ...), a straight-line
-  `PcodeInsn` per instruction, and an interpreter used for both constant
-  folding (branch targets) and concrete semantic validation
-- **SLEIGH-lite parser** (`src/sleigh.cpp`): `define space/register`,
-  `token` with bit fields (incl. composed fields with `@` placement for
-  split immediates), `attach variables`, constructors
-  (`:name ops is pattern { pcode }`) with first-match pattern semantics;
-  emits p-code with incremental constant folding; classifies instructions
-  (RET/CALL/JMP/JCC) and resolves branch targets from the folded p-code
-- **First language module** `sleigh/riscv64.slaspec` (RV64IM, ~55
-  constructors) — validated against objdump on real compiler output
-  (0 mismatches on 120 insns); unit-tested via `test_sleigh`
+## ✅ v0.4-lite — CFG + first C decompiler (done)
+- **CFG** (`cfg.cpp`): basic blocks from p-code (fallthrough-first edges,
+  block-start boundaries), iterative dominators, DOT output
+- **Decompiler** (`decompile.cpp`): per-block p-code expression
+  reconstruction (copy propagation through temps, constant folding, 32-bit
+  SUBPIECE+INT_SEXT as `(int64_t)(int32_t)(uint32_t)(x)` casts), registers
+  as single C variables (no SSA versioning needed — C sequential semantics
+  match the machine, and joins come out correct), if/return structuring for
+  single-pred return blocks, goto/labels elsewhere
+- **Round-trip verified**: decompiled compute/max3/absdiff compile and
+  produce identical results to the original C on 20 test vectors
 
-**Next (v0.3 part 2):**
-1. Full Sleigh language coverage: subtable constructors, `build`,
-   `define pcodeop`, exports of register-relative operands, `*` priority
-2. Port the x86-64 decoder onto a spec (biggest single spec: ~600
-   constructors) so Capstone-free x86 also runs on the engine
-3. Compressed RISC-V (C ext) in the spec
-4. `ghra <file> pcode <addr>` — done; next: CFG construction from p-code
-   (basic blocks + dominators) as the decompiler front end
+## 🎯 v0.4 — Decompiler front end (remaining)
+- SSA + phi nodes (needed for full register-liveness correctness)
+- Stack-frame recovery (sp-relative locals) — unlocks non-leaf functions
+- Call argument tracking (a0-a7 by convention) and CALL emission
+- Loop structuring (while/for via dominators)
+- Type propagation to clean up the cast noise
 
 ## 🎯 v0.4 — Decompiler front end
 - P-code → CFG (basic blocks, dominators)

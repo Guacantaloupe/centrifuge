@@ -1,5 +1,6 @@
-// RISC-V RV64IM (no compressed) language module for the ghra SLEIGH-lite engine
+// RISC-V RV64IMC language module for the ghra SLEIGH-lite engine
 // Spec language subset documented in include/ghra/sleigh.hpp and ROADMAP v0.3
+// Covers: RV64I + M extension + W-variants + compressed (C) extension.
 
 define space ram size=8 type=ram_space default;
 define space regs size=8 type=register_space;
@@ -9,6 +10,74 @@ define register offset=0 size=8 [
   s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 t3 t4 t5 t6
 ];
 
+// ===================== compressed (C extension, 16-bit) =====================
+token t16 (2) {
+  quad    = (1:0);
+  f3c     = (15:13);
+  f2c     = (12:11);
+  funct6c = (15:10);
+  subop   = (6:5);
+  rdc     = (11:7);
+  rs2c    = (6:2);
+  rd8c    = (4:2);   // x8 + field
+  rs18c   = (9:7);   // x8 + field
+  shamt6  = (12:12)@5, (6:2)@0;
+  i_addi  = (12:12)@5, (6:2)@0;
+  i_cj    = (12:12)@11, (8:8)@10, (10:10)@9, (9:9)@8, (6:6)@7, (7:7)@6, (2:2)@5, (11:11)@4, (5:3)@1;
+  i_cb    = (12:12)@8, (6:5)@6, (2:2)@5, (11:10)@3, (4:3)@1;
+  i_lw    = (5:5)@7, (12:10)@4, (6:6)@3;   // uimm << 2
+  i_ld    = (6:5)@8, (12:10)@6;            // uimm << 3
+  i_addi4 = (10:7)@4, (12:11)@8, (5:5)@3, (6:6)@2;  // nzuimm << 2
+  i_addi16 = (12:12)@9, (4:4)@8, (3:3)@7, (5:5)@6, (2:2)@5, (6:6)@4;  // << 4
+  i_lui   = (12:12)@5, (6:2)@0;
+  i_lwsp  = (3:2)@2, (12:12)@4, (6:4)@5;   // uimm << 2
+  i_ldsp  = (4:2)@6, (12:12)@5, (6:5)@3;   // uimm << 3
+  i_swsp  = (8:7)@6, (12:9)@2;             // uimm << 2
+  i_sdsp  = (9:7)@6, (12:10)@3;            // uimm << 3
+}
+
+attach variables [ rdc ] [ zero ra sp gp tp t0 t1 t2 s0 s1 a0 a1 a2 a3 a4 a5 a6 a7 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 t3 t4 t5 t6 ];
+attach variables [ rs2c ] [ zero ra sp gp tp t0 t1 t2 s0 s1 a0 a1 a2 a3 a4 a5 a6 a7 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 t3 t4 t5 t6 ];
+attach variables [ rd8c ] [ s0 s1 a0 a1 a2 a3 a4 a5 ];
+attach variables [ rs18c ] [ s0 s1 a0 a1 a2 a3 a4 a5 ];
+
+:c.addi4spn rd, imm is quad=0 & f3c=0 & rd8c:rd & i_addi4:imm { rd = sp + zext(imm, 10); };
+:c.lw rd, rs1, imm is quad=0 & f3c=2 & rd8c:rd & rs18c:rs1 & i_lw:imm { rd = sext(load(rs1 + zext(imm, 8), 4), 32); };
+:c.ld rd, rs1, imm is quad=0 & f3c=3 & rd8c:rd & rs18c:rs1 & i_ld:imm { rd = load(rs1 + zext(imm, 9), 8); };
+:c.sw rs2, rs1, imm is quad=0 & f3c=6 & rd8c:rs2 & rs18c:rs1 & i_lw:imm { *(rs1 + zext(imm, 8)) = zext(rs2, 32); };
+:c.sd rs2, rs1, imm is quad=0 & f3c=7 & rd8c:rs2 & rs18c:rs1 & i_ld:imm { *(rs1 + zext(imm, 9)) = rs2; };
+
+:c.nop is quad=1 & f3c=0 & rdc=0 & i_addi=0 { };
+:c.addi rd, imm is quad=1 & f3c=0 & rdc:rd & i_addi:imm { rd = rd + sext(imm, 6); };
+:c.addiw rd, imm is quad=1 & f3c=1 & rdc:rd & i_addi:imm { rd = sext(rd + sext(imm, 6), 32); };
+:c.li rd, imm is quad=1 & f3c=2 & rdc:rd & i_addi:imm { rd = sext(imm, 6); };
+:c.addi16sp is quad=1 & f3c=3 & rdc=2 & i_addi16:imm { sp = sp + sext(imm, 10); };
+:c.lui rd, imm is quad=1 & f3c=3 & rdc:rd & i_lui:imm { rd = sext(imm, 6) << 12; };
+:c.srli rd, shamt is quad=1 & f3c=4 & f2c=0 & rs18c:rd & shamt6:shamt { rd = rd >> zext(shamt, 6); };
+:c.srai rd, shamt is quad=1 & f3c=4 & f2c=1 & rs18c:rd & shamt6:shamt { rd = rd s>> zext(shamt, 6); };
+:c.andi rd, imm is quad=1 & f3c=4 & f2c=2 & rs18c:rd & i_addi:imm { rd = rd & sext(imm, 6); };
+:c.sub rd, rs2 is quad=1 & f3c=4 & f2c=3 & funct6c=0x23 & subop=0 & rs18c:rd & rd8c:rs2 { rd = rd - rs2; };
+:c.xor rd, rs2 is quad=1 & f3c=4 & f2c=3 & funct6c=0x23 & subop=1 & rs18c:rd & rd8c:rs2 { rd = rd ^ rs2; };
+:c.or rd, rs2 is quad=1 & f3c=4 & f2c=3 & funct6c=0x23 & subop=2 & rs18c:rd & rd8c:rs2 { rd = rd | rs2; };
+:c.and rd, rs2 is quad=1 & f3c=4 & f2c=3 & funct6c=0x23 & subop=3 & rs18c:rd & rd8c:rs2 { rd = rd & rs2; };
+:c.addw rd, rs2 is quad=1 & f3c=4 & f2c=3 & funct6c=0x27 & rs18c:rd & rd8c:rs2 { rd = sext(rd + rs2, 32); };
+:c.j target is quad=1 & f3c=5 & i_cj:target { goto inst_start + sext(target, 12); };
+:c.beqz rs1, target is quad=1 & f3c=6 & rs18c:rs1 & i_cb:target { if (rs1 == 0) goto inst_start + sext(target, 9); };
+:c.bnez rs1, target is quad=1 & f3c=7 & rs18c:rs1 & i_cb:target { if (rs1 != 0) goto inst_start + sext(target, 9); };
+
+:ret is quad=2 & f3c=4 & f2c=0 & rdc=1 & rs2c=0 { return; };
+:c.jr rs1 is quad=2 & f3c=4 & f2c=0 & rs2c=0 & rdc:rs1 { goto rs1; };
+:c.mv rd, rs2 is quad=2 & f3c=4 & f2c=0 & rdc:rd & rs2c:rs2 { rd = rs2; };
+:c.ebreak is quad=2 & f3c=4 & f2c=1 & rdc=0 & rs2c=0 { };
+:c.jalr rd is quad=2 & f3c=4 & f2c=1 & rs2c=0 & rdc:rd { call rd; };
+:c.add rd, rs2 is quad=2 & f3c=4 & f2c=1 & rdc:rd & rs2c:rs2 { rd = rd + rs2; };
+:c.slli rd, shamt is quad=2 & f3c=0 & rdc:rd & shamt6:shamt { rd = rd << zext(shamt, 6); };
+:c.lwsp rd, imm is quad=2 & f3c=2 & rdc:rd & i_lwsp:imm { rd = sext(load(sp + zext(imm, 8), 4), 32); };
+:c.ldsp rd, imm is quad=2 & f3c=3 & rdc:rd & i_ldsp:imm { rd = load(sp + zext(imm, 9), 8); };
+:c.swsp rs2, imm is quad=2 & f3c=6 & rs2c:rs2 & i_swsp:imm { *(sp + zext(imm, 8)) = zext(rs2, 32); };
+:c.sdsp rs2, imm is quad=2 & f3c=7 & rs2c:rs2 & i_sdsp:imm { *(sp + zext(imm, 9)) = rs2; };
+
+// ===================== base (32-bit) =====================
 token t32 (4) {
   opcode = (6:0);
   rd     = (11:7);
@@ -39,18 +108,18 @@ attach variables [ rs2 ] [ zero ra sp gp tp t0 t1 t2 s0 s1 a0 a1 a2 a3 a4 a5 a6 
 :auipc rd, imm is opcode=0x17 & rd & imm20:imm { rd = inst_start + (sext(imm, 20) << 12); };
 
 // ---- jumps (specific forms first) ----
-:call target is opcode=0x6F & rd=1 & jimm20:target { ra = inst_next; call inst_next + sext(target, 21); };
-:jal rd, target is opcode=0x6F & rd & jimm20:target { rd = inst_next; goto inst_next + sext(target, 21); };
+:call target is opcode=0x6F & rd=1 & jimm20:target { ra = inst_next; call inst_start + sext(target, 21); };
+:jal rd, target is opcode=0x6F & rd & jimm20:target { rd = inst_next; goto inst_start + sext(target, 21); };
 :ret is opcode=0x67 & funct3=0 & rd=0 & rs1=1 & imm12=0 { return; };
 :jalr rd, rs1, imm is opcode=0x67 & funct3=0 & rd & rs1 & imm12:imm { rd = inst_next; goto rs1 + sext(imm, 12); };
 
 // ---- branches ----
-:beq rs1, rs2, target is opcode=0x63 & funct3=0 & rs1 & rs2 & bimm12:target { if (rs1 == rs2) goto inst_next + sext(target, 12); };
-:bne rs1, rs2, target is opcode=0x63 & funct3=1 & rs1 & rs2 & bimm12:target { if (rs1 != rs2) goto inst_next + sext(target, 12); };
-:blt rs1, rs2, target is opcode=0x63 & funct3=4 & rs1 & rs2 & bimm12:target { if (rs1 s< rs2) goto inst_next + sext(target, 12); };
-:bge rs1, rs2, target is opcode=0x63 & funct3=5 & rs1 & rs2 & bimm12:target { if (rs1 s>= rs2) goto inst_next + sext(target, 12); };
-:bltu rs1, rs2, target is opcode=0x63 & funct3=6 & rs1 & rs2 & bimm12:target { if (rs1 < rs2) goto inst_next + sext(target, 12); };
-:bgeu rs1, rs2, target is opcode=0x63 & funct3=7 & rs1 & rs2 & bimm12:target { if (rs1 >= rs2) goto inst_next + sext(target, 12); };
+:beq rs1, rs2, target is opcode=0x63 & funct3=0 & rs1 & rs2 & bimm12:target { if (rs1 == rs2) goto inst_start + sext(target, 12); };
+:bne rs1, rs2, target is opcode=0x63 & funct3=1 & rs1 & rs2 & bimm12:target { if (rs1 != rs2) goto inst_start + sext(target, 12); };
+:blt rs1, rs2, target is opcode=0x63 & funct3=4 & rs1 & rs2 & bimm12:target { if (rs1 s< rs2) goto inst_start + sext(target, 12); };
+:bge rs1, rs2, target is opcode=0x63 & funct3=5 & rs1 & rs2 & bimm12:target { if (rs1 s>= rs2) goto inst_start + sext(target, 12); };
+:bltu rs1, rs2, target is opcode=0x63 & funct3=6 & rs1 & rs2 & bimm12:target { if (rs1 < rs2) goto inst_start + sext(target, 12); };
+:bgeu rs1, rs2, target is opcode=0x63 & funct3=7 & rs1 & rs2 & bimm12:target { if (rs1 >= rs2) goto inst_start + sext(target, 12); };
 
 // ---- loads ----
 :lb rd, rs1, imm is opcode=0x03 & funct3=0 & rd & rs1 & imm12:imm { rd = sext(load(rs1 + sext(imm, 12), 1), 8); };
@@ -74,15 +143,15 @@ attach variables [ rs2 ] [ zero ra sp gp tp t0 t1 t2 s0 s1 a0 a1 a2 a3 a4 a5 a6 
 :xori rd, rs1, imm is opcode=0x13 & funct3=4 & rd & rs1 & imm12:imm { rd = rs1 ^ sext(imm, 12); };
 :ori rd, rs1, imm is opcode=0x13 & funct3=6 & rd & rs1 & imm12:imm { rd = rs1 | sext(imm, 12); };
 :andi rd, rs1, imm is opcode=0x13 & funct3=7 & rd & rs1 & imm12:imm { rd = rs1 & sext(imm, 12); };
-:slli rd, rs1, shamt is opcode=0x13 & funct3=1 & funct7=0 & rd & rs1 & shamt { rd = rs1 << shamt; };
-:srli rd, rs1, shamt is opcode=0x13 & funct3=5 & funct7=0 & rd & rs1 & shamt { rd = rs1 >> shamt; };
-:srai rd, rs1, shamt is opcode=0x13 & funct3=5 & funct7=0x20 & rd & rs1 & shamt { rd = rs1 s>> shamt; };
+:slli rd, rs1, shamt is opcode=0x13 & funct3=1 & funct7=0 & rd & rs1 & shamt { rd = rs1 << zext(shamt, 6); };
+:srli rd, rs1, shamt is opcode=0x13 & funct3=5 & funct7=0 & rd & rs1 & shamt { rd = rs1 >> zext(shamt, 6); };
+:srai rd, rs1, shamt is opcode=0x13 & funct3=5 & funct7=0x20 & rd & rs1 & shamt { rd = rs1 s>> zext(shamt, 6); };
 
 // ---- OP-IMM-32 ----
 :addiw rd, rs1, imm is opcode=0x1B & funct3=0 & rd & rs1 & imm12:imm { rd = sext(rs1 + sext(imm, 12), 32); };
-:slliw rd, rs1, shamt is opcode=0x1B & funct3=1 & funct7=0 & rd & rs1 & shamt { rd = sext(rs1 << shamt, 32); };
-:srliw rd, rs1, shamt is opcode=0x1B & funct3=5 & funct7=0 & rd & rs1 & shamt { rd = sext(rs1 >> shamt, 32); };
-:sraiw rd, rs1, shamt is opcode=0x1B & funct3=5 & funct7=0x20 & rd & rs1 & shamt { rd = sext(rs1 s>> shamt, 32); };
+:slliw rd, rs1, shamt is opcode=0x1B & funct3=1 & funct7=0 & rd & rs1 & shamt { rd = sext(rs1 << zext(shamt, 5), 32); };
+:srliw rd, rs1, shamt is opcode=0x1B & funct3=5 & funct7=0 & rd & rs1 & shamt { rd = sext(rs1 >> zext(shamt, 5), 32); };
+:sraiw rd, rs1, shamt is opcode=0x1B & funct3=5 & funct7=0x20 & rd & rs1 & shamt { rd = sext(rs1 s>> zext(shamt, 5), 32); };
 
 // ---- OP ----
 :add rd, rs1, rs2 is opcode=0x33 & funct3=0 & funct7=0 & rd & rs1 & rs2 { rd = rs1 + rs2; };

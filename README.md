@@ -6,17 +6,18 @@ scripting API. `ghra` reimplements that architecture in C++17, one layer at a
 time, with **zero external dependencies** — no Capstone, no LLVM, no libopcodes.
 All loaders, disassemblers and analysis are written from scratch in C++17.
 
-## Status (v0.3 part 1)
+## Status (v0.4-lite)
 
 | Layer            | Ghidra equivalent | ghra status |
 |------------------|-------------------|-------------|
 | Memory model     | Address space / program image | ✅ `MemoryImage` |
 | Loaders          | `LoaderService` (ELF, PE, ...) | ✅ ELF32/ELF64, PE32/PE32+ |
 | Symbol table     | Symbol table / exports         | ✅ symtab+dynsym, PE exports |
-| Disassembler     | Sleigh + language modules      | ✅ hand-written x86/x86-64 + RISC-V **and** SLEIGH-lite spec engine (p-code) |
-| p-code           | `PcodeOps` / varnodes          | ✅ `PcodeInsn` + interpreter (constant folding + concrete eval) |
-| Function discovery | `FunctionAnalyzer`           | 🟡 symbol seeds + recursive-descent scan (works on both backends) |
-| Decompiler       | `DecompInterface` (p-code → C) | ⛔ next milestone |
+| Disassembler     | Sleigh + language modules      | ✅ hand-written x86/x86-64 + RISC-V **and** SLEIGH-lite spec engine |
+| p-code           | `PcodeOps` / varnodes          | ✅ `PcodeInsn` + interpreter |
+| CFG + dominators | `BasicBlockModel`             | ✅ `cfg.cpp` (blocks, edges, iterative dominators, DOT) |
+| Function discovery | `FunctionAnalyzer`           | 🟡 symbol seeds + recursive-descent scan (both backends) |
+| Decompiler       | `DecompInterface`             | 🟡 v0.4-lite: expression reconstruction + if/return structuring + register-level C (round-trip verified) |
 | GUI              | Ghidra window                  | ⛔ later (ImGui/Qt) |
 
 ## Building
@@ -37,7 +38,9 @@ ghra <file> disasm <addr> [n]  # disassemble n instructions
 ghra <file> dump <addr> <size> # hexdump
 ghra spec <spec.slaspec> <file> disasm <addr> [n]  # spec-driven disasm
 ghra spec <spec.slaspec> <file> funcs             # analysis via spec engine
-ghra spec <spec.slaspec> <file> pcode <addr> [n]  # Ghidra-style p-code IR
+ghra spec <spec.slaspec> <file> pcode <addr> [count]  # Ghidra-style p-code IR
+ghra spec <spec.slaspec> <file> cfg <addr> [end]      # CFG + dominators
+ghra spec <spec.slaspec> <file> decompile <addr> [end] # C decompilation
 ```
 
 Example:
@@ -63,10 +66,13 @@ src/disasm_x86.cpp      hand-written x86 / x86-64 decoder
 src/disasm_riscv.cpp    hand-written RV32I/RV64I + M + C decoder
 src/pcode.cpp           p-code IR (varnodes, ops, interpreter)
 src/sleigh.cpp          SLEIGH-lite: spec parser, pattern matcher, p-code emitter
-sleigh/riscv64.slaspec  RISC-V RV64IM language module (spec data, not code)
+src/cfg.cpp             CFG construction + iterative dominators
+src/decompile.cpp       v0.4-lite C decompiler (expression reconstruction,
+                        register-level output, if/return structuring)
+sleigh/riscv64.slaspec  RISC-V RV64IMC language module (incl. compressed)
 src/analysis.cpp        function discovery pass
 tools/make_samples.cpp  C++ test-binary generator (no Python, no assembler)
-include/ghra/*.hpp      public API (memory, loader, disasm, pcode, sleigh, analysis)
+include/ghra/*.hpp      public API
 ```
 
 Design notes:
@@ -95,10 +101,13 @@ objdump (an independent decoder):
 - hand-written x86-64: notepad.exe 600 insns + kernel32.dll 1750 insns —
   0 byte errors, 0 boundary mismatches
 - hand-written RISC-V: matches objdump incl. compressed instructions
-- SLEIGH-lite RISC-V spec: real compiler output (fib recursion, array
-  loops, stack frames) — 120 insns, 0 mismatches vs objdump
+- SLEIGH-lite RISC-V spec: RV64IM + compressed (C ext) — real compiler
+  output (fib recursion, array loops, stack frames) — 0 mismatches vs objdump
 - `tests/test_sleigh.cpp`: spec disassembly + p-code interpreter semantics
-  (add/mulw/addi sign-extension/load/store/branch targets)
+- **Decompiler round-trip** (`tests/roundtrip.py`): decompile `compute`/
+  `max3`/`absdiff`, compile the emitted C, run 20 test vectors — output is
+  byte-identical to the original C's results. Recovers idioms like
+  `abs(x) = x^(x>>31)-(x>>31)` and `if (x>100) return x-100; return x;`
 
 ## Tests
 

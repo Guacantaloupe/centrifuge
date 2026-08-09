@@ -15,6 +15,8 @@
 #include <vector>
 
 #include "ghra/analysis.hpp"
+#include "ghra/cfg.hpp"
+#include "ghra/decompile.hpp"
 #include "ghra/disasm.hpp"
 #include "ghra/loader.hpp"
 #include "ghra/pcode.hpp"
@@ -162,6 +164,9 @@ void usage(const char* argv0) {
     std::printf("  %s spec <spec.slaspec> <file> funcs\n", argv0);
     std::printf("  %s spec <spec.slaspec> <file> pcode <addr> [count]\n",
                 argv0);
+    std::printf("  %s spec <spec.slaspec> <file> cfg <addr> [end]\n", argv0);
+    std::printf("  %s spec <spec.slaspec> <file> decompile <addr> [end]\n",
+                argv0);
 }
 
 std::shared_ptr<SleighEngine> loadSpecEngine(const char* path) {
@@ -218,6 +223,9 @@ int cmdSpec(int argc, char** argv) {
         std::fprintf(stderr, "ghra: %s\n", err.c_str());
         return 1;
     }
+    auto reader = [&](uint64_t a, void* buf, size_t n) {
+        return prog->memory.read(a, buf, n);
+    };
     const std::string cmd = argv[4];
     if (cmd == "funcs") {
         SpecDisassembler d(eng);
@@ -243,6 +251,47 @@ int cmdSpec(int argc, char** argv) {
         }
         if (argc >= 7) count = std::strtoull(argv[6], nullptr, 0);
         return cmdPcode(*eng, *prog, addr, count);
+    }
+    if (cmd == "cfg") {
+        if (argc < 6) { usage(argv[0]); return 1; }
+        uint64_t addr = 0;
+        if (!parseAddr(argv[5], addr)) {
+            std::fprintf(stderr, "ghra: bad address '%s'\n", argv[5]);
+            return 1;
+        }
+        uint64_t end = 0;
+        if (argc >= 7) end = std::strtoull(argv[6], nullptr, 0);
+        CfgBuilder cfg;
+        if (!cfg.build(*eng, reader, addr, end)) {
+            std::fprintf(stderr, "ghra: cfg build failed\n");
+            return 1;
+        }
+        for (const auto& b : cfg.blocks()) {
+            std::printf("0x%llx (end 0x%llx, %zu insns):",
+                        static_cast<unsigned long long>(b.start),
+                        static_cast<unsigned long long>(b.end), b.insns.size());
+            for (uint64_t s : b.succs)
+                std::printf(" -> 0x%llx",
+                            static_cast<unsigned long long>(s));
+            std::printf("\n");
+        }
+        std::printf("dominators(entry):");
+        for (uint64_t d : cfg.dominators(addr))
+            std::printf(" 0x%llx", static_cast<unsigned long long>(d));
+        std::printf("\n");
+        return 0;
+    }
+    if (cmd == "decompile") {
+        if (argc < 6) { usage(argv[0]); return 1; }
+        uint64_t addr = 0;
+        if (!parseAddr(argv[5], addr)) {
+            std::fprintf(stderr, "ghra: bad address '%s'\n", argv[5]);
+            return 1;
+        }
+        uint64_t end = 0;
+        if (argc >= 7) end = std::strtoull(argv[6], nullptr, 0);
+        std::printf("%s", decompile(*eng, reader, addr, end).c_str());
+        return 0;
     }
     usage(argv[0]);
     return 1;

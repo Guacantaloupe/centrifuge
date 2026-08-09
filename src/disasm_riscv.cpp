@@ -183,7 +183,7 @@ bool decodeOne(const uint8_t* code, size_t len, uint64_t addr, bool is64,
             }
             case 1: { // C.JAL (RV32) / C.ADDIW (RV64)
                 if (!is64) {
-                    const uint64_t t = addr + 2 + immJ;
+                    const uint64_t t = addr + immJ;
                     setText(out, "c.jal", hexOf(t));
                     finish(Insn::CALL, t, true);
                     return true;
@@ -247,13 +247,13 @@ bool decodeOne(const uint8_t* code, size_t len, uint64_t addr, bool is64,
                 return true;
             }
             case 5: { // C.J
-                const uint64_t t = addr + 2 + immJ;
+                const uint64_t t = addr + immJ;
                 setText(out, "c.j", hexOf(t));
                 finish(Insn::JMP, t, true);
                 return true;
             }
             case 6: case 7: { // C.BEQZ / C.BNEZ
-                const uint64_t t = addr + 2 + immB;
+                const uint64_t t = addr + immB;
                 setText(out, (f3 == 6) ? "c.beqz" : "c.bnez", regName(rs18),
                         hexOf(t));
                 finish(Insn::JCC, t, true);
@@ -374,7 +374,7 @@ bool decodeOne(const uint8_t* code, size_t len, uint64_t addr, bool is64,
         out.kind = Insn::OTHER;
         return true;
     case 0x6F: { // JAL
-        const uint64_t t = addr + 4 + immJ;
+        const uint64_t t = addr + immJ;
         setText(out, "jal", regName(rd), hexOf(t));
         finish(rd == 0 ? Insn::JMP : Insn::CALL, t, true);
         return true;
@@ -397,7 +397,7 @@ bool decodeOne(const uint8_t* code, size_t len, uint64_t addr, bool is64,
         static const char* mn[] = {"beq", "bne", "", "", "blt", "bge", "bltu",
                                    "bgeu"};
         if (!mn[f3][0]) return false;
-        const uint64_t t = addr + 4 + immB;
+        const uint64_t t = addr + immB;
         setText(out, mn[f3], regName(rs1), regName(rs2), hexOf(t));
         finish(Insn::JCC, t, true);
         return true;

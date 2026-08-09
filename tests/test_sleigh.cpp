@@ -103,9 +103,9 @@ int main(int argc, char** argv) {
     }
     {
         auto pi = dis(0x10);
-        expect(0, "beq text", pi.text, "beq a0, a1, 0x1c");
+        expect(0, "beq text", pi.text, "beq a0, a1, 0x18");
         CHECK(pi.kind == Insn::JCC, "beq kind");
-        CHECK(pi.targetKnown && pi.target == 0x1C, "beq target");
+        CHECK(pi.targetKnown && pi.target == 0x18, "beq target");
     }
     {
         auto pi = dis(0x14);
@@ -113,14 +113,14 @@ int main(int argc, char** argv) {
     }
     {
         auto pi = dis(0x18);
-        CHECK(pi.kind == Insn::JMP && pi.targetKnown && pi.target == 0x1C,
-              "jal zero,0 target");
+        CHECK(pi.kind == Insn::JMP && pi.targetKnown && pi.target == 0x18,
+              "jal zero,0 target (self)");
     }
     {
         auto pi = dis(0x1C);
-        CHECK(pi.kind == Insn::CALL && pi.targetKnown && pi.target == 0x28,
-              "jal ra,8 -> call 0x28");
-        expect(0, "jal ra text", pi.text, "call 0x28");
+        CHECK(pi.kind == Insn::CALL && pi.targetKnown && pi.target == 0x24,
+              "jal ra,8 -> call 0x24");
+        expect(0, "jal ra text", pi.text, "call 0x24");
     }
 
     // ---- p-code interpreter semantics ----
@@ -183,6 +183,51 @@ int main(int argc, char** argv) {
         ev.run();
         CHECK(ev.ram[0x2008] == 0x44 && ev.ram[0x200B] == 0x11,
               "sw semantics");
+    }
+
+    // ---- compressed (C ext) - c.li, c.jr ra, c.addw, c.lwsp/c.swsp ----
+    put(0x30, 0x4535); // c.li a0, 13        (0x4535)
+    put(0x32, 0x8082); // c.jr ra            (ret)
+    put(0x34, 0x9D2D); // c.addw a0, a1      (0x9d2d)
+    put(0x36, 0x1141); // c.addi sp, -16     (0x1141)
+    put(0x38, 0xC62A); // c.swsp a0, 12(sp)  (0xc62a)
+    put(0x3A, 0x4502); // c.lwsp a0, 0(sp)   (0x4502)
+    {
+        auto pi = dis(0x30);
+        expect(0, "c.li text", pi.text, "c.li a0, 13");
+        CHECK(pi.size == 2, "c.li size");
+    }
+    {
+        auto pi = dis(0x32);
+        expect(0, "c.jr ra text", pi.text, "ret");
+        CHECK(pi.kind == Insn::RET, "c.jr ra kind");
+    }
+    {
+        auto pi = dis(0x34);
+        expect(0, "c.addw text", pi.text, "c.addw a0, a1");
+    }
+    {
+        auto pi = dis(0x36);
+        expect(0, "c.addi sp text", pi.text, "c.addi sp, -16");
+        PcodeEvaluator ev(pi);
+        ev.regs[2 * 8] = 0x1000;
+        ev.run();
+        auto v = ev.regValue(2 * 8);
+        CHECK(v.has_value() && *v == 0xFF0, "c.addi sp semantics");
+    }
+    {
+        auto pi = dis(0x38);
+        expect(0, "c.swsp text", pi.text, "c.swsp a0, 12(sp)");
+        PcodeEvaluator ev(pi);
+        ev.regs[2 * 8] = 0x2000;
+        ev.regs[10 * 8] = 0x11223344;
+        ev.run();
+        CHECK(ev.ram[0x200C] == 0x44 && ev.ram[0x200F] == 0x11,
+              "c.swsp semantics");
+    }
+    {
+        auto pi = dis(0x3A);
+        expect(0, "c.lwsp text", pi.text, "c.lwsp a0, 0(sp)");
     }
 
     if (failures == 0) {

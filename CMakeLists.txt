@@ -19,6 +19,8 @@ add_library(ghra_core STATIC
   src/disasm_riscv.cpp
   src/pcode.cpp
   src/sleigh.cpp
+  src/cfg.cpp
+  src/decompile.cpp
   src/analysis.cpp
 )
 target_include_directories(ghra_core PUBLIC include)

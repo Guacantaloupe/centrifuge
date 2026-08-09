@@ -41,12 +41,12 @@ struct SpecField {
     int size = 0; // bytes (ceil(bits/8))
     bool attached = false;
     std::vector<std::string> regs; // attach variables list
+    int token = 0;                 // owning token index
 };
 
 struct SpecToken {
     std::string name;
     int size = 4; // bytes
-    std::vector<SpecField> fields;
 };
 
 struct SpecRegister {
@@ -103,15 +103,20 @@ public:
         uint64_t addr, PcodeInsn& out, std::string& err) const;
 
     const std::vector<SpecCtor>& ctors() const { return ctors_; }
-    const std::string& tokenName() const { return tokenName_; }
-    int tokenSize() const { return tokenSize_; }
+    std::string tokenName() const {
+        return tokens_.empty() ? std::string() : tokens_[0].name;
+    }
+    int tokenSize() const { // max instruction size in bytes
+        int m = 0;
+        for (const auto& t : tokens_) m = std::max(m, t.size);
+        return m;
+    }
 
 private:
     std::vector<SpecRegister> regs_;
     std::map<std::string, uint64_t> regOffsets_;
-    std::string tokenName_;
-    int tokenSize_ = 4;
-    std::vector<SpecField> fields_;
+    std::vector<SpecToken> tokens_;
+    std::vector<SpecField> fields_; // flattened; SpecField::token indexes tokens_
     std::map<std::string, int> fieldIdx_;
     std::vector<SpecCtor> ctors_;
 

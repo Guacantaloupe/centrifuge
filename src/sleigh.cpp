@@ -537,17 +537,19 @@ bool SleighEngine::loadSpec(const std::string& text, std::string& err) {
         } else if (isId(tk[i], "token")) {
             i++;
             if (tk[i].kind != Tok::ID) { err = "token: bad name"; return false; }
-            tokenName_ = tk[i].text;
+            SpecToken st;
+            st.name = tk[i].text;
             i++;
             if (!isOp(tk[i], "(")) { err = "token: expected ("; return false; }
             i++;
             if (tk[i].kind != Tok::INT) { err = "token: bad size"; return false; }
-            tokenSize_ = static_cast<int>(tk[i].ival);
+            st.size = static_cast<int>(tk[i].ival);
             i++;
             if (!isOp(tk[i], ")")) { err = "token: expected )"; return false; }
             i++;
             if (!isOp(tk[i], "{")) { err = "token: expected {"; return false; }
             i++;
+            const int tokIdx = static_cast<int>(tokens_.size());
             while (!isOp(tk[i], "}")) {
                 if (tk[i].kind != Tok::ID) { err = "token: bad field name"; return false; }
                 SpecField f;
@@ -572,10 +574,12 @@ bool SleighEngine::loadSpec(const std::string& text, std::string& err) {
                     return false;
                 }
                 i++; // ;
+                f.token = tokIdx;
                 fields_.push_back(f);
                 fieldIdx_[f.name] = static_cast<int>(fields_.size()) - 1;
             }
             i++; // }
+            tokens_.push_back(st);
         } else if (isId(tk[i], "attach")) {
             i++;
             if (!isId(tk[i], "variables")) { err = "attach: expected variables"; return false; }
@@ -1018,34 +1022,52 @@ uint64_t SleighEngine::evalExpr(PcodeInsn& pi, const SpecCtor::SExpr& e) const {
 bool SleighEngine::disassemble(
     const std::function<bool(uint64_t, void*, size_t)>& read, uint64_t addr,
     PcodeInsn& out, std::string& err) const {
+    const int maxTok = tokenSize();
+    if (maxTok <= 0) return false;
     uint8_t raw[16];
-    if (!read(addr, raw, static_cast<size_t>(tokenSize_))) return false;
-    uint64_t word = 0;
-    for (int i = 0; i < tokenSize_; ++i)
-        word |= static_cast<uint64_t>(raw[i]) << (8 * i);
+    int got = 0;
+    for (int n : {maxTok, maxTok / 2, maxTok / 4, 1}) {
+        if (n <= 0) continue;
+        if (read(addr, raw, static_cast<size_t>(n))) {
+            got = n;
+            break;
+        }
+    }
+    if (got == 0) return false;
+    // little-endian word per token (missing tail bytes read as zero)
+    uint64_t word[4] = {0, 0, 0, 0};
+    for (size_t t = 0; t < tokens_.size(); ++t) {
+        const int avail = std::min(tokens_[t].size, got);
+        for (int i = 0; i < avail; ++i)
+            word[t] |= static_cast<uint64_t>(raw[i]) << (8 * i);
+    }
 
     auto fieldValue = [&](const SpecField& f) -> uint64_t {
         uint64_t v = 0;
+        const uint64_t w = word[f.token];
         for (const auto& pc : f.pieces) {
             const int width = pc.msb - pc.lsb + 1;
             const uint64_t mask =
                 (width >= 64) ? ~0ULL : ((1ULL << width) - 1);
-            v |= ((word >> pc.lsb) & mask) << pc.shift;
+            v |= ((w >> pc.lsb) & mask) << pc.shift;
         }
         return v;
     };
 
     // first full pattern match wins (declaration order)
     const SpecCtor* matched = nullptr;
+    int insnSize = maxTok;
     std::map<std::string, uint64_t> opValues;
     std::map<std::string, std::string> opFields; // operand -> token field
     for (const auto& c : ctors_) {
         bool ok = true;
+        int usedTok = 0;
         opValues.clear();
         opFields.clear();
         for (const auto& t : c.terms) {
             const SpecField* f = findField(t.field);
             if (!f) { ok = false; break; }
+            usedTok = std::max(usedTok, tokens_[f->token].size);
             const uint64_t v = fieldValue(*f);
             if (t.kind == SpecCtor::Term::FIELD_EQ) {
                 if (v != t.value) { ok = false; break; }
@@ -1056,6 +1078,7 @@ bool SleighEngine::disassemble(
         }
         if (ok) {
             matched = &c;
+            insnSize = std::max(usedTok, 1);
             break;
         }
     }
@@ -1063,8 +1086,8 @@ bool SleighEngine::disassemble(
 
     out = PcodeInsn{};
     out.addr = addr;
-    out.size = tokenSize_;
-    out.nextAddr = addr + tokenSize_;
+    out.size = insnSize;
+    out.nextAddr = addr + insnSize;
     nextId_ = 1;
     cache_.clear();
 
@@ -1216,8 +1239,11 @@ bool SleighEngine::disassemble(
 
     static const std::set<std::string> memOps = {
         "lb", "lh", "lw", "ld", "lbu", "lhu", "lwu", "sb", "sh", "sw", "sd"};
+    static const std::set<std::string> spOps = {"c.lwsp", "c.ldsp",
+                                                 "c.swsp", "c.sdsp"};
     const bool isMem = memOps.count(matched->name) != 0;
     const bool isJalr = matched->name == "jalr";
+    const bool isSp = spOps.count(matched->name) != 0;
 
     std::vector<std::string> parts;
     for (const auto& oname : matched->operands) {
@@ -1226,7 +1252,10 @@ bool SleighEngine::disassemble(
     }
 
     std::string text = matched->name;
-    if (isMem || isJalr) {
+    if (isSp && parts.size() >= 2) {
+        // "c.lwsp rd, imm(sp)"
+        text += " " + parts[0] + ", " + parts[1] + "(sp)";
+    } else if (isMem || isJalr) {
         // "mnem a, c(b)"  where a=rd/rs2, b=rs1, c=imm
         if (parts.size() >= 3) {
             text += " " + parts[0] + ", " + parts[2] + "(" + parts[1] + ")";

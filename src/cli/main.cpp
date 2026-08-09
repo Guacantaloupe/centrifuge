@@ -290,7 +290,15 @@ int cmdSpec(int argc, char** argv) {
         }
         uint64_t end = 0;
         if (argc >= 7) end = std::strtoull(argv[6], nullptr, 0);
-        std::printf("%s", decompile(*eng, reader, addr, end).c_str());
+        auto nameOf = [&](uint64_t target) -> std::string {
+            for (const auto& s : prog->symbols)
+                if (s.isFunction && s.addr == target) return s.name;
+            char buf[24];
+            std::snprintf(buf, sizeof(buf), "FUN_%llx",
+                          static_cast<unsigned long long>(target));
+            return buf;
+        };
+        std::printf("%s", decompile(*eng, reader, addr, end, nameOf).c_str());
         return 0;
     }
     usage(argv[0]);

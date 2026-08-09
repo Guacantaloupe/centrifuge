@@ -15,9 +15,11 @@
 namespace ghra {
 
 // Decompile the function starting at `start` (until RET/undecodable/`end`).
+// `nameOf` resolves call-target addresses to function names ("" = indirect).
 std::string decompile(
     const SleighEngine& eng,
     const std::function<bool(uint64_t, void*, size_t)>& read, uint64_t start,
-    uint64_t end);
+    uint64_t end,
+    const std::function<std::string(uint64_t)>& nameOf = nullptr);
 
 } // namespace ghra

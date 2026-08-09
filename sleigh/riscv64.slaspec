@@ -111,7 +111,8 @@ attach variables [ rs2 ] [ zero ra sp gp tp t0 t1 t2 s0 s1 a0 a1 a2 a3 a4 a5 a6 
 :call target is opcode=0x6F & rd=1 & jimm20:target { ra = inst_next; call inst_start + sext(target, 21); };
 :jal rd, target is opcode=0x6F & rd & jimm20:target { rd = inst_next; goto inst_start + sext(target, 21); };
 :ret is opcode=0x67 & funct3=0 & rd=0 & rs1=1 & imm12=0 { return; };
-:jalr rd, rs1, imm is opcode=0x67 & funct3=0 & rd & rs1 & imm12:imm { rd = inst_next; goto rs1 + sext(imm, 12); };
+:callr rs1, imm is opcode=0x67 & funct3=0 & rd=1 & rs1 & imm12:imm { t = rs1 + sext(imm, 12); ra = inst_next; call t; };
+:jalr rd, rs1, imm is opcode=0x67 & funct3=0 & rd & rs1 & imm12:imm { t = rs1 + sext(imm, 12); rd = inst_next; goto t; };
 
 // ---- branches ----
 :beq rs1, rs2, target is opcode=0x63 & funct3=0 & rs1 & rs2 & bimm12:target { if (rs1 == rs2) goto inst_start + sext(target, 12); };

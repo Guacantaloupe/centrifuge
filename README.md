@@ -1,24 +1,28 @@
-# ghra — a Ghidra reimplementation in C++17 (100% C++)
+# Centrifuge (离心机) — a C++17 reimplementation merging Ghidra + angr
 
-Ghidra (NSA) is a reverse-engineering suite: file loaders, a *Sleigh*
-spec-driven disassembler, a decompiler, analysis passes, a GUI, and a
-scripting API. `ghra` reimplements that architecture in C++17, one layer at a
-time, with **zero external dependencies** — no Capstone, no LLVM, no libopcodes.
-All loaders, disassemblers and analysis are written from scratch in C++17.
+Ghidra (NSA) is a static reverse-engineering suite: file loaders, a *Sleigh*
+spec-driven disassembler, and a decompiler that turns p-code into C. angr
+(UCSB) is a symbolic-execution framework that explores program paths with
+constraint solving. **Centrifuge merges both philosophies on one foundation:**
+loaders → spec-driven disassembly → p-code (our unified IR, replacing both
+Sleigh's p-code and angr's VEX) → static decompilation **and** symbolic
+exploration, all written from scratch in C++17 with zero external
+dependencies.
 
-## Status (v0.4-lite)
+就像离心机把混合物甩开、按成分分离一样，Centrifuge 把二进制拆成成分——
+代码、数据、控制流、符号约束——分别分析，再拼回对程序的理解。
 
-| Layer            | Ghidra equivalent | ghra status |
-|------------------|-------------------|-------------|
-| Memory model     | Address space / program image | ✅ `MemoryImage` |
-| Loaders          | `LoaderService` (ELF, PE, ...) | ✅ ELF32/ELF64, PE32/PE32+ |
-| Symbol table     | Symbol table / exports         | ✅ symtab+dynsym, PE exports |
-| Disassembler     | Sleigh + language modules      | ✅ hand-written x86/x86-64 + RISC-V **and** SLEIGH-lite spec engine |
-| p-code           | `PcodeOps` / varnodes          | ✅ `PcodeInsn` + interpreter |
-| CFG + dominators | `BasicBlockModel`             | ✅ `cfg.cpp` (blocks, edges, iterative dominators, DOT) |
-| Function discovery | `FunctionAnalyzer`           | 🟡 symbol seeds + recursive-descent scan (both backends) |
-| Decompiler       | `DecompInterface`             | 🟡 v0.4-lite: expression reconstruction + if/return structuring + register-level C (round-trip verified) |
-| GUI              | Ghidra window                  | ⛔ later (ImGui/Qt) |
+## Status (v0.4 + v0.3 x86)
+
+| Layer            | Ghidra equivalent | angr equivalent | centrifuge status |
+|------------------|-------------------|-----------------|-------------------|
+| Loaders          | `LoaderService`   | `cle`           | ✅ ELF32/64, PE32/PE32+ |
+| Disassembler     | Sleigh + language modules | Capstone/PyVEX | ✅ hand-written x86/RISC-V + SLEIGH-lite spec engine (RISC-V full, x86-64 partial) |
+| IR               | p-code            | VEX             | ✅ own p-code (35+ ops) + interpreter |
+| CFG + dominators | `BasicBlockModel` | CFGFast/CFGEmulated | ✅ `cfg.cpp` |
+| Decompiler       | `DecompInterface` | —              | ✅ v0.4: stack frames, calls, loops; round-trip verified |
+| Symbolic execution | —              | **core**        | ⛔ v0.7: p-code evaluator → symbolic values → concolic → solver |
+| GUI              | Ghidra window     | —              | ⛔ later (ImGui/Qt) |
 
 ## Building
 
@@ -32,26 +36,11 @@ cmake --build build
 ## Usage
 
 ```
-ghra <file> info               # format, arch, entry, sections, symbols
-ghra <file> funcs              # discovered functions
-ghra <file> disasm <addr> [n]  # disassemble n instructions
-ghra <file> dump <addr> <size> # hexdump
-ghra spec <spec.slaspec> <file> disasm <addr> [n]  # spec-driven disasm
-ghra spec <spec.slaspec> <file> funcs             # analysis via spec engine
-ghra spec <spec.slaspec> <file> pcode <addr> [count]  # Ghidra-style p-code IR
-ghra spec <spec.slaspec> <file> cfg <addr> [end]      # CFG + dominators
-ghra spec <spec.slaspec> <file> decompile <addr> [end] # C decompilation
-```
-
-Example:
-
-```
-$ ghra samples/sample_elf64 funcs
-backend:   builtin-c++ (x86-64)
-FUNCTIONS (2)
-name                     addr                 size       src
-main                     0x00401000           0x10       sym
-helper                   0x00401020           0x0C       sym
+centrifuge <file> info               # format, arch, entry, sections, symbols
+centrifuge <file> funcs              # discovered functions
+centrifuge <file> disasm <addr> [n]  # disassemble n instructions
+centrifuge <file> dump <addr> <size> # hexdump
+centrifuge spec <spec.slaspec> <file> disasm|funcs|pcode|cfg|decompile
 ```
 
 ## Architecture
@@ -67,50 +56,23 @@ src/disasm_riscv.cpp    hand-written RV32I/RV64I + M + C decoder
 src/pcode.cpp           p-code IR (varnodes, ops, interpreter)
 src/sleigh.cpp          SLEIGH-lite: spec parser, pattern matcher, p-code emitter
 src/cfg.cpp             CFG construction + iterative dominators
-src/decompile.cpp       v0.4-lite C decompiler (expression reconstruction,
-                        register-level output, if/return structuring)
+src/decompile.cpp       C decompiler (expression reconstruction, stack
+                        frames, calls, if/return structuring)
 sleigh/riscv64.slaspec  RISC-V RV64IMC language module (incl. compressed)
+sleigh/x86-64.slaspec   x86-64 language module (common integer + SSE subset)
 src/analysis.cpp        function discovery pass
 tools/make_samples.cpp  C++ test-binary generator (no Python, no assembler)
-include/ghra/*.hpp      public API
+include/centrifuge/*.hpp  public API
 ```
-
-Design notes:
-
-- The loader produces a `Program` — sections, symbols, entry point, and a flat
-  `MemoryImage` of mapped, permission-tagged blocks. This is ghra's equivalent
-  of Ghidra's program database, kept in memory for now.
-- The `Disassembler` interface is where a Sleigh-style spec engine will plug
-  in (ROADMAP v0.3). Today it is backed by hand-written decoders that emit
-  exact instruction lengths plus branch/call targets for analysis. The raw
-  fallback keeps the pipeline alive for not-yet-supported architectures.
-- `findFunctions()` seeds from symbols/exports/entry, then recursive-descent
-  scans, following direct calls (promoting targets to functions) and direct
-  jumps. Sizes come from next-function distance.
-- The SLEIGH-lite engine (`src/sleigh.cpp`) is the v0.3 milestone: it parses
-  `.slaspec`-style specs (spaces, registers, tokens/fields, attach variables,
-  constructors with bit patterns) and emits p-code with constant folding and
-  branch-target resolution. `sleigh/riscv64.slaspec` is the first language
-  module — new ISAs now mean writing a spec, not C++ tables.
 
 ## Validation
 
-Decoders are validated instruction-by-instruction against GNU binutils
-objdump (an independent decoder):
-
-- hand-written x86-64: notepad.exe 600 insns + kernel32.dll 1750 insns —
-  0 byte errors, 0 boundary mismatches
-- hand-written RISC-V: matches objdump incl. compressed instructions
-- SLEIGH-lite RISC-V spec: RV64IM + compressed (C ext) — real compiler
-  output (fib recursion, array loops, stack frames) — 0 mismatches vs objdump
+- SLEIGH-lite RISC-V spec: real compiler output (fib recursion, array loops,
+  stack frames) — 0 mismatches vs objdump, including compressed instructions
+- x86-64 spec: notepad.exe vs objdump — every decoded instruction byte-exact,
+  0 false positives (~50% coverage; sweep stops at uncovered long-tail forms)
+- **Decompiler round-trip** (`tests/roundtrip.py`): decompile fib/sum_array/
+  compute/max3/absdiff, compile the emitted C, run test vectors — results are
+  identical to the original C (the IR semantics are provably correct, which
+  is exactly what the symbolic-execution engine needs as its base)
 - `tests/test_sleigh.cpp`: spec disassembly + p-code interpreter semantics
-- **Decompiler round-trip** (`tests/roundtrip.py`): decompile `compute`/
-  `max3`/`absdiff`, compile the emitted C, run 20 test vectors — output is
-  byte-identical to the original C's results. Recovers idioms like
-  `abs(x) = x^(x>>31)-(x>>31)` and `if (x>100) return x-100; return x;`
-
-## Tests
-
-`tools/make_samples.cpp` writes hand-crafted ELF32, ELF64 and PE32+ samples
-(bytes written explicitly — no assembler dependency) so the loaders can be
-verified deterministically. See ROADMAP.md for the full plan.

@@ -1,14 +1,14 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // loader_elf.cpp - ELF32/ELF64 loader (hosts are assumed little-endian;
 // all multibyte fields are read with explicit LE helpers)
-#include "ghra/loader.hpp"
+#include "centrifuge/loader.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
-namespace ghra {
+namespace centrifuge {
 namespace {
 
 // ---- minimal ELF struct definitions (packed) ----
@@ -336,4 +336,4 @@ std::optional<Program> loadElf(const std::vector<uint8_t>& data,
     return loadElfImpl(data, path, err);
 }
 
-} // namespace ghra
+} // namespace centrifuge

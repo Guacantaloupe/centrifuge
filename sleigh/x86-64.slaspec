@@ -1,4 +1,4 @@
-// x86-64 language module for the ghra SLEIGH-lite engine
+// x86-64 language module for the centrifuge SLEIGH-lite engine
 // Covers the common legacy integer ISA (64-bit mode + 32/16/8-bit forms).
 // Flags are NOT modeled yet: jcc conditions are placeholders (disassembly
 // and branch targets are exact; decompiler flag analysis is future work).

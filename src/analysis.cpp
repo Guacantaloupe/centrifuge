@@ -1,13 +1,13 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // analysis.cpp - function discovery
-#include "ghra/analysis.hpp"
+#include "centrifuge/analysis.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <map>
 #include <set>
 
-namespace ghra {
+namespace centrifuge {
 
 namespace {
 
@@ -127,4 +127,4 @@ std::vector<Function> findFunctions(const Program& prog, Disassembler* disasm) {
     return out;
 }
 
-} // namespace ghra
+} // namespace centrifuge

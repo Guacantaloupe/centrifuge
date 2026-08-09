@@ -1,10 +1,10 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // pcode.cpp - p-code names + interpreter
-#include "ghra/pcode.hpp"
+#include "centrifuge/pcode.hpp"
 
 #include <cstdio>
 
-namespace ghra {
+namespace centrifuge {
 
 const char* pOpName(POp p) {
     switch (p) {
@@ -353,4 +353,4 @@ std::optional<uint64_t> PcodeEvaluator::evalOp(const PcodeOp& op) {
     return std::nullopt;
 }
 
-} // namespace ghra
+} // namespace centrifuge

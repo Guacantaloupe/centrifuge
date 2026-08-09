@@ -1,4 +1,4 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // analysis.hpp - program analysis passes (function discovery, ...)
 #pragma once
 
@@ -6,10 +6,10 @@
 #include <string>
 #include <vector>
 
-#include "ghra/disasm.hpp"
-#include "ghra/loader.hpp"
+#include "centrifuge/disasm.hpp"
+#include "centrifuge/loader.hpp"
 
-namespace ghra {
+namespace centrifuge {
 
 struct Function {
     std::string name;
@@ -28,4 +28,4 @@ struct Function {
 // so hand-written asm with unusual CFG may under-report. Good enough for v0.1.
 std::vector<Function> findFunctions(const Program& prog, Disassembler* disasm);
 
-} // namespace ghra
+} // namespace centrifuge

@@ -6,7 +6,7 @@ import re, subprocess, sys, os
 
 SPEC = "sleigh/riscv64.slaspec"
 ELF = "tests/real_riscv2.elf"
-GHR = "./build/ghra.exe"
+GHR = "./build/centrifuge.exe"
 CC = "gcc"
 
 FUNCS = [

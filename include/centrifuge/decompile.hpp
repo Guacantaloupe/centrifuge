@@ -1,4 +1,4 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // decompile.hpp - minimal C decompiler (v0.4-lite)
 //
 // Reconstructs register-level expressions from p-code and emits C with
@@ -10,9 +10,9 @@
 #include <functional>
 #include <string>
 
-#include "ghra/sleigh.hpp"
+#include "centrifuge/sleigh.hpp"
 
-namespace ghra {
+namespace centrifuge {
 
 // Decompile the function starting at `start` (until RET/undecodable/`end`).
 // `nameOf` resolves call-target addresses to function names ("" = indirect).
@@ -22,4 +22,4 @@ std::string decompile(
     uint64_t end,
     const std::function<std::string(uint64_t)>& nameOf = nullptr);
 
-} // namespace ghra
+} // namespace centrifuge

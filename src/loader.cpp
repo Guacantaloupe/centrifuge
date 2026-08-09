@@ -1,11 +1,11 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // loader.cpp - format dispatch
-#include "ghra/loader.hpp"
+#include "centrifuge/loader.hpp"
 
 #include <fstream>
 #include <iterator>
 
-namespace ghra {
+namespace centrifuge {
 namespace {
 
 std::optional<std::vector<uint8_t>> readFileBytes(const std::string& path,
@@ -46,4 +46,4 @@ std::optional<Program> loadFile(const std::string& path, std::string& err) {
     return std::nullopt;
 }
 
-} // namespace ghra
+} // namespace centrifuge

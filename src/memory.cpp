@@ -1,10 +1,10 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // memory.cpp - address-space / memory-image model
-#include "ghra/memory.hpp"
+#include "centrifuge/memory.hpp"
 
 #include <cstring>
 
-namespace ghra {
+namespace centrifuge {
 
 bool MemoryImage::addBlock(std::string name, uint64_t base,
                            std::vector<uint8_t> data, int perm) {
@@ -55,4 +55,4 @@ bool MemoryImage::readString(uint64_t addr, std::string& out, size_t maxLen) con
     return true;
 }
 
-} // namespace ghra
+} // namespace centrifuge

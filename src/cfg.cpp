@@ -1,12 +1,12 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // cfg.cpp - control-flow graph construction + dominators
-#include "ghra/cfg.hpp"
+#include "centrifuge/cfg.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <set>
 
-namespace ghra {
+namespace centrifuge {
 
 bool CfgBuilder::build(
     const SleighEngine& eng,
@@ -150,4 +150,4 @@ std::string CfgBuilder::dot() const {
     return s;
 }
 
-} // namespace ghra
+} // namespace centrifuge

@@ -1,4 +1,4 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // pcode.hpp - p-code intermediate representation (Ghidra's decompiler IR)
 //
 // Every instruction decodes to a straight-line list of p-code ops over
@@ -12,9 +12,9 @@
 #include <string>
 #include <vector>
 
-#include "ghra/disasm.hpp" // Insn
+#include "centrifuge/disasm.hpp" // Insn
 
-namespace ghra {
+namespace centrifuge {
 
 enum class POp : uint8_t {
     COPY,
@@ -120,4 +120,4 @@ private:
     std::optional<uint64_t> evalOp(const PcodeOp& op);
 };
 
-} // namespace ghra
+} // namespace centrifuge

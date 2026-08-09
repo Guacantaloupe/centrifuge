@@ -1,10 +1,10 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // main.cpp - command-line front end
 //
-//   ghra <file> info
-//   ghra <file> funcs
-//   ghra <file> disasm <addr> [count]
-//   ghra <file> dump <addr> <size>
+//   centrifuge <file> info
+//   centrifuge <file> funcs
+//   centrifuge <file> disasm <addr> [count]
+//   centrifuge <file> dump <addr> <size>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -14,15 +14,15 @@
 #include <string>
 #include <vector>
 
-#include "ghra/analysis.hpp"
-#include "ghra/cfg.hpp"
-#include "ghra/decompile.hpp"
-#include "ghra/disasm.hpp"
-#include "ghra/loader.hpp"
-#include "ghra/pcode.hpp"
-#include "ghra/sleigh.hpp"
+#include "centrifuge/analysis.hpp"
+#include "centrifuge/cfg.hpp"
+#include "centrifuge/decompile.hpp"
+#include "centrifuge/disasm.hpp"
+#include "centrifuge/loader.hpp"
+#include "centrifuge/pcode.hpp"
+#include "centrifuge/sleigh.hpp"
 
-using namespace ghra;
+using namespace centrifuge;
 
 namespace {
 
@@ -172,7 +172,7 @@ void usage(const char* argv0) {
 std::shared_ptr<SleighEngine> loadSpecEngine(const char* path) {
     std::ifstream f(path);
     if (!f) {
-        std::fprintf(stderr, "ghra: cannot open spec: %s\n", path);
+        std::fprintf(stderr, "centrifuge: cannot open spec: %s\n", path);
         return nullptr;
     }
     std::ostringstream ss;
@@ -180,7 +180,7 @@ std::shared_ptr<SleighEngine> loadSpecEngine(const char* path) {
     auto eng = std::make_shared<SleighEngine>();
     std::string err;
     if (!eng->loadSpec(ss.str(), err)) {
-        std::fprintf(stderr, "ghra: spec error: %s\n", err.c_str());
+        std::fprintf(stderr, "centrifuge: spec error: %s\n", err.c_str());
         return nullptr;
     }
     return eng;
@@ -220,7 +220,7 @@ int cmdSpec(int argc, char** argv) {
     std::string err;
     auto prog = loadFile(argv[3], err);
     if (!prog) {
-        std::fprintf(stderr, "ghra: %s\n", err.c_str());
+        std::fprintf(stderr, "centrifuge: %s\n", err.c_str());
         return 1;
     }
     auto reader = [&](uint64_t a, void* buf, size_t n) {
@@ -235,7 +235,7 @@ int cmdSpec(int argc, char** argv) {
         if (argc < 6) { usage(argv[0]); return 1; }
         uint64_t addr = 0, count = 16;
         if (!parseAddr(argv[5], addr)) {
-            std::fprintf(stderr, "ghra: bad address '%s'\n", argv[5]);
+            std::fprintf(stderr, "centrifuge: bad address '%s'\n", argv[5]);
             return 1;
         }
         if (argc >= 7) count = std::strtoull(argv[6], nullptr, 0);
@@ -246,7 +246,7 @@ int cmdSpec(int argc, char** argv) {
         if (argc < 6) { usage(argv[0]); return 1; }
         uint64_t addr = 0, count = 8;
         if (!parseAddr(argv[5], addr)) {
-            std::fprintf(stderr, "ghra: bad address '%s'\n", argv[5]);
+            std::fprintf(stderr, "centrifuge: bad address '%s'\n", argv[5]);
             return 1;
         }
         if (argc >= 7) count = std::strtoull(argv[6], nullptr, 0);
@@ -256,14 +256,14 @@ int cmdSpec(int argc, char** argv) {
         if (argc < 6) { usage(argv[0]); return 1; }
         uint64_t addr = 0;
         if (!parseAddr(argv[5], addr)) {
-            std::fprintf(stderr, "ghra: bad address '%s'\n", argv[5]);
+            std::fprintf(stderr, "centrifuge: bad address '%s'\n", argv[5]);
             return 1;
         }
         uint64_t end = 0;
         if (argc >= 7) end = std::strtoull(argv[6], nullptr, 0);
         CfgBuilder cfg;
         if (!cfg.build(*eng, reader, addr, end)) {
-            std::fprintf(stderr, "ghra: cfg build failed\n");
+            std::fprintf(stderr, "centrifuge: cfg build failed\n");
             return 1;
         }
         for (const auto& b : cfg.blocks()) {
@@ -285,7 +285,7 @@ int cmdSpec(int argc, char** argv) {
         if (argc < 6) { usage(argv[0]); return 1; }
         uint64_t addr = 0;
         if (!parseAddr(argv[5], addr)) {
-            std::fprintf(stderr, "ghra: bad address '%s'\n", argv[5]);
+            std::fprintf(stderr, "centrifuge: bad address '%s'\n", argv[5]);
             return 1;
         }
         uint64_t end = 0;
@@ -320,7 +320,7 @@ int main(int argc, char** argv) {
     std::string err;
     auto prog = loadFile(path, err);
     if (!prog) {
-        std::fprintf(stderr, "ghra: %s\n", err.c_str());
+        std::fprintf(stderr, "centrifuge: %s\n", err.c_str());
         return 1;
     }
 
@@ -335,7 +335,7 @@ int main(int argc, char** argv) {
         if (argc < 4) { usage(argv[0]); return 1; }
         uint64_t addr = 0, count = 16;
         if (!parseAddr(argv[3], addr)) {
-            std::fprintf(stderr, "ghra: bad address '%s'\n", argv[3]);
+            std::fprintf(stderr, "centrifuge: bad address '%s'\n", argv[3]);
             return 1;
         }
         if (argc >= 5) count = std::strtoull(argv[4], nullptr, 0);
@@ -347,7 +347,7 @@ int main(int argc, char** argv) {
         if (argc < 5) { usage(argv[0]); return 1; }
         uint64_t addr = 0, size = 64;
         if (!parseAddr(argv[3], addr)) {
-            std::fprintf(stderr, "ghra: bad address '%s'\n", argv[3]);
+            std::fprintf(stderr, "centrifuge: bad address '%s'\n", argv[3]);
             return 1;
         }
         size = std::strtoull(argv[4], nullptr, 0);

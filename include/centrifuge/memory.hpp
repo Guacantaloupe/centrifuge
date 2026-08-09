@@ -1,4 +1,4 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // memory.hpp - address-space / memory-image model
 #pragma once
 
@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace ghra {
+namespace centrifuge {
 
 // Permission bits. Values deliberately match ELF PF_* flags (R=4, W=2, X=1).
 enum class Perm : int {
@@ -53,4 +53,4 @@ private:
     std::vector<MemoryBlock> blocks_;
 };
 
-} // namespace ghra
+} // namespace centrifuge

@@ -1,11 +1,11 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // loader_pe.cpp - PE32/PE32+ loader with export-table parsing
-#include "ghra/loader.hpp"
+#include "centrifuge/loader.hpp"
 
 #include <algorithm>
 #include <cstring>
 
-namespace ghra {
+namespace centrifuge {
 namespace {
 
 #pragma pack(push, 1)
@@ -240,4 +240,4 @@ std::optional<Program> loadPe(const std::vector<uint8_t>& data,
     return loadPeImpl(data, path, err);
 }
 
-} // namespace ghra
+} // namespace centrifuge

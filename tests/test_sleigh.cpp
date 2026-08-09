@@ -1,4 +1,4 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // tests/test_sleigh.cpp - SLEIGH-lite engine + p-code interpreter tests
 //
 // Usage: test_sleigh <spec.slaspec>
@@ -10,10 +10,10 @@
 #include <string>
 #include <vector>
 
-#include "ghra/pcode.hpp"
-#include "ghra/sleigh.hpp"
+#include "centrifuge/pcode.hpp"
+#include "centrifuge/sleigh.hpp"
 
-using namespace ghra;
+using namespace centrifuge;
 
 static int failures = 0;
 

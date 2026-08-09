@@ -1,4 +1,4 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // tools/make_samples.cpp - writes hand-crafted test binaries (pure C++17)
 //
 // Produces, byte-for-byte, the same samples the old Python generator did:
@@ -90,7 +90,7 @@ std::vector<uint8_t> buildElf(bool is64) {
                     h + (is64 ? sizeof(textHelper64) : sizeof(textHelper32)));
     }
     text.resize(0x30, 0xCC); // pad with int3
-    const std::string dataStr = "hello from ghra sample";
+    const std::string dataStr = "hello from centrifuge sample";
     std::vector<uint8_t> data(dataStr.begin(), dataStr.end());
     data.push_back(0);
 

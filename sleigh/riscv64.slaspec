@@ -1,5 +1,5 @@
-// RISC-V RV64IMC language module for the ghra SLEIGH-lite engine
-// Spec language subset documented in include/ghra/sleigh.hpp and ROADMAP v0.3
+// RISC-V RV64IMC language module for the centrifuge SLEIGH-lite engine
+// Spec language subset documented in include/centrifuge/sleigh.hpp and ROADMAP v0.3
 // Covers: RV64I + M extension + W-variants + compressed (C) extension.
 
 define space ram size=8 type=ram_space default;

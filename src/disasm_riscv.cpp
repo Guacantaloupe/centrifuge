@@ -1,14 +1,14 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // disasm_riscv.cpp - hand-written RISC-V (RV32I/RV64I + M + C) disassembler
 // Pure C++, no deps. Matches objdump output for rv64gc (incl. compressed).
 
-#include "ghra/disasm.hpp"
+#include "centrifuge/disasm.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <string>
 
-namespace ghra {
+namespace centrifuge {
 namespace riscv {
 
 namespace {
@@ -653,4 +653,4 @@ bool decodeOne(const uint8_t* code, size_t len, uint64_t addr, bool is64,
 }
 
 } // namespace riscv
-} // namespace ghra
+} // namespace centrifuge

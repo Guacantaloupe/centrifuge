@@ -1,4 +1,4 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // disasm.hpp - disassembler abstraction (the role Sleigh plays in Ghidra)
 #pragma once
 
@@ -7,9 +7,9 @@
 #include <string>
 #include <vector>
 
-#include "ghra/memory.hpp"
+#include "centrifuge/memory.hpp"
 
-namespace ghra {
+namespace centrifuge {
 
 struct Insn {
     enum Kind { OTHER, CALL, RET, JMP, JCC, NOP };
@@ -40,4 +40,4 @@ public:
 // falls back to a raw "opcode listing" backend when nothing supports the arch.
 std::unique_ptr<Disassembler> makeDisassembler(const std::string& arch);
 
-} // namespace ghra
+} // namespace centrifuge

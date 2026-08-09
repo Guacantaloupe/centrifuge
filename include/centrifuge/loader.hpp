@@ -1,4 +1,4 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // loader.hpp - file-format front ends (ELF, PE, ...) producing a Program
 #pragma once
 
@@ -7,9 +7,9 @@
 #include <string>
 #include <vector>
 
-#include "ghra/memory.hpp"
+#include "centrifuge/memory.hpp"
 
-namespace ghra {
+namespace centrifuge {
 
 struct Section {
     std::string name;
@@ -42,4 +42,4 @@ struct Program {
 // Load any supported binary. Returns nullopt and sets `error` on failure.
 std::optional<Program> loadFile(const std::string& path, std::string& error);
 
-} // namespace ghra
+} // namespace centrifuge

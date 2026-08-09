@@ -1,4 +1,4 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // cfg.hpp - control-flow graph construction from p-code (decompiler front end)
 #pragma once
 
@@ -9,10 +9,10 @@
 #include <string>
 #include <vector>
 
-#include "ghra/pcode.hpp"
-#include "ghra/sleigh.hpp"
+#include "centrifuge/pcode.hpp"
+#include "centrifuge/sleigh.hpp"
 
-namespace ghra {
+namespace centrifuge {
 
 struct CfgBlock {
     uint64_t start = 0;
@@ -57,4 +57,4 @@ private:
     size_t indexOf(uint64_t start) const;
 };
 
-} // namespace ghra
+} // namespace centrifuge

@@ -1,4 +1,4 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // sleigh.cpp - SLEIGH-lite: spec parsing, pattern matching, p-code emission
 //
 // Operator encoding for expression trees (unique int codes):
@@ -6,7 +6,7 @@
 //   '<','>','==','!=','<=','>='       char pairs (hi<<8|lo)
 //   's<','s>','s<=','s>=','s>>','s/','s%'  signed: 0x40000000 | code
 //   '<<' 0x3C3C   '>>' 0x3E3E
-#include "ghra/sleigh.hpp"
+#include "centrifuge/sleigh.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -15,7 +15,7 @@
 #include <set>
 #include <sstream>
 
-namespace ghra {
+namespace centrifuge {
 
 // ---------------------------------------------------------------------------
 // lexer
@@ -465,7 +465,7 @@ static bool parseFieldSpec(const std::string& text, SpecField& f) {
 bool SleighEngine::loadSpec(const std::string& text, std::string& err) {
     Lexer lx(text);
     auto tk = lx.all(err);
-#ifdef GHRA_DEBUG_TOKENS
+#ifdef CENTRIFUGE_DEBUG_TOKENS
     for (const auto& t : tk) {
         if (t.kind == Tok::INT)
             std::fprintf(stderr, "[#%llu]",
@@ -1684,4 +1684,4 @@ std::string SpecDisassembler::backendName() const {
     return "sleigh-lite (" + eng_->tokenName() + ")";
 }
 
-} // namespace ghra
+} // namespace centrifuge

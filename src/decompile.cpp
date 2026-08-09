@@ -1,6 +1,6 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // decompile.cpp - minimal C decompiler (v0.4)
-#include "ghra/decompile.hpp"
+#include "centrifuge/decompile.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -9,9 +9,9 @@
 #include <set>
 #include <sstream>
 
-#include "ghra/cfg.hpp"
+#include "centrifuge/cfg.hpp"
 
-namespace ghra {
+namespace centrifuge {
 
 namespace {
 
@@ -602,4 +602,4 @@ std::string decompile(
     return out.str();
 }
 
-} // namespace ghra
+} // namespace centrifuge

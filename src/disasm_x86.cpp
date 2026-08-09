@@ -1,4 +1,4 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // disasm_x86.cpp - hand-written x86 / x86-64 disassembler (pure C++, no deps)
 //
 // Coverage: the common legacy instruction set (integer + branch + SSE movs/
@@ -7,14 +7,14 @@
 // This is an interim decoder - the long-term plan is a Sleigh-style spec
 // engine (see ROADMAP.md v0.3) that replaces hand-written tables.
 
-#include "ghra/disasm.hpp"
+#include "centrifuge/disasm.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <string>
 
-namespace ghra {
+namespace centrifuge {
 namespace x86 {
 
 namespace {
@@ -1317,4 +1317,4 @@ bool decodeThreeByte(Dec& d, Insn& out,
 }
 
 } // namespace x86
-} // namespace ghra
+} // namespace centrifuge

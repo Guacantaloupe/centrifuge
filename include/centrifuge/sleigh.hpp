@@ -1,4 +1,4 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // sleigh.hpp - SLEIGH-lite: spec-driven disassembly engine (Ghidra's Sleigh
 // reimplemented for a practical subset of the .slaspec language)
 //
@@ -25,9 +25,9 @@
 #include <string>
 #include <vector>
 
-#include "ghra/pcode.hpp"
+#include "centrifuge/pcode.hpp"
 
-namespace ghra {
+namespace centrifuge {
 
 // ---- spec model ----
 
@@ -149,4 +149,4 @@ private:
     std::shared_ptr<const SleighEngine> eng_;
 };
 
-} // namespace ghra
+} // namespace centrifuge

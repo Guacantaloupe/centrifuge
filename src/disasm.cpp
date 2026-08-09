@@ -1,11 +1,11 @@
-// ghra - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // disasm.cpp - disassembler backends (100% C++, no external decoders)
-#include "ghra/disasm.hpp"
+#include "centrifuge/disasm.hpp"
 
 #include <cstdio>
 #include <string>
 
-namespace ghra {
+namespace centrifuge {
 
 // implemented in disasm_x86.cpp / disasm_riscv.cpp
 namespace x86 {
@@ -92,4 +92,4 @@ std::unique_ptr<Disassembler> makeDisassembler(const std::string& arch) {
     return std::make_unique<RawDisassembler>(arch);
 }
 
-} // namespace ghra
+} // namespace centrifuge

@@ -240,6 +240,28 @@ int cmdSpec(int argc, char** argv) {
         }
         if (argc >= 7) count = std::strtoull(argv[6], nullptr, 0);
         SpecDisassembler d(eng);
+        if (argc >= 8 && std::string(argv[7]) == "--resume") {
+            // coverage scanning: skip undecodable bytes and continue
+            for (uint64_t i = 0; i < count; ++i) {
+                Insn insn;
+                if (!d.disasmOne(prog->memory, addr, insn)) {
+                    std::printf("; GAP %s\n", hexAddr(addr).c_str());
+                    addr++;
+                    continue;
+                }
+                std::string bytesHex;
+                for (size_t b = 0; b < insn.bytes.size(); ++b) {
+                    char tmp[4];
+                    std::snprintf(tmp, sizeof(tmp), "%s%02x", b ? " " : "",
+                                  insn.bytes[b]);
+                    bytesHex += tmp;
+                }
+                std::printf("%s %s %s\n", hexAddr(addr).c_str(),
+                            bytesHex.c_str(), insn.text.c_str());
+                addr += insn.size;
+            }
+            return 0;
+        }
         return cmdDisasm(*prog, d, addr, count);
     }
     if (cmd == "pcode") {

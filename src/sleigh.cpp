@@ -1050,7 +1050,8 @@ bool SleighEngine::disassemble(
     // ---- x86: consume prefixes and set context (REX/66/67/... ) ----
     struct X86Ctx {
         bool rex = false, rexw = false, rexr = false, rexx = false,
-             rexb = false, op66 = false, addr67 = false;
+             rexb = false, op66 = false, opF2 = false, opF3 = false,
+             addr67 = false;
         int opsz = 4; // operand size in bytes
         int prefixLen = 0;
         bool haveModrm = false;
@@ -1068,9 +1069,11 @@ bool SleighEngine::disassemble(
             const uint8_t b = raw[p];
             if (b == 0x66) { xc.op66 = true; p++; }
             else if (b == 0x67) { xc.addr67 = true; p++; }
-            else if (b == 0xF0 || b == 0xF2 || b == 0xF3 || b == 0x2E ||
-                     b == 0x36 || b == 0x3E || b == 0x26 || b == 0x64 ||
-                     b == 0x65) {
+            else if (b == 0xF0) { p++; }
+            else if (b == 0xF2) { xc.opF2 = true; p++; }
+            else if (b == 0xF3) { xc.opF3 = true; p++; }
+            else if (b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 ||
+                     b == 0x64 || b == 0x65) {
                 p++;
             } else if (b >= 0x40 && b <= 0x4F) {
                 xc.rex = true;
@@ -1112,11 +1115,12 @@ bool SleighEngine::disassemble(
     std::vector<std::pair<std::string, std::string>> magicExports;
     auto isMagic = [&](const std::string& n) {
         return archX86_ &&
-               (n == "rexw" || n == "opsz" || n == "modrm" ||
+               (n == "acc" || n == "pfxf2" || n == "pfxf3" || n == "pfx66" ||
+                n == "pfxnone" || n == "rexw" || n == "opsz" || n == "modrm" ||
                 n.rfind("modrm", 0) == 0 || n == "rreg" ||
                 n.rfind("rreg", 0) == 0 || n == "rmreg" ||
                 n.rfind("rmreg", 0) == 0 || n == "rmmem" ||
-                n == "rmval" || n.rfind("rmval", 0) == 0 || n == "ea" ||
+                n == "rmval" || n.rfind("rmval", 0) == 0 || n == "sreg" || n == "ea" ||
                 n == "rq" || n.rfind("rq", 0) == 0 || n == "immb" ||
                 n == "immw" || n == "immd" || n == "immq" || n == "immv" ||
                 n == "immz");
@@ -1125,7 +1129,7 @@ bool SleighEngine::disassemble(
         // trailing digits carry the size: rreg8, rmreg16, rq64, rmval32
         const char* d = n.c_str();
         while (*d && !isdigit(static_cast<unsigned char>(*d))) d++;
-        return *d ? atoi(d) : xc.opsz;
+        return *d ? atoi(d) / 8 : xc.opsz;
     };
 
     auto readByte = [&](int off) -> uint8_t {
@@ -1214,6 +1218,23 @@ bool SleighEngine::disassemble(
         for (const auto& t : c.terms) {
             const std::string& fn = t.field;
             if (isMagic(fn)) {
+                if (fn == "pfxf2" || fn == "pfxf3" || fn == "pfx66" ||
+                    fn == "pfxnone") {
+                    const bool have = fn == "pfxf2" ? xc.opF2
+                                    : fn == "pfxf3" ? xc.opF3
+                                    : fn == "pfx66" ? xc.op66
+                                                    : (!xc.opF2 && !xc.opF3 &&
+                                                       !xc.op66);
+                    if (!have) {
+                        ok = false;
+                        break;
+                    }
+                    if (t.kind == SpecCtor::Term::FIELD_EQ && t.value != 1) {
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
                 if (fn == "rexw" || fn == "opsz") {
                     const uint64_t v =
                         (fn == "rexw") ? (xc.rexw ? 1 : 0)
@@ -1227,7 +1248,9 @@ bool SleighEngine::disassemble(
                 if (fn == "modrm" || fn.rfind("modrm", 0) == 0) {
                     int off = 1;
                     if (fn.size() > 5) off = atoi(fn.c_str() + 5);
-                    if (!decodeModrm(off)) { ok = false; break; }
+                    if (!decodeModrm(off)) {
+                        ok = false; break;
+                    }
                     continue;
                 }
                 // FIELD_EQ on register exports: /digit group check
@@ -1271,7 +1294,9 @@ bool SleighEngine::disassemble(
                 continue;
             }
             const SpecField* f = findField(fn);
-            if (!f) { ok = false; break; }
+            if (!f) {
+                ok = false; break;
+            }
             usedTok = std::max(usedTok, tokens_[f->token].size);
             const uint64_t v = fieldValue(*f);
             if (t.kind == SpecCtor::Term::FIELD_EQ) {
@@ -1331,6 +1356,27 @@ bool SleighEngine::disassemble(
                 std::snprintf(nm, sizeof(nm), "r%dd", idx);
             else
                 std::snprintf(nm, sizeof(nm), "%s", r32[idx]);
+        } else if (size == 8) {
+            static const char* r64[8] = {"rax", "rcx", "rdx", "rbx",
+                                         "rsp", "rbp", "rsi", "rdi"};
+            if (idx >= 8)
+                std::snprintf(nm, sizeof(nm), "r%d", idx);
+            else
+                std::snprintf(nm, sizeof(nm), "%s", r64[idx]);
+        } else if (size == 16) {
+            static const char* xmm[8] = {"xmm0", "xmm1", "xmm2", "xmm3",
+                                         "xmm4", "xmm5", "xmm6", "xmm7"};
+            if (idx >= 8)
+                std::snprintf(nm, sizeof(nm), "xmm%d", idx);
+            else
+                std::snprintf(nm, sizeof(nm), "%s", xmm[idx]);
+        } else if (size == 32) {
+            static const char* ymm[8] = {"ymm0", "ymm1", "ymm2", "ymm3",
+                                         "ymm4", "ymm5", "ymm6", "ymm7"};
+            if (idx >= 8)
+                std::snprintf(nm, sizeof(nm), "ymm%d", idx);
+            else
+                std::snprintf(nm, sizeof(nm), "%s", ymm[idx]);
         } else {
             static const char* r64[8] = {"rax", "rcx", "rdx", "rbx",
                                          "rsp", "rbp", "rsi", "rdi"};
@@ -1423,7 +1469,16 @@ bool SleighEngine::disassemble(
 
     // materialize magic exports (registers, addresses, immediates)
     for (const auto& [opname, mname] : magicExports) {
-        if (mname == "rreg" || mname.rfind("rreg", 0) == 0) {
+        if (mname == "acc") {
+            const int sz = xc.rexw ? 8 : xc.opsz;
+            out.named[opname] = x86RegVarnode(0, sz);
+        } else if (mname == "sreg") {
+            static const char* seg[8] = {"es", "cs", "ss", "ds", "fs", "gs", "?", "?"};
+            Varnode* v = makeVarnode(out, Varnode::REGISTER,
+                                     static_cast<uint64_t>(xc.regReg) * 8, 2,
+                                     seg[xc.regReg & 7]);
+            out.named[opname] = v->id;
+        } else if (mname == "rreg" || mname.rfind("rreg", 0) == 0) {
             out.named[opname] = x86RegVarnode(xc.regReg, magicSize(mname));
         } else if (mname == "rmreg" || mname.rfind("rmreg", 0) == 0) {
             out.named[opname] = x86RegVarnode(xc.rmReg, magicSize(mname));
@@ -1612,6 +1667,7 @@ bool SleighEngine::disassemble(
         const Varnode* v = out.find(it->second);
         if (!v) return "";
         if (v->kind == Varnode::REGISTER) return v->name;
+        if (!v->name.empty()) return v->name;
         return fmtImm(static_cast<int64_t>(v->offset));
     };
 

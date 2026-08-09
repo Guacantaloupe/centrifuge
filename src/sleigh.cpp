@@ -485,7 +485,14 @@ bool SleighEngine::loadSpec(const std::string& text, std::string& err) {
     for (size_t i = 0; i < tk.size();) {
         if (isId(tk[i], "define")) {
             i++;
-            if (isId(tk[i], "space")) {
+            if (isId(tk[i], "arch")) {
+                i++;
+                if (tk[i].kind != Tok::ID) { err = "arch: bad name"; return false; }
+                archX86_ = (tk[i].text == "x86");
+                i++;
+                if (!isOp(tk[i], ";")) { err = "arch: expected ;"; return false; }
+                i++;
+            } else if (isId(tk[i], "space")) {
                 i++;
                 if (tk[i].kind != Tok::ID) { err = "bad space name"; return false; }
                 i++;
@@ -915,6 +922,11 @@ uint64_t SleighEngine::evalExpr(PcodeInsn& pi, const SpecCtor::SExpr& e) const {
         return v->id;
     }
     case SpecCtor::SExpr::VAR: {
+        if (e.var == "opsz" && x86Opsz_) {
+            Varnode* v = makeVarnode(pi, Varnode::CONST,
+                                     static_cast<uint64_t>(x86Opsz_), 8);
+            return v->id;
+        }
         if (uint64_t id = opId(e.var)) return id;
         if (const SpecRegister* r = findReg(e.var)) return regVarnode(pi, *r);
         return constVarnode(pi, 0, 8); // unknown var (shouldn't happen)
@@ -1007,7 +1019,7 @@ uint64_t SleighEngine::evalExpr(PcodeInsn& pi, const SpecCtor::SExpr& e) const {
     }
     case SpecCtor::SExpr::LOAD: {
         const uint64_t a = evalExpr(pi, *e.a);
-        const int sz = e.bits ? e.bits : 8;
+        const int sz = e.bits ? e.bits : (x86Opsz_ ? x86Opsz_ : 8);
         Varnode* out = makeVarnode(pi, Varnode::UNIQUE, nextId_++, sz);
         pi.ops.push_back(PcodeOp{POp::LOAD, out->id, a, 0, 0});
         return out->id;
@@ -1034,12 +1046,54 @@ bool SleighEngine::disassemble(
         }
     }
     if (got == 0) return false;
+
+    // ---- x86: consume prefixes and set context (REX/66/67/... ) ----
+    struct X86Ctx {
+        bool rex = false, rexw = false, rexr = false, rexx = false,
+             rexb = false, op66 = false, addr67 = false;
+        int opsz = 4; // operand size in bytes
+        int prefixLen = 0;
+        bool haveModrm = false;
+        int mod = 0, reg = 0, rm = 0;
+        int cursor = 0; // next unread byte in the token word
+        bool isMem = false, ripRel = false;
+        int64_t disp = 0;
+        int base = -1, index = -1, scale = 1;
+        int regReg = 0; // reg-field register idx (+REX.R)
+        int rmReg = 0;  // rm register idx (mod==3, +REX.B)
+    } xc;
+    if (archX86_) {
+        int p = 0;
+        while (p < got) {
+            const uint8_t b = raw[p];
+            if (b == 0x66) { xc.op66 = true; p++; }
+            else if (b == 0x67) { xc.addr67 = true; p++; }
+            else if (b == 0xF0 || b == 0xF2 || b == 0xF3 || b == 0x2E ||
+                     b == 0x36 || b == 0x3E || b == 0x26 || b == 0x64 ||
+                     b == 0x65) {
+                p++;
+            } else if (b >= 0x40 && b <= 0x4F) {
+                xc.rex = true;
+                xc.rexw = b & 8;
+                xc.rexr = b & 4;
+                xc.rexx = b & 2;
+                xc.rexb = b & 1;
+                p++;
+            } else {
+                break;
+            }
+        }
+        xc.prefixLen = p;
+        xc.opsz = xc.rexw ? 8 : (xc.op66 ? 2 : 4);
+        x86Opsz_ = xc.opsz;
+    }
+
     // little-endian word per token (missing tail bytes read as zero)
     uint64_t word[4] = {0, 0, 0, 0};
     for (size_t t = 0; t < tokens_.size(); ++t) {
-        const int avail = std::min(tokens_[t].size, got);
+        const int avail = std::min(tokens_[t].size, got - xc.prefixLen);
         for (int i = 0; i < avail; ++i)
-            word[t] |= static_cast<uint64_t>(raw[i]) << (8 * i);
+            word[t] |= static_cast<uint64_t>(raw[xc.prefixLen + i]) << (8 * i);
     }
 
     auto fieldValue = [&](const SpecField& f) -> uint64_t {
@@ -1054,6 +1108,98 @@ bool SleighEngine::disassemble(
         return v;
     };
 
+    // ---- x86 magic terms ----
+    std::vector<std::pair<std::string, std::string>> magicExports;
+    auto isMagic = [&](const std::string& n) {
+        return archX86_ &&
+               (n == "rexw" || n == "opsz" || n == "modrm" ||
+                n.rfind("modrm", 0) == 0 || n == "rreg" ||
+                n.rfind("rreg", 0) == 0 || n == "rmreg" ||
+                n.rfind("rmreg", 0) == 0 || n == "rmmem" ||
+                n == "rmval" || n.rfind("rmval", 0) == 0 || n == "ea" ||
+                n == "rq" || n.rfind("rq", 0) == 0 || n == "immb" ||
+                n == "immw" || n == "immd" || n == "immq" || n == "immv" ||
+                n == "immz");
+    };
+    auto magicSize = [&](const std::string& n) {
+        // trailing digits carry the size: rreg8, rmreg16, rq64, rmval32
+        const char* d = n.c_str();
+        while (*d && !isdigit(static_cast<unsigned char>(*d))) d++;
+        return *d ? atoi(d) : xc.opsz;
+    };
+
+    auto readByte = [&](int off) -> uint8_t {
+        return (off >= 0 && off < maxTok) ? ((word[0] >> (8 * off)) & 0xFF)
+                                          : 0;
+    };
+    auto decodeModrm = [&](int off) -> bool {
+        xc.haveModrm = true;
+        const uint8_t b = readByte(off);
+        xc.mod = (b >> 6) & 3;
+        xc.reg = (b >> 3) & 7;
+        xc.rm = b & 7;
+        xc.cursor = off + 1;
+        xc.regReg = xc.reg | (xc.rexr ? 8 : 0);
+        if (xc.mod == 3) {
+            xc.isMem = false;
+            xc.rmReg = xc.rm | (xc.rexb ? 8 : 0);
+            return true;
+        }
+        xc.isMem = true;
+        const bool addr64 = !xc.addr67;
+        const int rm = xc.rm;
+        int64_t disp = 0;
+        int base = -1, index = -1, scale = 1;
+        if (addr64) {
+            if (rm == 4) {
+                const uint8_t sib = readByte(xc.cursor);
+                xc.cursor++;
+                scale = 1 << ((sib >> 6) & 3);
+                const int idx = (sib >> 3) & 7, bs = sib & 7;
+                if (idx != 4) index = idx | (xc.rexx ? 8 : 0);
+                if (!(bs == 5 && xc.mod == 0)) base = bs | (xc.rexb ? 8 : 0);
+            } else if (rm == 5 && xc.mod == 0) {
+                xc.ripRel = true;
+            } else {
+                base = rm | (xc.rexb ? 8 : 0);
+            }
+        } else {
+            if (rm == 4) {
+                const uint8_t sib = readByte(xc.cursor);
+                xc.cursor++;
+                scale = 1 << ((sib >> 6) & 3);
+                const int idx = (sib >> 3) & 7, bs = sib & 7;
+                if (idx != 4) index = idx;
+                if (!(bs == 5 && xc.mod == 0)) base = bs;
+            } else if (rm == 5 && xc.mod == 0) {
+                // disp32 absolute, no base
+            } else {
+                base = rm;
+            }
+        }
+        if (xc.mod == 1) {
+            disp = static_cast<int8_t>(readByte(xc.cursor));
+            xc.cursor++;
+        } else if (xc.mod == 2) {
+            uint32_t v = 0;
+            for (int i = 0; i < 4; ++i) v |= (uint32_t)readByte(xc.cursor + i) << (8 * i);
+            xc.cursor += 4;
+            disp = static_cast<int32_t>(v);
+        } else if (xc.mod == 0 &&
+                   ((addr64 && ((rm == 5) || (rm == 4 && base == -1))) ||
+                    (!addr64 && rm == 5))) {
+            uint32_t v = 0;
+            for (int i = 0; i < 4; ++i) v |= (uint32_t)readByte(xc.cursor + i) << (8 * i);
+            xc.cursor += 4;
+            disp = static_cast<int32_t>(v);
+        }
+        xc.base = base;
+        xc.index = index;
+        xc.scale = scale;
+        xc.disp = disp;
+        return true;
+    };
+
     // first full pattern match wins (declaration order)
     const SpecCtor* matched = nullptr;
     int insnSize = maxTok;
@@ -1064,13 +1210,78 @@ bool SleighEngine::disassemble(
         int usedTok = 0;
         opValues.clear();
         opFields.clear();
+        magicExports.clear();
         for (const auto& t : c.terms) {
-            const SpecField* f = findField(t.field);
+            const std::string& fn = t.field;
+            if (isMagic(fn)) {
+                if (fn == "rexw" || fn == "opsz") {
+                    const uint64_t v =
+                        (fn == "rexw") ? (xc.rexw ? 1 : 0)
+                                        : static_cast<uint64_t>(xc.opsz);
+                    if (t.kind == SpecCtor::Term::FIELD_EQ && v != t.value) {
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
+                if (fn == "modrm" || fn.rfind("modrm", 0) == 0) {
+                    int off = 1;
+                    if (fn.size() > 5) off = atoi(fn.c_str() + 5);
+                    if (!decodeModrm(off)) { ok = false; break; }
+                    continue;
+                }
+                // FIELD_EQ on register exports: /digit group check
+                if (t.kind == SpecCtor::Term::FIELD_EQ &&
+                    (fn.rfind("rreg", 0) == 0 || fn.rfind("rmreg", 0) == 0 ||
+                     fn.rfind("rq", 0) == 0)) {
+                    int idx = xc.regReg;
+                    if (fn.rfind("rmreg", 0) == 0) idx = xc.rmReg;
+                    else if (fn.rfind("rq", 0) == 0)
+                        idx = (readByte(0) & 7) | (xc.rexb ? 8 : 0);
+                    if (idx != static_cast<int>(t.value)) {
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
+                // export terms: register/ea/imm materialized after match
+                if (fn.rfind("rmreg", 0) == 0 &&
+                    (!xc.haveModrm || xc.mod != 3)) {
+                    ok = false;
+                    break;
+                }
+                if (fn == "rmmem" && (!xc.haveModrm || xc.mod == 3)) {
+                    ok = false;
+                    break;
+                }
+                if ((fn == "rreg" || fn.rfind("rreg", 0) == 0 || fn == "ea") &&
+                    !xc.haveModrm) {
+                    ok = false;
+                    break;
+                }
+                // advance the byte cursor for immediates during matching
+                // (the instruction size depends on it)
+                if (fn == "immb") xc.cursor += 1;
+                else if (fn == "immw") xc.cursor += 2;
+                else if (fn == "immd") xc.cursor += 4;
+                else if (fn == "immq") xc.cursor += 8;
+                else if (fn == "immv") xc.cursor += xc.opsz;
+                else if (fn == "immz") xc.cursor += xc.op66 ? 2 : 4;
+                magicExports.emplace_back(t.operand, fn);
+                continue;
+            }
+            const SpecField* f = findField(fn);
             if (!f) { ok = false; break; }
             usedTok = std::max(usedTok, tokens_[f->token].size);
             const uint64_t v = fieldValue(*f);
             if (t.kind == SpecCtor::Term::FIELD_EQ) {
                 if (v != t.value) { ok = false; break; }
+                // x86: advance the imm cursor past matched opcode bytes
+                if (archX86_) {
+                    if (fn == "opcode") xc.cursor = std::max(xc.cursor, 1);
+                    else if (fn == "op2") xc.cursor = std::max(xc.cursor, 2);
+                    else if (fn == "op3") xc.cursor = std::max(xc.cursor, 3);
+                }
             } else {
                 opValues[t.operand] = v;
                 opFields[t.operand] = t.field;
@@ -1078,7 +1289,8 @@ bool SleighEngine::disassemble(
         }
         if (ok) {
             matched = &c;
-            insnSize = std::max(usedTok, 1);
+            insnSize = archX86_ ? (xc.prefixLen + xc.cursor)
+                                : std::max(usedTok, 1);
             break;
         }
     }
@@ -1091,8 +1303,174 @@ bool SleighEngine::disassemble(
     nextId_ = 1;
     cache_.clear();
 
+    // ---- x86 helpers (need `out` and insnSize) ----
+    auto x86RegVarnode = [&](int idx, int size) -> uint64_t {
+        char nm[8];
+        if (size == 1) {
+            static const char* r8lo[8] = {"al", "cl", "dl", "bl",
+                                          "spl", "bpl", "sil", "dil"};
+            static const char* r8hi[8] = {"al", "cl", "dl", "bl",
+                                          "ah", "ch", "dh", "bh"};
+            if (idx >= 8)
+                std::snprintf(nm, sizeof(nm), "r%db", idx);
+            else if (xc.rex && idx >= 4)
+                std::snprintf(nm, sizeof(nm), "%s", r8lo[idx]);
+            else
+                std::snprintf(nm, sizeof(nm), "%s", r8hi[idx]);
+        } else if (size == 2) {
+            static const char* r16[8] = {"ax", "cx", "dx", "bx",
+                                         "sp", "bp", "si", "di"};
+            if (idx >= 8)
+                std::snprintf(nm, sizeof(nm), "r%dw", idx);
+            else
+                std::snprintf(nm, sizeof(nm), "%s", r16[idx]);
+        } else if (size == 4) {
+            static const char* r32[8] = {"eax", "ecx", "edx", "ebx",
+                                         "esp", "ebp", "esi", "edi"};
+            if (idx >= 8)
+                std::snprintf(nm, sizeof(nm), "r%dd", idx);
+            else
+                std::snprintf(nm, sizeof(nm), "%s", r32[idx]);
+        } else {
+            static const char* r64[8] = {"rax", "rcx", "rdx", "rbx",
+                                         "rsp", "rbp", "rsi", "rdi"};
+            if (idx >= 8)
+                std::snprintf(nm, sizeof(nm), "r%d", idx);
+            else
+                std::snprintf(nm, sizeof(nm), "%s", r64[idx]);
+        }
+        Varnode* v = makeVarnode(out, Varnode::REGISTER,
+                                 static_cast<uint64_t>(idx) * 8, size, nm);
+        return v->id;
+    };
+    auto addrText = [&]() -> std::string {
+        std::string s = "[";
+        bool any = false;
+        auto rn = [&](int idx) {
+            char b[8];
+            std::snprintf(b, sizeof(b), "r%d", idx);
+            static const char* r64[8] = {"rax", "rcx", "rdx", "rbx",
+                                         "rsp", "rbp", "rsi", "rdi"};
+            return idx >= 8 ? std::string(b) : std::string(r64[idx]);
+        };
+        if (xc.ripRel) {
+            char b[24];
+            std::snprintf(b, sizeof(b), "0x%llx",
+                          static_cast<unsigned long long>(addr + insnSize +
+                                                          xc.disp));
+            return b;
+        }
+        if (xc.base >= 0) {
+            s += rn(xc.base);
+            any = true;
+        }
+        if (xc.index >= 0) {
+            if (any) s += " + ";
+            s += rn(xc.index);
+            if (xc.scale > 1) s += "*" + std::to_string(xc.scale);
+            any = true;
+        }
+        if (xc.disp != 0 || !any) {
+            if (any) {
+                s += xc.disp >= 0 ? " + " : " - ";
+                char b[24];
+                std::snprintf(b, sizeof(b), "0x%llx",
+                              static_cast<unsigned long long>(
+                                  xc.disp < 0 ? -xc.disp : xc.disp));
+                s += b;
+            } else {
+                char b[24];
+                std::snprintf(b, sizeof(b), "0x%llx",
+                              static_cast<unsigned long long>(xc.disp));
+                s += b;
+            }
+        }
+        s += "]";
+        return s;
+    };
+    auto materializeAddr = [&]() -> uint64_t {
+        if (xc.ripRel) {
+            Varnode* v = makeVarnode(out, Varnode::CONST,
+                                     addr + insnSize + xc.disp, 8);
+            return v->id;
+        }
+        std::vector<uint64_t> parts;
+        if (xc.base >= 0) parts.push_back(x86RegVarnode(xc.base, 8));
+        if (xc.index >= 0) {
+            uint64_t v = x86RegVarnode(xc.index, 8);
+            if (xc.scale > 1) {
+                Varnode* t = makeVarnode(out, Varnode::UNIQUE, nextId_++, 8);
+                out.ops.push_back(PcodeOp{POp::INT_MULT, t->id, v,
+                                          constVarnode(out, xc.scale, 8), 0});
+                v = t->id;
+            }
+            parts.push_back(v);
+        }
+        if (xc.disp != 0) {
+            Varnode* c = makeVarnode(out, Varnode::CONST,
+                                     static_cast<uint64_t>(xc.disp), 8);
+            parts.push_back(c->id);
+        }
+        if (parts.empty()) return constVarnode(out, 0, 8);
+        uint64_t acc = parts[0];
+        for (size_t i = 1; i < parts.size(); ++i) {
+            Varnode* t = makeVarnode(out, Varnode::UNIQUE, nextId_++, 8);
+            out.ops.push_back(PcodeOp{POp::INT_ADD, t->id, acc, parts[i], 0});
+            acc = t->id;
+        }
+        return acc;
+    };
+
+    // materialize magic exports (registers, addresses, immediates)
+    for (const auto& [opname, mname] : magicExports) {
+        if (mname == "rreg" || mname.rfind("rreg", 0) == 0) {
+            out.named[opname] = x86RegVarnode(xc.regReg, magicSize(mname));
+        } else if (mname == "rmreg" || mname.rfind("rmreg", 0) == 0) {
+            out.named[opname] = x86RegVarnode(xc.rmReg, magicSize(mname));
+        } else if (mname == "rq" || mname.rfind("rq", 0) == 0) {
+            const int idx = (readByte(0) & 7) | (xc.rexb ? 8 : 0);
+            out.named[opname] = x86RegVarnode(idx, magicSize(mname));
+        } else if (mname == "rmmem") {
+            const uint64_t ea = materializeAddr();
+            auto it = out.varnodes.find(ea);
+            if (it != out.varnodes.end() && it->second.kind == Varnode::UNIQUE)
+                it->second.name = addrText();
+            out.named[opname] = ea;
+        } else if (mname == "ea") {
+            out.named[opname] = materializeAddr();
+        } else if (mname == "rmval" || mname.rfind("rmval", 0) == 0) {
+            const int size = magicSize(mname);
+            if (!xc.isMem) {
+                out.named[opname] = x86RegVarnode(xc.rmReg, size);
+            } else {
+                const uint64_t ea = materializeAddr();
+                Varnode* t = makeVarnode(out, Varnode::UNIQUE, nextId_++, size);
+                t->name = addrText();
+                out.ops.push_back(PcodeOp{POp::LOAD, t->id, ea, 0, 0});
+                out.named[opname] = t->id;
+            }
+        } else if (mname == "immb" || mname == "immw" || mname == "immd" ||
+                   mname == "immq" || mname == "immv" || mname == "immz") {
+            const int n = mname == "immb" ? 1
+                          : mname == "immw" ? 2
+                          : mname == "immd" ? 4
+                          : mname == "immq" ? 8
+                          : mname == "immz" ? (xc.op66 ? 2 : 4)
+                                            : xc.opsz;
+            uint64_t v = 0;
+            // cursor was advanced during matching; read the bytes before it
+            for (int i = 0; i < n; ++i)
+                v |= static_cast<uint64_t>(readByte(xc.cursor - n + i))
+                     << (8 * i);
+            // cursor was already advanced during matching
+            Varnode* c = makeVarnode(out, Varnode::CONST, v, n);
+            out.named[opname] = c->id;
+        }
+    }
+
     // create operand varnodes (named for semantics + rendering)
     for (const auto& oname : matched->operands) {
+        if (out.named.count(oname)) continue; // magic export already made
         auto it = opValues.find(oname);
         if (it == opValues.end()) continue; // e.g. 'rd=1' not exported
         const SpecField* f = nullptr;

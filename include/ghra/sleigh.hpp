@@ -119,6 +119,8 @@ private:
     std::vector<SpecField> fields_; // flattened; SpecField::token indexes tokens_
     std::map<std::string, int> fieldIdx_;
     std::vector<SpecCtor> ctors_;
+    bool archX86_ = false; // x86-style: prefix scan + ModRM magic terms
+    mutable int x86Opsz_ = 0; // current operand size during disassembly
 
     // per-instruction emission state
     mutable uint64_t nextId_ = 1;

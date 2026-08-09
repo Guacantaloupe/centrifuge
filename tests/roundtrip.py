@@ -2,12 +2,34 @@
 """Round-trip test: decompile functions from real compiler output, wrap the
 output as C, compile it, and check it produces the same results as the
 original C."""
-import re, subprocess, sys, os
+import argparse
+import atexit
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
 
-SPEC = "sleigh/riscv64.slaspec"
-ELF = "tests/real_riscv2.elf"
-GHR = "./build/centrifuge.exe"
-CC = "gcc"
+parser = argparse.ArgumentParser()
+parser.add_argument("--centrifuge", default="build/centrifuge.exe")
+parser.add_argument("--source-dir", default=str(Path(__file__).resolve().parents[1]))
+parser.add_argument("--cc", default="gcc")
+parser.add_argument("--work-dir")
+args = parser.parse_args()
+
+ROOT = Path(args.source_dir).resolve()
+SPEC = ROOT / "sleigh" / "riscv64.slaspec"
+ELF = ROOT / "tests" / "real_riscv2.elf"
+GHR = Path(args.centrifuge).resolve()
+CC = args.cc
+if args.work_dir:
+    WORK = Path(args.work_dir).resolve()
+    WORK.mkdir(parents=True, exist_ok=True)
+else:
+    WORK = Path(tempfile.mkdtemp(prefix="centrifuge-roundtrip-"))
+    atexit.register(shutil.rmtree, WORK, ignore_errors=True)
 
 FUNCS = [
     # name, addr, argc, kind ("plain" | "array"), vectors
@@ -24,7 +46,8 @@ REG_DECL = (
 )
 
 def decompile(name, addr):
-    r = subprocess.run([GHR, "spec", SPEC, ELF, "decompile", hex(addr)],
+    r = subprocess.run([str(GHR), "spec", str(SPEC), str(ELF),
+                        "decompile", hex(addr)],
                        capture_output=True, text=True, check=True)
     lines = [l for l in r.stdout.splitlines()
              if l.strip() and not l.startswith("// decompiled")]
@@ -70,10 +93,11 @@ for name, addr, argc, kind, vectors in FUNCS:
             harness.append('    printf("%%lld\\n", (long long)%s(%s));' % (name, args))
 harness.append("    return 0;")
 harness.append("}")
-open("tests/dec_harness.c", "w").write("\n".join(harness) + "\n")
+dec_source = WORK / "dec_harness.c"
+dec_source.write_text("\n".join(harness) + "\n", encoding="utf-8")
 
 # original ground truth (drop the source's main - it has nested braces)
-src = open("tests/real_riscv2.c").read()
+src = (ROOT / "tests" / "real_riscv2.c").read_text(encoding="utf-8")
 i = src.find('int main')
 if i >= 0:
     src = src[:i]
@@ -93,18 +117,22 @@ for name, addr, argc, kind, vectors in FUNCS:
             orig.append('    printf("%%lld\\n", (long long)%s(%s));' % (name, args))
 orig.append("    return 0;")
 orig.append("}")
-open("tests/orig_harness.c", "w").write("\n".join(orig) + "\n")
+orig_source = WORK / "orig_harness.c"
+orig_source.write_text("\n".join(orig) + "\n", encoding="utf-8")
 
-for src, exe in [("tests/dec_harness.c", "tests/dec_test.exe"),
-                 ("tests/orig_harness.c", "tests/orig_test.exe")]:
-    r = subprocess.run([CC, "-O0", "-o", exe, src], capture_output=True, text=True)
+exe_suffix = ".exe" if os.name == "nt" else ""
+dec_exe = WORK / ("dec_test" + exe_suffix)
+orig_exe = WORK / ("orig_test" + exe_suffix)
+for source, exe in [(dec_source, dec_exe), (orig_source, orig_exe)]:
+    r = subprocess.run([CC, "-O0", "-o", str(exe), str(source)],
+                       capture_output=True, text=True)
     if r.returncode != 0:
-        print("COMPILE FAIL:", src)
+        print("COMPILE FAIL:", source)
         print(r.stderr)
         sys.exit(1)
 
-d = subprocess.run(["./tests/dec_test.exe"], capture_output=True, text=True, check=True).stdout
-o = subprocess.run(["./tests/orig_test.exe"], capture_output=True, text=True, check=True).stdout
+d = subprocess.run([str(dec_exe)], capture_output=True, text=True, check=True).stdout
+o = subprocess.run([str(orig_exe)], capture_output=True, text=True, check=True).stdout
 dl, ol = d.splitlines(), o.splitlines()
 if dl == ol:
     print("ROUND-TRIP OK: decompiled output matches original C on %d test vectors" % len(dl))

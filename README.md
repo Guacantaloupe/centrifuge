@@ -33,6 +33,32 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
+Run the unit and decompiler round-trip tests with CTest:
+
+```sh
+ctest --test-dir build --output-on-failure
+```
+
+For a GCC or Clang toolchain that provides the sanitizer runtimes, create a
+separate ASan/UBSan build:
+
+```sh
+cmake -S . -B build-sanitize -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DCENTRIFUGE_ENABLE_SANITIZERS=ON
+cmake --build build-sanitize
+ctest --test-dir build-sanitize --output-on-failure
+```
+
+With Clang, the in-memory loader can also be exercised through libFuzzer:
+
+```sh
+cmake -S . -B build-fuzz -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Debug -DCENTRIFUGE_ENABLE_SANITIZERS=ON \
+  -DCENTRIFUGE_BUILD_FUZZERS=ON
+cmake --build build-fuzz --target fuzz_loader
+build-fuzz/fuzz_loader -max_total_time=60 samples
+```
+
 ## Usage
 
 ```
@@ -40,7 +66,7 @@ centrifuge <file> info               # format, arch, entry, sections, symbols
 centrifuge <file> funcs              # discovered functions
 centrifuge <file> disasm <addr> [n]  # disassemble n instructions
 centrifuge <file> dump <addr> <size> # hexdump
-centrifuge spec <spec.slaspec> <file> disasm|funcs|pcode|cfg|decompile
+centrifuge spec <spec.slaspec> <file> disasm|funcs|pcode|cfg|analyze|decompile
 ```
 
 ## Architecture
@@ -56,6 +82,8 @@ src/disasm_riscv.cpp    hand-written RV32I/RV64I + M + C decoder
 src/pcode.cpp           p-code IR (varnodes, ops, interpreter)
 src/sleigh.cpp          SLEIGH-lite: spec parser, pattern matcher, p-code emitter
 src/cfg.cpp             CFG construction + iterative dominators
+src/ir.cpp              function SSA, data-flow types, ABI signatures,
+                        optimizer, exception edges, and jump tables
 src/decompile.cpp       C decompiler (expression reconstruction, stack
                         frames, calls, if/return structuring)
 sleigh/riscv64.slaspec  RISC-V RV64IMC language module (incl. compressed)

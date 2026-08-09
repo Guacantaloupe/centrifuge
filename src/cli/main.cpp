@@ -19,6 +19,7 @@
 #include "centrifuge/decompile.hpp"
 #include "centrifuge/disasm.hpp"
 #include "centrifuge/loader.hpp"
+#include "centrifuge/ir.hpp"
 #include "centrifuge/pcode.hpp"
 #include "centrifuge/sleigh.hpp"
 
@@ -165,6 +166,8 @@ void usage(const char* argv0) {
     std::printf("  %s spec <spec.slaspec> <file> pcode <addr> [count]\n",
                 argv0);
     std::printf("  %s spec <spec.slaspec> <file> cfg <addr> [end]\n", argv0);
+    std::printf("  %s spec <spec.slaspec> <file> analyze <addr> [end] [abi]\n",
+                argv0);
     std::printf("  %s spec <spec.slaspec> <file> decompile <addr> [end]\n",
                 argv0);
 }
@@ -284,7 +287,10 @@ int cmdSpec(int argc, char** argv) {
         uint64_t end = 0;
         if (argc >= 7) end = std::strtoull(argv[6], nullptr, 0);
         CfgBuilder cfg;
-        if (!cfg.build(*eng, reader, addr, end)) {
+        auto executable = [&](uint64_t target) {
+            return prog->memory.isExecutable(target);
+        };
+        if (!cfg.build(*eng, reader, addr, end, executable)) {
             std::fprintf(stderr, "centrifuge: cfg build failed\n");
             return 1;
         }
@@ -295,12 +301,77 @@ int cmdSpec(int argc, char** argv) {
             for (uint64_t s : b.succs)
                 std::printf(" -> 0x%llx",
                             static_cast<unsigned long long>(s));
+            for (uint64_t target : b.calls)
+                std::printf(" call 0x%llx",
+                            static_cast<unsigned long long>(target));
+            if (b.tailCallTarget)
+                std::printf(" tail 0x%llx",
+                            static_cast<unsigned long long>(*b.tailCallTarget));
+            std::printf("\n");
+        }
+        for (const auto& loop : cfg.loops()) {
+            std::printf("loop 0x%llx (%zu blocks, %zu exits)",
+                        static_cast<unsigned long long>(loop.header),
+                        loop.blocks.size(), loop.exits.size());
+            if (loop.parentHeader)
+                std::printf(" parent 0x%llx",
+                            static_cast<unsigned long long>(*loop.parentHeader));
             std::printf("\n");
         }
         std::printf("dominators(entry):");
         for (uint64_t d : cfg.dominators(addr))
             std::printf(" 0x%llx", static_cast<unsigned long long>(d));
         std::printf("\n");
+        return 0;
+    }
+    if (cmd == "analyze") {
+        if (argc < 6) { usage(argv[0]); return 1; }
+        uint64_t addr = 0;
+        if (!parseAddr(argv[5], addr)) {
+            std::fprintf(stderr, "centrifuge: bad address '%s'\n", argv[5]);
+            return 1;
+        }
+        uint64_t end = 0;
+        if (argc >= 7 && !parseAddr(argv[6], end)) {
+            std::fprintf(stderr, "centrifuge: bad end address '%s'\n", argv[6]);
+            return 1;
+        }
+        const std::string abi = argc >= 8 ? argv[7] : std::string();
+        CfgBuilder cfg;
+        auto executable = [&](uint64_t target) {
+            return prog->memory.isExecutable(target);
+        };
+        if (!cfg.build(*eng, reader, addr, end, executable)) {
+            std::fprintf(stderr, "centrifuge: cfg build failed\n");
+            return 1;
+        }
+        cfg.applyExceptionRegions(prog->exceptionRegions);
+        FunctionIR ir;
+        if (!ir.build(cfg, prog->arch, abi)) {
+            std::fprintf(stderr, "centrifuge: SSA construction failed\n");
+            return 1;
+        }
+        ir.inferTypes();
+        const FunctionSignature signature = ir.inferSignature();
+        ir.optimize();
+        std::string functionName = "FUN_" + hexAddr(addr).substr(2);
+        for (const auto& symbol : prog->symbols)
+            if (symbol.isFunction && symbol.addr == addr) {
+                functionName = symbol.name;
+                break;
+            }
+        std::printf("signature: %s\n", signature.declaration(functionName).c_str());
+        std::printf("ssa: %zu blocks, %zu phi nodes, %zu live operations\n",
+                    ir.blocks().size(), ir.phiCount(), ir.liveOpCount());
+        const int pointerSize = prog->arch == "x86" ? 4 : 8;
+        for (const JumpTable& table : recoverJumpTables(cfg, prog->memory,
+                                                        pointerSize)) {
+            std::printf("jump-table 0x%llx at 0x%llx (%zu targets%s)\n",
+                        static_cast<unsigned long long>(table.dispatchAddress),
+                        static_cast<unsigned long long>(table.tableAddress),
+                        table.targets.size(), table.relative ? ", relative" : "");
+        }
+        std::printf("%s", ir.dump().c_str());
         return 0;
     }
     if (cmd == "decompile") {

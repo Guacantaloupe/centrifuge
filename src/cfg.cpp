@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <limits>
+#include <map>
 #include <set>
 
 namespace centrifuge {
@@ -11,67 +13,137 @@ namespace centrifuge {
 bool CfgBuilder::build(
     const SleighEngine& eng,
     const std::function<bool(uint64_t, void*, size_t)>& read, uint64_t start,
-    uint64_t end) {
+    uint64_t end, const std::function<bool(uint64_t)>& isExecutable) {
     blocks_.clear();
     idx_.clear();
+    loops_.clear();
+    entry_ = start;
+
+    if (end != 0 && start >= end) return false;
+
+    // Phase 1: discover the reachable instruction graph. Keeping this at
+    // instruction granularity lets us collect every leader before blocks are
+    // formed, including targets that point into a previously explored run.
+    std::map<uint64_t, PcodeInsn> insns;
+    std::map<uint64_t, std::vector<uint64_t>> flow;
+    std::map<uint64_t, std::vector<uint64_t>> calls;
+    std::map<uint64_t, uint64_t> tailCalls;
+    std::set<uint64_t> leaders{start};
     std::vector<uint64_t> worklist{start};
-    std::set<uint64_t> starts{start}; // known block starts (boundaries)
-    std::set<uint64_t> built;
+
+    auto readable = [&](uint64_t addr) {
+        uint8_t byte = 0;
+        return (!isExecutable || isExecutable(addr)) && read(addr, &byte, 1);
+    };
+    auto inFunction = [&](uint64_t addr) {
+        return end == 0 || (addr >= start && addr < end);
+    };
+    auto addUnique = [](std::vector<uint64_t>& values, uint64_t value) {
+        if (std::find(values.begin(), values.end(), value) == values.end())
+            values.push_back(value);
+    };
+    auto enqueue = [&](uint64_t from, uint64_t target, bool leader) {
+        if (!inFunction(target) || !readable(target)) return false;
+        addUnique(flow[from], target);
+        if (leader) leaders.insert(target);
+        if (!insns.count(target)) worklist.push_back(target);
+        return true;
+    };
+
     while (!worklist.empty()) {
         const uint64_t a = worklist.back();
         worklist.pop_back();
-        if (built.count(a)) continue;
-        built.insert(a);
+        if (insns.count(a) || !inFunction(a) || !readable(a)) continue;
 
-        CfgBlock blk;
-        blk.start = a;
-        uint64_t cur = a;
-        for (;;) {
-            if (end != 0 && cur >= end) {
-                blk.end = cur;
-                break;
-            }
-            // stop at the start of another block (fallthrough edge)
-            if (cur != a && starts.count(cur)) {
-                blk.end = cur;
-                blk.succs.push_back(cur);
-                break;
-            }
-            PcodeInsn pi;
-            std::string err;
-            if (!eng.disassemble(read, cur, pi, err)) {
-                blk.end = cur;
-                break;
-            }
-            blk.insns.push_back(pi);
-            cur += pi.size;
-            if (pi.kind == Insn::RET) {
-                blk.end = cur;
-                break;
-            }
-            if (pi.kind == Insn::JMP) {
-                blk.end = cur;
-                if (pi.targetKnown && starts.insert(pi.target).second)
-                    worklist.push_back(pi.target);
-                break;
-            }
-            if (pi.kind == Insn::JCC) {
-                blk.end = cur;
-                blk.succs.push_back(cur); // fallthrough first
-                if (starts.insert(cur).second) worklist.push_back(cur);
-                if (pi.targetKnown) {
-                    blk.succs.push_back(pi.target);
-                    if (starts.insert(pi.target).second)
-                        worklist.push_back(pi.target);
-                }
-                break;
-            }
-            // CALL / OTHER: block continues
+        PcodeInsn pi;
+        std::string err;
+        if (!eng.disassemble(read, a, pi, err) || pi.size <= 0 ||
+            static_cast<uint64_t>(pi.size) >
+                std::numeric_limits<uint64_t>::max() - a)
+            continue;
+
+        const uint64_t next = a + static_cast<uint64_t>(pi.size);
+        insns.emplace(a, pi);
+
+        switch (pi.kind) {
+        case Insn::RET:
+            break;
+        case Insn::JMP:
+            if (pi.targetKnown && !enqueue(a, pi.target, true) && end != 0 &&
+                !inFunction(pi.target))
+                tailCalls.emplace(a, pi.target);
+            break;
+        case Insn::JCC:
+            enqueue(a, next, true); // fallthrough stays first
+            if (pi.targetKnown) enqueue(a, pi.target, true);
+            break;
+        case Insn::CALL:
+            if (pi.targetKnown) addUnique(calls[a], pi.target);
+            enqueue(a, next, false);
+            break;
+        case Insn::OTHER:
+        case Insn::NOP:
+            enqueue(a, next, false);
+            break;
         }
-        blocks_.push_back(blk);
-        idx_[a] = blocks_.size() - 1;
     }
-    return !blocks_.empty();
+
+    if (!insns.count(start)) return false;
+
+    // Phase 2: form maximal basic blocks using the complete leader set.
+    std::set<uint64_t> assigned;
+    for (uint64_t leader : leaders) {
+        if (!insns.count(leader) || assigned.count(leader)) continue;
+        CfgBlock block;
+        block.start = leader;
+        uint64_t cur = leader;
+        for (;;) {
+            auto it = insns.find(cur);
+            if (it == insns.end() || assigned.count(cur)) break;
+            const PcodeInsn& pi = it->second;
+            block.insns.push_back(pi);
+            assigned.insert(cur);
+            block.end = cur + static_cast<uint64_t>(pi.size);
+
+            auto callIt = calls.find(cur);
+            if (callIt != calls.end())
+                for (uint64_t target : callIt->second)
+                    addUnique(block.calls, target);
+
+            auto tailIt = tailCalls.find(cur);
+            if (tailIt != tailCalls.end()) {
+                block.tailCallTarget = tailIt->second;
+                break;
+            }
+
+            const auto flowIt = flow.find(cur);
+            const std::vector<uint64_t> noFlow;
+            const auto& nexts = flowIt == flow.end() ? noFlow : flowIt->second;
+            if (pi.kind == Insn::RET || pi.kind == Insn::JMP ||
+                pi.kind == Insn::JCC || nexts.empty()) {
+                for (uint64_t target : nexts)
+                    if (leaders.count(target)) addUnique(block.succs, target);
+                break;
+            }
+
+            const uint64_t next = nexts.front();
+            if (leaders.count(next)) {
+                addUnique(block.succs, next);
+                break;
+            }
+            cur = next;
+        }
+        blocks_.push_back(std::move(block));
+    }
+
+    std::sort(blocks_.begin(), blocks_.end(),
+              [](const CfgBlock& a, const CfgBlock& b) {
+                  return a.start < b.start;
+              });
+    for (size_t i = 0; i < blocks_.size(); ++i) idx_[blocks_[i].start] = i;
+    if (!blockAt(start)) return false;
+    findNaturalLoops();
+    return true;
 }
 
 const CfgBlock* CfgBuilder::blockAt(uint64_t startAddr) const {
@@ -86,27 +158,31 @@ size_t CfgBuilder::indexOf(uint64_t start) const {
 
 std::set<uint64_t> CfgBuilder::predecessors(uint64_t blockStart) const {
     std::set<uint64_t> p;
-    for (const auto& b : blocks_)
+    for (const auto& b : blocks_) {
         for (uint64_t s : b.succs)
             if (s == blockStart) p.insert(b.start);
+        for (uint64_t s : b.exceptionSuccs)
+            if (s == blockStart) p.insert(b.start);
+    }
     return p;
 }
 
 std::set<uint64_t> CfgBuilder::dominators(uint64_t blockStart) const {
+    if (!idx_.count(blockStart) || !idx_.count(entry_)) return {};
     // iterative dataflow: dom(b) = {b} ∪ ⋂ dom(p)
     std::set<uint64_t> all;
     for (const auto& b : blocks_) all.insert(b.start);
 
     std::map<uint64_t, std::set<uint64_t>> dom;
     for (const auto& b : blocks_) {
-        if (b.start == blockStart) dom[b.start] = {b.start};
+        if (b.start == entry_) dom[b.start] = {b.start};
         else dom[b.start] = all;
     }
     bool changed = true;
     while (changed) {
         changed = false;
         for (const auto& b : blocks_) {
-            if (b.start == blockStart) continue;
+            if (b.start == entry_) continue;
             std::set<uint64_t> preds = predecessors(b.start);
             std::set<uint64_t> nd;
             bool first = true;
@@ -128,7 +204,114 @@ std::set<uint64_t> CfgBuilder::dominators(uint64_t blockStart) const {
             }
         }
     }
-    return dom[blockStart];
+    return dom.at(blockStart);
+}
+
+void CfgBuilder::findNaturalLoops() {
+    loops_.clear();
+    std::map<uint64_t, size_t> byHeader;
+
+    for (const auto& tail : blocks_) {
+        const auto tailDom = dominators(tail.start);
+        for (uint64_t header : tail.succs) {
+            if (!tailDom.count(header)) continue; // not a back edge
+
+            size_t loopIndex = 0;
+            auto found = byHeader.find(header);
+            if (found == byHeader.end()) {
+                loopIndex = loops_.size();
+                byHeader.emplace(header, loopIndex);
+                NaturalLoop loop;
+                loop.header = header;
+                loop.blocks.insert(header);
+                loops_.push_back(std::move(loop));
+            } else {
+                loopIndex = found->second;
+            }
+
+            NaturalLoop& loop = loops_[loopIndex];
+            loop.backEdges.emplace_back(tail.start, header);
+            std::vector<uint64_t> worklist;
+            if (loop.blocks.insert(tail.start).second && tail.start != header)
+                worklist.push_back(tail.start);
+            while (!worklist.empty()) {
+                const uint64_t block = worklist.back();
+                worklist.pop_back();
+                for (uint64_t pred : predecessors(block)) {
+                    if (loop.blocks.insert(pred).second && pred != header)
+                        worklist.push_back(pred);
+                }
+            }
+        }
+    }
+
+    for (auto& loop : loops_) {
+        for (uint64_t blockAddr : loop.blocks) {
+            const CfgBlock* block = blockAt(blockAddr);
+            if (!block) continue;
+            for (uint64_t succ : block->succs)
+                if (!loop.blocks.count(succ))
+                    loop.exits.emplace_back(blockAddr, succ);
+        }
+        std::sort(loop.backEdges.begin(), loop.backEdges.end());
+        loop.backEdges.erase(
+            std::unique(loop.backEdges.begin(), loop.backEdges.end()),
+            loop.backEdges.end());
+        std::sort(loop.exits.begin(), loop.exits.end());
+        loop.exits.erase(std::unique(loop.exits.begin(), loop.exits.end()),
+                         loop.exits.end());
+    }
+
+    // The smallest strict superset is the immediate parent loop.
+    for (auto& child : loops_) {
+        const NaturalLoop* parent = nullptr;
+        for (const auto& candidate : loops_) {
+            if (candidate.header == child.header ||
+                candidate.blocks.size() <= child.blocks.size())
+                continue;
+            if (!std::includes(candidate.blocks.begin(), candidate.blocks.end(),
+                               child.blocks.begin(), child.blocks.end()))
+                continue;
+            if (!parent || candidate.blocks.size() < parent->blocks.size())
+                parent = &candidate;
+        }
+        if (parent) child.parentHeader = parent->header;
+    }
+
+    std::sort(loops_.begin(), loops_.end(),
+              [](const NaturalLoop& a, const NaturalLoop& b) {
+                  return a.header < b.header;
+              });
+}
+
+const NaturalLoop* CfgBuilder::loopByHeader(uint64_t header) const {
+    for (const auto& loop : loops_)
+        if (loop.header == header) return &loop;
+    return nullptr;
+}
+
+const NaturalLoop* CfgBuilder::innermostLoopForBlock(uint64_t blockStart) const {
+    const NaturalLoop* result = nullptr;
+    for (const auto& loop : loops_) {
+        if (!loop.blocks.count(blockStart)) continue;
+        if (!result || loop.blocks.size() < result->blocks.size()) result = &loop;
+    }
+    return result;
+}
+
+void CfgBuilder::applyExceptionRegions(
+    const std::vector<ExceptionRegion>& regions) {
+    for (auto& block : blocks_) {
+        block.exceptionSuccs.clear();
+        for (const auto& region : regions) {
+            if (!region.handler || block.end <= region.start || block.start >= region.end)
+                continue;
+            if (std::find(block.exceptionSuccs.begin(), block.exceptionSuccs.end(),
+                          region.handler) == block.exceptionSuccs.end())
+                block.exceptionSuccs.push_back(region.handler);
+        }
+        std::sort(block.exceptionSuccs.begin(), block.exceptionSuccs.end());
+    }
 }
 
 std::string CfgBuilder::dot() const {
@@ -143,6 +326,27 @@ std::string CfgBuilder::dot() const {
             std::snprintf(buf, sizeof(buf), "  L%llx -> L%llx;\n",
                           static_cast<unsigned long long>(b.start),
                           static_cast<unsigned long long>(t));
+            s += buf;
+        }
+        for (uint64_t t : b.calls) {
+            std::snprintf(buf, sizeof(buf),
+                          "  L%llx -> L%llx [style=dashed,label=\"call\"];\n",
+                          static_cast<unsigned long long>(b.start),
+                          static_cast<unsigned long long>(t));
+            s += buf;
+        }
+        for (uint64_t t : b.exceptionSuccs) {
+            std::snprintf(buf, sizeof(buf),
+                          "  L%llx -> L%llx [style=dotted,color=red,label=\"exception\"];\n",
+                          static_cast<unsigned long long>(b.start),
+                          static_cast<unsigned long long>(t));
+            s += buf;
+        }
+        if (b.tailCallTarget) {
+            std::snprintf(buf, sizeof(buf),
+                          "  L%llx -> L%llx [style=dashed,label=\"tail\"];\n",
+                          static_cast<unsigned long long>(b.start),
+                          static_cast<unsigned long long>(*b.tailCallTarget));
             s += buf;
         }
     }

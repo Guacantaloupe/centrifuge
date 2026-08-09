@@ -28,6 +28,15 @@ struct Symbol {
     bool isExported = false; // came from dynsym / PE export table
 };
 
+struct ExceptionRegion {
+    enum Kind { WINDOWS_UNWIND, DWARF_CFI } kind = WINDOWS_UNWIND;
+    uint64_t start = 0;
+    uint64_t end = 0;
+    uint64_t unwindInfo = 0;
+    uint64_t handler = 0;
+    uint64_t languageData = 0;
+};
+
 struct Program {
     std::string path;
     std::string format; // "ELF64" | "ELF32" | "PE32+" | "PE32"
@@ -36,10 +45,34 @@ struct Program {
     uint64_t entryPoint = 0;
     std::vector<Section> sections;
     std::vector<Symbol> symbols;
+    std::vector<ExceptionRegion> exceptionRegions;
     MemoryImage memory;
+};
+
+struct LoadOptions {
+    // Maximum cumulative number of bytes materialized in the memory image.
+    // Callers processing untrusted inputs can lower this to limit allocations.
+    uint64_t maxMappedBytes = 1ULL << 30;
 };
 
 // Load any supported binary. Returns nullopt and sets `error` on failure.
 std::optional<Program> loadFile(const std::string& path, std::string& error);
+
+// Load a supported binary directly from memory. `virtualPath` is retained in
+// Program::path for diagnostics and does not need to exist on disk.
+std::optional<Program> loadData(const uint8_t* data, size_t size,
+                                const std::string& virtualPath,
+                                std::string& error);
+std::optional<Program> loadData(const uint8_t* data, size_t size,
+                                const std::string& virtualPath,
+                                const LoadOptions& options,
+                                std::string& error);
+std::optional<Program> loadData(const std::vector<uint8_t>& data,
+                                const std::string& virtualPath,
+                                std::string& error);
+std::optional<Program> loadData(const std::vector<uint8_t>& data,
+                                const std::string& virtualPath,
+                                const LoadOptions& options,
+                                std::string& error);
 
 } // namespace centrifuge

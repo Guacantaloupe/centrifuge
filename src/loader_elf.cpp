@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace centrifuge {
@@ -64,6 +65,7 @@ constexpr uint32_t SHT_NULL = 0;
 constexpr uint32_t PT_LOAD = 1;
 constexpr uint32_t SHT_SYMTAB = 2;
 constexpr uint32_t SHT_STRTAB = 3;
+constexpr uint32_t SHT_NOBITS = 8;
 constexpr uint32_t SHT_DYNSYM = 11;
 constexpr uint32_t SHF_WRITE = 0x1;
 constexpr uint32_t SHF_ALLOC = 0x2;
@@ -71,10 +73,19 @@ constexpr uint32_t SHF_EXECINSTR = 0x4;
 constexpr uint32_t STT_FUNC = 2;
 constexpr uint32_t STB_GLOBAL = 1;
 constexpr uint32_t STB_WEAK = 2;
+bool rangeInFile(uint64_t off, uint64_t size, size_t fileSize) {
+    return off <= fileSize && size <= static_cast<uint64_t>(fileSize) - off;
+}
+
+bool addOk(uint64_t a, uint64_t b, uint64_t& out) {
+    if (b > std::numeric_limits<uint64_t>::max() - a) return false;
+    out = a + b;
+    return true;
+}
 
 template <typename T>
 bool rd(const std::vector<uint8_t>& d, size_t off, T& out) {
-    if (off + sizeof(T) > d.size()) return false;
+    if (off > d.size() || sizeof(T) > d.size() - off) return false;
     std::memcpy(&out, d.data() + off, sizeof(T));
     return true;
 }
@@ -101,40 +112,40 @@ std::string archForElf(bool is64, uint16_t machine) {
     return a;
 }
 
-// Merge overlapping PT_LOAD segments into a single non-overlapping set so the
-// MemoryImage (which forbids overlaps) can host the runtime image.
 struct Seg {
     uint64_t vaddr, memsz, filesz, off;
     int perm;
 };
-std::vector<Seg> mergeSegments(std::vector<Seg> segs) {
+struct SegGroup {
+    uint64_t base = 0;
+    uint64_t end = 0;
+    int perm = 0;
+    std::vector<Seg> members;
+};
+
+std::vector<SegGroup> groupSegments(std::vector<Seg> segs) {
     std::sort(segs.begin(), segs.end(),
               [](const Seg& a, const Seg& b) { return a.vaddr < b.vaddr; });
-    std::vector<Seg> out;
+    std::vector<SegGroup> out;
     for (auto& s : segs) {
         if (s.memsz == 0) continue;
-        if (!out.empty()) {
-            Seg& last = out.back();
-            const uint64_t lastEnd = last.vaddr + last.memsz;
-            if (s.vaddr <= lastEnd) { // overlap or adjacent
-                const uint64_t newEnd = std::max(lastEnd, s.vaddr + s.memsz);
-                const uint64_t oldFileszEnd = last.vaddr + last.filesz;
-                const uint64_t sFileszEnd = s.vaddr + s.filesz;
-                last.filesz = std::max(oldFileszEnd, sFileszEnd) - last.vaddr;
-                if (s.filesz > 0 && s.vaddr >= last.vaddr)
-                    last.off = s.off - (s.vaddr - last.vaddr);
-                last.memsz = newEnd - last.vaddr;
-                last.perm |= s.perm;
-                continue;
-            }
+        const uint64_t segEnd = s.vaddr + s.memsz; // validated by caller
+        if (!out.empty() && s.vaddr <= out.back().end) {
+            SegGroup& last = out.back();
+            last.end = std::max(last.end, segEnd);
+            last.perm |= s.perm;
+            last.members.push_back(s);
+            continue;
         }
-        out.push_back(s);
+        out.push_back(SegGroup{s.vaddr, segEnd, s.perm, {s}});
     }
     return out;
 }
 
 std::optional<Program> loadElfImpl(const std::vector<uint8_t>& d,
-                                   const std::string& path, std::string& err) {
+                                   const std::string& path,
+                                   uint64_t maxMappedBytes,
+                                   std::string& err) {
     if (d.size() < 16) {
         err = "ELF file too small";
         return std::nullopt;
@@ -146,21 +157,21 @@ std::optional<Program> loadElfImpl(const std::vector<uint8_t>& d,
     }
     const bool is64 = (elfClass == 2);
 
-    uint16_t type = 0, machine = 0, phnum = 0, shnum = 0, shstrndx = 0;
+    uint16_t machine = 0, phnum = 0, shnum = 0, shstrndx = 0;
     uint16_t phentsize = 0, shentsize = 0;
     uint64_t entry = 0, phoff = 0, shoff = 0;
 
     if (is64) {
         Ehdr64 h;
         if (!rd(d, 0, h)) { err = "truncated ELF header"; return std::nullopt; }
-        type = h.type; machine = h.machine; entry = h.entry;
+        machine = h.machine; entry = h.entry;
         phoff = h.phoff; shoff = h.shoff;
         phnum = h.phnum; shnum = h.shnum; shstrndx = h.shstrndx;
         phentsize = h.phentsize; shentsize = h.shentsize;
     } else {
         Ehdr32 h;
         if (!rd(d, 0, h)) { err = "truncated ELF header"; return std::nullopt; }
-        type = h.type; machine = h.machine; entry = h.entry;
+        machine = h.machine; entry = h.entry;
         phoff = h.phoff; shoff = h.shoff;
         phnum = h.phnum; shnum = h.shnum; shstrndx = h.shstrndx;
         phentsize = h.phentsize; shentsize = h.shentsize;
@@ -180,19 +191,35 @@ std::optional<Program> loadElfImpl(const std::vector<uint8_t>& d,
     }
     std::vector<Seg> segs;
     for (uint16_t i = 0; i < phnum; ++i) {
-        const size_t off = static_cast<size_t>(phoff) + i * phentsize;
+        uint64_t entryOff = 0;
+        if (!addOk(phoff, static_cast<uint64_t>(i) * phentsize, entryOff) ||
+            !rangeInFile(entryOff, phentsize, d.size())) {
+            err = "truncated program header";
+            return std::nullopt;
+        }
+        const size_t off = static_cast<size_t>(entryOff);
         if (is64) {
             Phdr64 ph;
             if (!rd(d, off, ph)) { err = "truncated program header"; return std::nullopt; }
             if (ph.type != PT_LOAD) continue;
-            if (ph.offset + ph.filesz > d.size()) { err = "segment out of file"; return std::nullopt; }
+            uint64_t end = 0;
+            if (ph.filesz > ph.memsz || !rangeInFile(ph.offset, ph.filesz, d.size()) ||
+                !addOk(ph.vaddr, ph.memsz, end) || ph.memsz > maxMappedBytes) {
+                err = "invalid load segment range";
+                return std::nullopt;
+            }
             segs.push_back(Seg{ph.vaddr, ph.memsz, ph.filesz, ph.offset,
                                static_cast<int>(ph.flags & 0x7)});
         } else {
             Phdr32 ph;
             if (!rd(d, off, ph)) { err = "truncated program header"; return std::nullopt; }
             if (ph.type != PT_LOAD) continue;
-            if (static_cast<uint64_t>(ph.offset) + ph.filesz > d.size()) { err = "segment out of file"; return std::nullopt; }
+            uint64_t end = 0;
+            if (ph.filesz > ph.memsz || !rangeInFile(ph.offset, ph.filesz, d.size()) ||
+                !addOk(ph.vaddr, ph.memsz, end) || ph.memsz > maxMappedBytes) {
+                err = "invalid load segment range";
+                return std::nullopt;
+            }
             segs.push_back(Seg{ph.vaddr, ph.memsz, ph.filesz, ph.offset,
                                static_cast<int>(ph.flags & 0x7)});
         }
@@ -201,17 +228,30 @@ std::optional<Program> loadElfImpl(const std::vector<uint8_t>& d,
         err = "ELF has no PT_LOAD segments";
         return std::nullopt;
     }
-    for (auto& s : mergeSegments(std::move(segs))) {
-        std::vector<uint8_t> bytes(static_cast<size_t>(s.memsz), 0);
-        const size_t copyN = static_cast<size_t>(
-            std::min<uint64_t>(s.filesz, s.memsz));
-        if (copyN > 0) {
-            std::memcpy(bytes.data(), d.data() + s.off, copyN);
+    uint64_t mappedTotal = 0;
+    for (auto& group : groupSegments(std::move(segs))) {
+        const uint64_t groupSize = group.end - group.base;
+        if (groupSize > maxMappedBytes || mappedTotal > maxMappedBytes - groupSize ||
+            groupSize > SIZE_MAX) {
+            err = "merged load range too large";
+            return std::nullopt;
+        }
+        mappedTotal += groupSize;
+        std::vector<uint8_t> bytes(static_cast<size_t>(groupSize), 0);
+        for (const auto& s : group.members) {
+            if (s.filesz == 0) continue;
+            const size_t dstOff = static_cast<size_t>(s.vaddr - group.base);
+            const size_t copyN = static_cast<size_t>(s.filesz);
+            std::memcpy(bytes.data() + dstOff,
+                        d.data() + static_cast<size_t>(s.off), copyN);
         }
         char name[32];
         std::snprintf(name, sizeof(name), "LOAD:0x%llx",
-                      static_cast<unsigned long long>(s.vaddr));
-        p.memory.addBlock(name, s.vaddr, std::move(bytes), s.perm);
+                      static_cast<unsigned long long>(group.base));
+        if (!p.memory.addBlock(name, group.base, std::move(bytes), group.perm)) {
+            err = "overlapping or invalid load range";
+            return std::nullopt;
+        }
     }
 
     // ---- section headers ----
@@ -227,7 +267,13 @@ std::optional<Program> loadElfImpl(const std::vector<uint8_t>& d,
     std::vector<ShRaw> shdrs;
     shdrs.reserve(shnum);
     for (uint16_t i = 0; i < shnum; ++i) {
-        const size_t off = static_cast<size_t>(shoff) + i * shentsize;
+        uint64_t entryOff = 0;
+        if (!addOk(shoff, static_cast<uint64_t>(i) * shentsize, entryOff) ||
+            !rangeInFile(entryOff, shentsize, d.size())) {
+            err = "truncated section header";
+            return std::nullopt;
+        }
+        const size_t off = static_cast<size_t>(entryOff);
         ShRaw s{};
         if (is64) {
             Shdr64 h;
@@ -244,15 +290,29 @@ std::optional<Program> loadElfImpl(const std::vector<uint8_t>& d,
         shdrs.push_back(s);
     }
 
+    for (const auto& s : shdrs) {
+        if (s.type != SHT_NOBITS && s.size != 0 &&
+            !rangeInFile(s.offset, s.size, d.size())) {
+            err = "section out of file";
+            return std::nullopt;
+        }
+    }
+
     // section names via shstrtab
     std::vector<std::string> secNames(shnum);
     if (shstrndx < shnum) {
         const ShRaw& shstr = shdrs[shstrndx];
+        if (shstr.type != SHT_STRTAB ||
+            !rangeInFile(shstr.offset, shstr.size, d.size())) {
+            err = "invalid section-name string table";
+            return std::nullopt;
+        }
         for (uint16_t i = 0; i < shnum; ++i) {
             if (shdrs[i].name < shstr.size) {
-                const size_t nOff = static_cast<size_t>(shstr.offset) + shdrs[i].name;
+                const size_t nOff = static_cast<size_t>(shstr.offset + shdrs[i].name);
+                const size_t nEnd = static_cast<size_t>(shstr.offset + shstr.size);
                 std::string s;
-                while (nOff + s.size() < d.size() && d[nOff + s.size()] != 0)
+                while (nOff + s.size() < nEnd && d[nOff + s.size()] != 0)
                     s.push_back(static_cast<char>(d[nOff + s.size()]));
                 secNames[i] = std::move(s);
             }
@@ -267,7 +327,15 @@ std::optional<Program> loadElfImpl(const std::vector<uint8_t>& d,
         if (s.flags & SHF_WRITE) perm |= static_cast<int>(Perm::W);
         if (s.flags & SHF_ALLOC) perm |= static_cast<int>(Perm::R);
         p.sections.push_back(
-            Section{secNames[i], s.addr, s.size, s.offset, s.size, perm});
+            Section{secNames[i], s.addr, s.size, s.offset,
+                    s.type == SHT_NOBITS ? 0 : s.size, perm});
+        if (secNames[i] == ".eh_frame" || secNames[i] == ".debug_frame") {
+            ExceptionRegion region;
+            region.kind = ExceptionRegion::DWARF_CFI;
+            region.unwindInfo = s.addr;
+            region.languageData = s.size;
+            p.exceptionRegions.push_back(region);
+        }
     }
 
     // ---- symbols (symtab + dynsym) ----
@@ -277,11 +345,18 @@ std::optional<Program> loadElfImpl(const std::vector<uint8_t>& d,
         if (s.entsize == 0 || s.link >= shnum) continue;
         const size_t symSize = is64 ? sizeof(Sym64) : sizeof(Sym32);
         if (s.entsize < symSize) continue;
-        const std::string& strtabName = secNames[s.link];
         const ShRaw& strtab = shdrs[s.link];
+        if (strtab.type != SHT_STRTAB ||
+            !rangeInFile(strtab.offset, strtab.size, d.size()))
+            continue;
         const size_t nSyms = static_cast<size_t>(s.size / s.entsize);
         for (size_t k = 0; k < nSyms; ++k) {
-            const size_t off = static_cast<size_t>(s.offset) + k * s.entsize;
+            uint64_t symOff = 0;
+            if (k > std::numeric_limits<uint64_t>::max() / s.entsize ||
+                !addOk(s.offset, static_cast<uint64_t>(k) * s.entsize, symOff) ||
+                !rangeInFile(symOff, symSize, d.size()))
+                break;
+            const size_t off = static_cast<size_t>(symOff);
             uint32_t stName = 0;
             uint8_t stInfo = 0;
             uint64_t stValue = 0, stSize = 0;
@@ -302,8 +377,9 @@ std::optional<Program> loadElfImpl(const std::vector<uint8_t>& d,
             if (stValue == 0) continue;
             std::string nm;
             if (stName < strtab.size) {
-                const size_t nOff = static_cast<size_t>(strtab.offset) + stName;
-                while (nOff + nm.size() < d.size() && d[nOff + nm.size()] != 0)
+                const size_t nOff = static_cast<size_t>(strtab.offset + stName);
+                const size_t nEnd = static_cast<size_t>(strtab.offset + strtab.size);
+                while (nOff + nm.size() < nEnd && d[nOff + nm.size()] != 0)
                     nm.push_back(static_cast<char>(d[nOff + nm.size()]));
             }
             Symbol sym;
@@ -332,8 +408,9 @@ std::optional<Program> loadElfImpl(const std::vector<uint8_t>& d,
 } // namespace
 
 std::optional<Program> loadElf(const std::vector<uint8_t>& data,
-                               const std::string& path, std::string& err) {
-    return loadElfImpl(data, path, err);
+                               const std::string& path,
+                               uint64_t maxMappedBytes, std::string& err) {
+    return loadElfImpl(data, path, maxMappedBytes, err);
 }
 
 } // namespace centrifuge

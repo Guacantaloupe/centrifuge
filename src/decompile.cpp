@@ -437,7 +437,7 @@ public:
                 }
                 case POp::INT_NEGATE: {
                     const CExpr a = exprOfV(pi.find(op.in0));
-                    r.text = "(~(" + stripParens(a.text) + "))";
+                    r.text = "(-(" + stripParens(a.text) + "))";
                     r.size = vo->size;
                     break;
                 }
@@ -445,6 +445,152 @@ public:
                     const CExpr a = exprOfV(pi.find(op.in0));
                     r.text = "(!(" + stripParens(a.text) + "))";
                     r.size = 1;
+                    break;
+                }
+                case POp::INT_CARRY:
+                case POp::INT_SCARRY:
+                case POp::INT_SBORROW: {
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const CExpr b = exprOfV(pi.find(op.in1));
+                    const Varnode* va = pi.find(op.in0);
+                    const int bits = (va ? va->size : 8) * 8;
+                    const std::string x = stripParens(a.text);
+                    const std::string y = stripParens(b.text);
+                    if (op.op == POp::INT_CARRY) {
+                        r.text = "((" + std::string(uCast(va ? va->size : 8)) +
+                                 ")((" + x + ") + (" + y + ")) < (" + x + "))";
+                    } else {
+                        const char* arith = op.op == POp::INT_SCARRY ? "+" : "-";
+                        const char* left = op.op == POp::INT_SCARRY ? "~" : "";
+                        r.text = "(((" + std::string(left) + "((" + x + ") ^ (" + y +
+                                 ")) & ((" + x + ") ^ ((" + x + ") " + arith +
+                                 " (" + y + ")))) >> " + std::to_string(bits - 1) +
+                                 ") & 1)";
+                    }
+                    r.size = 1;
+                    break;
+                }
+                case POp::INT_MULT_OVERFLOW:
+                case POp::INT_SMULT_OVERFLOW: {
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const CExpr b = exprOfV(pi.find(op.in1));
+                    r.text = std::string(op.op == POp::INT_SMULT_OVERFLOW
+                                             ? "signed_mul_overflow("
+                                             : "unsigned_mul_overflow(") +
+                             stripParens(a.text) + ", " + stripParens(b.text) + ")";
+                    r.size = 1;
+                    break;
+                }
+                case POp::INT_PARITY: {
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    r.text = "(__builtin_parity((unsigned)(" + stripParens(a.text) +
+                             ") & 0xffU) == 0)";
+                    r.size = 1;
+                    break;
+                }
+                case POp::INT_POPCOUNT:
+                case POp::INT_COUNT_LEADING_ZERO:
+                case POp::INT_COUNT_TRAILING_ZERO: {
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const std::string x = stripParens(a.text);
+                    if (op.op == POp::INT_POPCOUNT)
+                        r.text = "__builtin_popcountll(" + x + ")";
+                    else if (op.op == POp::INT_COUNT_LEADING_ZERO)
+                        r.text = "(" + x + " ? __builtin_clzll(" + x + ") : 64)";
+                    else
+                        r.text = "(" + x + " ? __builtin_ctzll(" + x + ") : 64)";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::FLOAT_EQUAL: case POp::FLOAT_NOTEQUAL:
+                case POp::FLOAT_LESS: case POp::FLOAT_LESSEQUAL: {
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const CExpr b = exprOfV(pi.find(op.in1));
+                    const char* relation = op.op == POp::FLOAT_EQUAL ? "=="
+                                           : op.op == POp::FLOAT_NOTEQUAL ? "!="
+                                           : op.op == POp::FLOAT_LESS ? "<" : "<=";
+                    r.text = "(" + stripParens(a.text) + " " + relation + " " +
+                             stripParens(b.text) + ")";
+                    r.size = 1;
+                    break;
+                }
+                case POp::FLOAT_NAN: {
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const CExpr b = exprOfV(pi.find(op.in1));
+                    r.text = "(isnan(" + stripParens(a.text) + ") || isnan(" +
+                             stripParens(b.text) + "))";
+                    r.size = 1;
+                    break;
+                }
+                case POp::FLOAT_ADD: case POp::FLOAT_SUB:
+                case POp::FLOAT_MULT: case POp::FLOAT_DIV:
+                case POp::FLOAT_MIN: case POp::FLOAT_MAX: {
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const CExpr b = exprOfV(pi.find(op.in1));
+                    const char* symbol = op.op == POp::FLOAT_ADD ? "+"
+                                         : op.op == POp::FLOAT_SUB ? "-"
+                                         : op.op == POp::FLOAT_MULT ? "*"
+                                         : op.op == POp::FLOAT_DIV ? "/" : "";
+                    if (vo->size > 8 && !(op.aux & 0x8000)) {
+                        const std::string suffix = (op.aux & 0x7fff) == 64 ? "f64" : "f32";
+                        r.text = "simd_" + std::string(op.op == POp::FLOAT_ADD ? "add_"
+                                                      : op.op == POp::FLOAT_SUB ? "sub_"
+                                                      : op.op == POp::FLOAT_MULT ? "mul_"
+                                                      : op.op == POp::FLOAT_DIV ? "div_"
+                                                      : op.op == POp::FLOAT_MIN ? "min_" : "max_") +
+                                 suffix + "(" + stripParens(a.text) + ", " +
+                                 stripParens(b.text) + ")";
+                    } else {
+                        if (op.op == POp::FLOAT_MIN || op.op == POp::FLOAT_MAX)
+                            r.text = std::string(op.op == POp::FLOAT_MIN ? "fmin(" : "fmax(") +
+                                     stripParens(a.text) + ", " + stripParens(b.text) + ")";
+                        else
+                            r.text = "(" + stripParens(a.text) + " " + symbol + " " +
+                                     stripParens(b.text) + ")";
+                    }
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::FLOAT_NEG: case POp::FLOAT_ABS: case POp::FLOAT_SQRT: {
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const std::string x = stripParens(a.text);
+                    r.text = op.op == POp::FLOAT_NEG ? "(-(" + x + "))"
+                             : op.op == POp::FLOAT_ABS ? "fabs(" + x + ")"
+                                                       : "sqrt(" + x + ")";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::FLOAT_INT2FLOAT: {
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    r.text = std::string((op.aux & 0x7fff) == 32 ? "(float)(int64_t)("
+                                                                 : "(double)(int64_t)(") +
+                             stripParens(a.text) + ")";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::FLOAT_FLOAT2INT: {
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const std::string x = stripParens(a.text);
+                    r.text = (op.aux & 0x8000) ? "(int64_t)trunc(" + x + ")"
+                                               : "(int64_t)nearbyint(" + x + ")";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::FLOAT_FLOAT2FLOAT: {
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const int destinationBits = (op.aux >> 8) & 0x7f;
+                    r.text = std::string(destinationBits == 32 ? "(float)(" : "(double)(") +
+                             stripParens(a.text) + ")";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SELECT: {
+                    const CExpr c = exprOfV(pi.find(op.in0));
+                    const CExpr yes = exprOfV(pi.find(op.in1));
+                    const CExpr no = exprOfV(pi.find(op.in2));
+                    r.text = "(" + stripParens(c.text) + " ? " +
+                             stripParens(yes.text) + " : " + stripParens(no.text) + ")";
+                    r.size = vo->size;
                     break;
                 }
                 case POp::LOAD: {
@@ -537,6 +683,96 @@ std::string decompile(
             for (int i = 0; i < depth; ++i) out << "    ";
             out << "L" << hexAddr(a) << ":\n";
         }
+
+        const NaturalLoop* loop = cfg.loopByHeader(a);
+        if (loop && loop->blocks.size() == 1) {
+            const PcodeInsn* term = b->terminator();
+            if (term && term->kind == Insn::JCC && b->succs.size() == 2 &&
+                loop->exits.size() == 1) {
+                const bool targetRepeats = term->targetKnown && term->target == a;
+                const bool fallRepeats = b->succs[0] == a;
+                if (targetRepeats || fallRepeats) {
+                    BlockEmitter body(*b);
+                    body.indent = depth + 2;
+                    body.nameOf = nameOf;
+                    body.spBias = frameBias;
+                    body.emit();
+                    if (body.hasCond && !body.cond.empty()) {
+                        for (int i = 0; i <= depth; ++i) out << "    ";
+                        out << "do {\n" << body.out.str();
+                        for (int i = 0; i <= depth; ++i) out << "    ";
+                        const std::string condition =
+                            targetRepeats ? body.cond
+                                          : "!(" + body.cond + ")";
+                        out << "} while (" << condition << ");\n";
+                        frameBias = std::min(frameBias, body.spBias);
+                        emitBlock(loop->exits.front().second, depth);
+                        return;
+                    }
+                }
+            }
+            if (term && term->kind == Insn::JMP && term->targetKnown &&
+                term->target == a && loop->exits.empty()) {
+                BlockEmitter body(*b);
+                body.indent = depth + 2;
+                body.nameOf = nameOf;
+                body.spBias = frameBias;
+                body.emit();
+                for (int i = 0; i <= depth; ++i) out << "    ";
+                out << "while (1) {\n" << body.out.str();
+                for (int i = 0; i <= depth; ++i) out << "    ";
+                out << "}\n";
+                frameBias = std::min(frameBias, body.spBias);
+                return;
+            }
+        }
+
+        // Conservative canonical while: a condition-only header, one body
+        // block, one exit, and an unconditional body back edge.
+        if (loop && loop->blocks.size() == 2 && loop->exits.size() == 1) {
+            uint64_t bodyAddr = 0;
+            for (uint64_t member : loop->blocks)
+                if (member != a) bodyAddr = member;
+            const CfgBlock* bodyBlock = cfg.blockAt(bodyAddr);
+            const PcodeInsn* headerTerm = b->terminator();
+            const PcodeInsn* bodyTerm = bodyBlock ? bodyBlock->terminator() : nullptr;
+            if (bodyBlock && !cfg.loopByHeader(bodyAddr) && headerTerm &&
+                headerTerm->kind == Insn::JCC && b->succs.size() == 2 &&
+                bodyBlock->succs == std::vector<uint64_t>{a} && bodyTerm &&
+                bodyTerm->kind == Insn::JMP && bodyTerm->targetKnown &&
+                bodyTerm->target == a) {
+                BlockEmitter header(*b);
+                header.indent = depth + 1;
+                header.nameOf = nameOf;
+                header.spBias = frameBias;
+                header.emit();
+                if (header.out.str().empty() && header.hasCond &&
+                    !header.cond.empty()) {
+                    const bool targetEnters = headerTerm->target == bodyAddr;
+                    const bool fallEnters = b->succs[0] == bodyAddr;
+                    if (targetEnters || fallEnters) {
+                        BlockEmitter body(*bodyBlock);
+                        body.indent = depth + 2;
+                        body.nameOf = nameOf;
+                        body.spBias = frameBias;
+                        body.emit();
+                        const std::string condition =
+                            targetEnters ? header.cond
+                                         : "!(" + header.cond + ")";
+                        for (int i = 0; i <= depth; ++i) out << "    ";
+                        out << "while (" << condition << ") {\n"
+                            << body.out.str();
+                        for (int i = 0; i <= depth; ++i) out << "    ";
+                        out << "}\n";
+                        emitted.insert(bodyAddr);
+                        frameBias = std::min(frameBias, body.spBias);
+                        emitBlock(loop->exits.front().second, depth);
+                        return;
+                    }
+                }
+            }
+        }
+
         BlockEmitter be(*b);
         be.indent = depth + 1;
         be.nameOf = nameOf;
@@ -578,6 +814,16 @@ std::string decompile(
             out << "if (" << be.cond << ") goto L" << hexAddr(target)
                 << ";\n";
             emitBlock(fall, depth);
+            return;
+        }
+        if (b->tailCallTarget) {
+            std::string args;
+            for (int i = 0; i < 8; ++i)
+                args += (i ? ", " : "") +
+                        std::string(regName64((10 + i) * 8));
+            for (int i = 0; i <= depth; ++i) out << "    ";
+            out << "return " << nameOf(*b->tailCallTarget) << "(" << args
+                << ");\n";
             return;
         }
         if (term->kind == Insn::JMP && term->targetKnown) {

@@ -265,7 +265,11 @@ bool decodeThreeByte(Dec& d, Insn& out,
 // ---------------------------------------------------------------------------
 bool decodeOne(const uint8_t* code, size_t len, uint64_t addr, bool is64,
                Insn& out) {
-    Dec d{code, len, addr, 0, is64};
+    Dec d{};
+    d.c = code;
+    d.len = len;
+    d.addr = addr;
+    d.is64 = is64;
 
     // ---- prefixes ----
     for (;;) {
@@ -1247,6 +1251,7 @@ bool decodeTwoByte(Dec& d, Insn& out,
 
 bool decodeGroup16(Dec& d, Insn& out,
                    const std::function<void(Insn::Kind, uint64_t, bool)>& finish) {
+    (void)out;
     uint8_t modrm = 0;
     if (!get8(d, modrm)) return false;
     const int mod = (modrm >> 6) & 3, reg = (modrm >> 3) & 7, rm = modrm & 7;
@@ -1265,6 +1270,7 @@ bool decodeGroup16(Dec& d, Insn& out,
 
 bool decodeGroup15(Dec& d, Insn& out,
                    const std::function<void(Insn::Kind, uint64_t, bool)>& finish) {
+    (void)out;
     uint8_t modrm = 0;
     if (!get8(d, modrm)) return false;
     const int mod = (modrm >> 6) & 3, reg = (modrm >> 3) & 7, rm = modrm & 7;
@@ -1292,6 +1298,7 @@ bool decodeGroup15(Dec& d, Insn& out,
 
 bool decodeThreeByte(Dec& d, Insn& out,
                      const std::function<void(Insn::Kind, uint64_t, bool)>& finish) {
+    (void)out;
     uint8_t op = 0;
     if (!get8(d, op)) return false;
     switch (op) {

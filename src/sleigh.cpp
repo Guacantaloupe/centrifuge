@@ -131,6 +131,7 @@ bool Lexer::lexOne(Tok& t) {
 }
 
 std::vector<Tok> Lexer::all(std::string& err) {
+    (void)err;
     std::vector<Tok> out;
     Tok t;
     for (;;) {
@@ -358,6 +359,22 @@ struct Parser {
                 e->bits = static_cast<int>(next().ival);
             }
             if (!eatOp(")")) { err = "expected )"; return {}; }
+            return e;
+        }
+        if (isId(peek(), "select")) {
+            i++;
+            if (!eatOp("(")) { err = "expected ( after select"; return {}; }
+            auto cond = parseExpr();
+            if (!eatOp(",")) { err = "expected first , in select"; return {}; }
+            auto yes = parseExpr();
+            if (!eatOp(",")) { err = "expected second , in select"; return {}; }
+            auto no = parseExpr();
+            if (!eatOp(")")) { err = "expected ) after select"; return {}; }
+            auto e = std::make_unique<SExpr>();
+            e->kind = SExpr::SELECT;
+            e->a = std::move(cond);
+            e->b = std::move(yes);
+            e->c = std::move(no);
             return e;
         }
         return parsePrimary();
@@ -750,8 +767,10 @@ bool SleighEngine::loadSpec(const std::string& text, std::string& err) {
                 return false;
             }
             i++;
-        for (const auto& ct : c.terms)
-            if (ct.field.rfind("vex", 0) == 0) c.requiresVex = true;
+        for (const auto& ct : c.terms) {
+            if (ct.field.rfind("evex", 0) == 0) c.requiresEvex = true;
+            else if (ct.field.rfind("vex", 0) == 0) c.requiresVex = true;
+        }
         ctors_.push_back(std::move(c));
         } else {
             std::string dbg;
@@ -948,7 +967,12 @@ uint64_t SleighEngine::evalExpr(PcodeInsn& pi, const SpecCtor::SExpr& e) const {
         const POp pop = binPop(e.op, swapped);
         uint64_t ia = a, ib = b;
         if (swapped) std::swap(ia, ib);
-        Varnode* out = makeVarnode(pi, Varnode::UNIQUE, nextId_++, 8);
+        const bool comparison =
+            pop == POp::INT_EQUAL || pop == POp::INT_NOTEQUAL ||
+            pop == POp::INT_LESS || pop == POp::INT_SLESS ||
+            pop == POp::INT_LESSEQUAL || pop == POp::INT_SLESSEQUAL;
+        const int outSize = comparison ? 1 : (va && va->size ? va->size : 8);
+        Varnode* out = makeVarnode(pi, Varnode::UNIQUE, nextId_++, outSize);
         pi.ops.push_back(PcodeOp{pop, out->id, ia, ib, 0});
         return out->id;
     }
@@ -1026,6 +1050,17 @@ uint64_t SleighEngine::evalExpr(PcodeInsn& pi, const SpecCtor::SExpr& e) const {
         pi.ops.push_back(PcodeOp{POp::LOAD, out->id, a, 0, 0});
         return out->id;
     }
+    case SpecCtor::SExpr::SELECT: {
+        const uint64_t cond = evalExpr(pi, *e.a);
+        const uint64_t yes = evalExpr(pi, *e.b);
+        const uint64_t no = evalExpr(pi, *e.c);
+        const Varnode* vy = pi.find(yes);
+        const Varnode* vn = pi.find(no);
+        const int sz = vy && vy->size ? vy->size : (vn && vn->size ? vn->size : 8);
+        Varnode* out = makeVarnode(pi, Varnode::UNIQUE, nextId_++, sz);
+        pi.ops.push_back(PcodeOp{POp::SELECT, out->id, cond, yes, no});
+        return out->id;
+    }
     }
     return constVarnode(pi, 0, 8);
 }
@@ -1036,6 +1071,7 @@ uint64_t SleighEngine::evalExpr(PcodeInsn& pi, const SpecCtor::SExpr& e) const {
 bool SleighEngine::disassemble(
     const std::function<bool(uint64_t, void*, size_t)>& read, uint64_t addr,
     PcodeInsn& out, std::string& err) const {
+    (void)err;
     const int maxTok = tokenSize();
     if (maxTok <= 0) return false;
     uint8_t raw[16];
@@ -1059,6 +1095,15 @@ bool SleighEngine::disassemble(
         int vexVvvv = -1; // 0-15, -1 = unused
         bool vexW = false, vexL = false;
         int vexPP = 0;
+        bool evex = false;
+        int evexMap = 1;   // 1=0F, 2=0F38, 3=0F3A
+        int evexVvvv = -1; // 0-31, -1 = unused
+        bool evexW = false;
+        int evexL = 0;     // 0=xmm, 1=ymm, 2=zmm
+        int evexPP = 0;
+        bool evexZ = false, evexB = false;
+        int evexAaa = 0;
+        int evexRprime = 0; // ~R'<<4, extends reg field to 5 bits
         int opsz = 4; // operand size in bytes
         int prefixLen = 0;
         bool haveModrm = false;
@@ -1084,16 +1129,17 @@ bool SleighEngine::disassemble(
                 p++;
             }
             else if (b == 0xC5 && p + 1 < got) {
-                // VEX2: R vvvv W L pp0  (map=0F, pp1=0)
+                // VEX2: R ~vvvv L pp (map=0F, no W bit -> implied 0)
+                // pp: 0=0F 1=66 2=F3 3=F2; L: 0=xmm 1=ymm
                 const uint8_t b2 = raw[p + 1];
                 xc.vex = true;
                 xc.rexr = !(b2 >> 7) & 1;
                 xc.rexb = false;
                 xc.rexx = false;
                 xc.vexVvvv = (~((b2 >> 3) & 0xF)) & 0xF;
-                xc.vexW = (b2 >> 1) & 1;
+                xc.vexW = false;
                 xc.vexL = (b2 >> 2) & 1;
-                xc.vexPP = b2 & 1;
+                xc.vexPP = b2 & 3;
                 xc.vexMap = 1;
                 p += 2;
                 break; // VEX is self-contained
@@ -1113,6 +1159,29 @@ bool SleighEngine::disassemble(
                 xc.vexPP = b3 & 3;
                 p += 3;
                 break; // VEX is self-contained; no prefixes after it
+            }
+            else if (b == 0x62 && p + 3 < got) {
+                // EVEX: P0=[R][X][B][R'][0][mm] P1=[W][vvvv][1][pp]
+                //       P2=[z][LL][b][V'][aaa]
+                const uint8_t p0 = raw[p + 1];
+                const uint8_t p1 = raw[p + 2];
+                const uint8_t p2 = raw[p + 3];
+                xc.evex = true;
+                xc.rexr = !((p0 >> 7) & 1);
+                xc.rexx = !((p0 >> 6) & 1);
+                xc.rexb = !((p0 >> 5) & 1);
+                xc.evexRprime = (!((p0 >> 4) & 1)) ? 16 : 0;
+                xc.evexMap = p0 & 7;
+                xc.evexW = (p1 >> 7) & 1;
+                xc.evexVvvv =
+                    (~((((p2 >> 3) & 1) << 4) | ((p1 >> 3) & 0xF))) & 0x1F;
+                xc.evexL = (p2 >> 5) & 3;
+                xc.evexPP = p1 & 3;
+                xc.evexZ = (p2 >> 7) & 1;
+                xc.evexB = (p2 >> 4) & 1;
+                xc.evexAaa = p2 & 7;
+                p += 4;
+                break; // EVEX is self-contained
             }
             else if (b >= 0x40 && b <= 0x4F) {
                 xc.rex = true;
@@ -1134,7 +1203,10 @@ bool SleighEngine::disassemble(
     uint64_t word[4] = {0, 0, 0, 0};
     for (size_t t = 0; t < tokens_.size(); ++t) {
         const int avail = std::min(tokens_[t].size, got - xc.prefixLen);
-        for (int i = 0; i < avail; ++i)
+        // A token may describe a 15-byte x86 instruction, while field
+        // extraction uses a 64-bit window.  Fields in the x86 spec live in
+        // the leading bytes; never shift a uint64_t by 64 or more here.
+        for (int i = 0; i < std::min(avail, 8); ++i)
             word[t] |= static_cast<uint64_t>(raw[xc.prefixLen + i]) << (8 * i);
     }
 
@@ -1154,15 +1226,20 @@ bool SleighEngine::disassemble(
     std::vector<std::pair<std::string, std::string>> magicExports;
     auto isMagic = [&](const std::string& n) {
         return archX86_ &&
-               (n == "rregv" || n == "rmregv" || n == "acc" || n == "vex" ||
+               (n == "rregv" || n == "rmregv" || n.rfind("acc", 0) == 0 ||
+                n == "vex" ||
                 n == "vexmap" ||
                 n == "vexvvvv" || n.rfind("vexvvvv", 0) == 0 ||
                 n == "vexw" || n == "vexL" || n == "vexpp" ||
+                n == "evex" || n == "evexmap" || n == "evexw" ||
+                n == "evexL" || n == "evexpp" || n == "evexvvvv" ||
+                n.rfind("evexvvvv", 0) == 0 || n == "evexz" ||
+                n == "evexb" || n == "evexaaa" ||
                 n == "pfxf2" || n == "pfxf3" || n == "pfx66" ||
                 n == "pfxnone" || n == "rexw" || n == "opsz" || n == "modrm" ||
                 n.rfind("modrm", 0) == 0 || n == "rreg" ||
                 n.rfind("rreg", 0) == 0 || n == "rmreg" ||
-                n.rfind("rmreg", 0) == 0 || n == "rmmem" ||
+                n.rfind("rmreg", 0) == 0 || n.rfind("rmmem", 0) == 0 ||
                 n == "rmval" || n.rfind("rmval", 0) == 0 || n == "sreg" || n == "ea" ||
                 n == "rq" || n.rfind("rq", 0) == 0 || n == "immb" ||
                 n == "immw" || n == "immd" || n == "immq" || n == "immv" ||
@@ -1176,8 +1253,10 @@ bool SleighEngine::disassemble(
     };
 
     auto readByte = [&](int off) -> uint8_t {
-        return (off >= 0 && off < maxTok) ? ((word[0] >> (8 * off)) & 0xFF)
-                                          : 0;
+        const int rawOffset = xc.prefixLen + off;
+        return (off >= 0 && rawOffset >= 0 && rawOffset < got)
+                   ? raw[rawOffset]
+                   : 0;
     };
     auto decodeModrm = [&](int off) -> bool {
         xc.haveModrm = true;
@@ -1186,7 +1265,8 @@ bool SleighEngine::disassemble(
         xc.reg = (b >> 3) & 7;
         xc.rm = b & 7;
         xc.cursor = off + 1;
-        xc.regReg = xc.reg | (xc.rexr ? 8 : 0);
+        xc.regReg = xc.reg | (xc.rexr ? 8 : 0) |
+                    (xc.evex ? xc.evexRprime : 0);
         if (xc.mod == 3) {
             xc.isMem = false;
             xc.rmReg = xc.rm | (xc.rexb ? 8 : 0);
@@ -1253,12 +1333,28 @@ bool SleighEngine::disassemble(
     std::map<std::string, uint64_t> opValues;
     std::map<std::string, std::string> opFields; // operand -> token field
     for (const auto& c : ctors_) {
+        // ModRM/immediate decoding is constructor-local.  A failed candidate
+        // must not leave its cursor or addressing state in the next match.
+        xc.cursor = 0;
+        xc.haveModrm = false;
+        xc.mod = xc.reg = xc.rm = 0;
+        xc.isMem = xc.ripRel = false;
+        xc.disp = 0;
+        xc.base = xc.index = -1;
+        xc.scale = 1;
+        xc.regReg = xc.rmReg = 0;
         bool ok = true;
         int usedTok = 0;
         opValues.clear();
         opFields.clear();
         magicExports.clear();
-        if (xc.vex != c.requiresVex) continue;
+        if (c.requiresEvex) {
+            if (!xc.evex) continue;
+        } else if (c.requiresVex) {
+            if (!xc.vex || xc.evex) continue;
+        } else if (xc.vex || xc.evex) {
+            continue;
+        }
         for (const auto& t : c.terms) {
             const std::string& fn = t.field;
             if (isMagic(fn)) {
@@ -1275,6 +1371,32 @@ bool SleighEngine::disassemble(
                                        : fn == "vexL"
                                            ? (xc.vexL ? 1 : 0)
                                            : static_cast<uint64_t>(xc.vexPP);
+                    if (t.kind != SpecCtor::Term::FIELD_EQ || v != t.value) {
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
+                if (fn == "evex") {
+                    if (!xc.evex) { ok = false; break; }
+                    continue;
+                }
+                if (fn == "evexmap" || fn == "evexw" || fn == "evexL" ||
+                    fn == "evexpp" || fn == "evexz" || fn == "evexb" ||
+                    fn == "evexaaa") {
+                    const uint64_t v = fn == "evexmap"
+                                           ? static_cast<uint64_t>(xc.evexMap)
+                                       : fn == "evexw"
+                                           ? (xc.evexW ? 1 : 0)
+                                       : fn == "evexL"
+                                           ? static_cast<uint64_t>(xc.evexL)
+                                       : fn == "evexpp"
+                                           ? static_cast<uint64_t>(xc.evexPP)
+                                       : fn == "evexz"
+                                           ? (xc.evexZ ? 1 : 0)
+                                       : fn == "evexb"
+                                           ? (xc.evexB ? 1 : 0)
+                                           : static_cast<uint64_t>(xc.evexAaa);
                     if (t.kind != SpecCtor::Term::FIELD_EQ || v != t.value) {
                         ok = false;
                         break;
@@ -1316,13 +1438,15 @@ bool SleighEngine::disassemble(
                     }
                     continue;
                 }
-                // FIELD_EQ on register exports: /digit group check
+                // FIELD_EQ on register exports: /digit group check.
+                // rreg=N and rmreg=N are FIXED encodings: REX.R/REX.B do NOT
+                // extend them (e.g. 4f d1 03 = REX.WRXB rolq: reg field is
+                // the /digit opcode extension, REX.R is ignored).
                 if (t.kind == SpecCtor::Term::FIELD_EQ &&
                     (fn.rfind("rreg", 0) == 0 || fn.rfind("rmreg", 0) == 0 ||
                      fn.rfind("rq", 0) == 0)) {
-                    int idx = xc.regReg;
-                    if (fn.rfind("rmreg", 0) == 0) idx = xc.rmReg;
-                    else if (fn.rfind("rq", 0) == 0)
+                    int idx = fn.rfind("rmreg", 0) == 0 ? xc.rm : xc.reg;
+                    if (fn.rfind("rq", 0) == 0)
                         idx = (readByte(0) & 7) | (xc.rexb ? 8 : 0);
                     if (idx != static_cast<int>(t.value)) {
                         ok = false;
@@ -1336,7 +1460,8 @@ bool SleighEngine::disassemble(
                     ok = false;
                     break;
                 }
-                if (fn == "rmmem" && (!xc.haveModrm || xc.mod == 3)) {
+                if (fn.rfind("rmmem", 0) == 0 &&
+                    (!xc.haveModrm || xc.mod == 3)) {
                     ok = false;
                     break;
                 }
@@ -1344,6 +1469,22 @@ bool SleighEngine::disassemble(
                     !xc.haveModrm) {
                     ok = false;
                     break;
+                }
+                // FIELD_EQ on immediates: compare the encoded value
+                if (t.kind == SpecCtor::Term::FIELD_EQ &&
+                    (fn == "immb" || fn == "immw" || fn == "immd" ||
+                     fn == "immq")) {
+                    const int n = fn == "immb" ? 1
+                                  : fn == "immw" ? 2
+                                  : fn == "immd" ? 4 : 8;
+                    uint64_t v = 0;
+                    for (int i = 0; i < n; ++i)
+                        v |= static_cast<uint64_t>(readByte(xc.cursor + i))
+                             << (8 * i);
+                    if (v != t.value) {
+                        ok = false;
+                        break;
+                    }
                 }
                 // advance the byte cursor for immediates during matching
                 // (the instruction size depends on it)
@@ -1440,6 +1581,13 @@ bool SleighEngine::disassemble(
                 std::snprintf(nm, sizeof(nm), "ymm%d", idx);
             else
                 std::snprintf(nm, sizeof(nm), "%s", ymm[idx]);
+        } else if (size == 64) {
+            static const char* zmm[8] = {"zmm0", "zmm1", "zmm2", "zmm3",
+                                         "zmm4", "zmm5", "zmm6", "zmm7"};
+            if (idx >= 8)
+                std::snprintf(nm, sizeof(nm), "zmm%d", idx);
+            else
+                std::snprintf(nm, sizeof(nm), "%s", zmm[idx]);
         } else {
             static const char* r64[8] = {"rax", "rcx", "rdx", "rbx",
                                          "rsp", "rbp", "rsi", "rdi"};
@@ -1533,16 +1681,25 @@ bool SleighEngine::disassemble(
     // materialize magic exports (registers, addresses, immediates)
     for (const auto& [opname, mname] : magicExports) {
         if (mname == "rregv" || mname == "rmregv") {
-            const int sz = xc.vexL ? 32 : 16;
+            const int sz = xc.evex ? (xc.evexL == 2 ? 64
+                                          : xc.evexL == 1 ? 32 : 16)
+                                   : (xc.vexL ? 32 : 16);
             out.named[opname] = x86RegVarnode(mname == "rregv" ? xc.regReg
                                                                : xc.rmReg,
                                               sz);
+        } else if (mname == "evexvvvv" || mname.rfind("evexvvvv", 0) == 0) {
+            const int sz = mname.size() > 8 ? atoi(mname.c_str() + 8) / 8
+                                            : (xc.evexL == 2 ? 64
+                                               : xc.evexL == 1 ? 32 : 16);
+            out.named[opname] = x86RegVarnode(xc.evexVvvv, sz);
         } else if (mname == "vexvvvv" || mname.rfind("vexvvvv", 0) == 0) {
             const int sz = mname.size() > 7 ? atoi(mname.c_str() + 7) / 8
                                             : (xc.vexL ? 32 : 16);
             out.named[opname] = x86RegVarnode(xc.vexVvvv, sz);
-        } else if (mname == "acc") {
-            const int sz = xc.rexw ? 8 : xc.opsz;
+        } else if (mname == "acc" || mname.rfind("acc", 0) == 0) {
+            // acc8/acc16/acc fixed-size, else rexw?8:opsz
+            const int sz = mname.size() > 3 ? atoi(mname.c_str() + 3) / 8
+                                            : (xc.rexw ? 8 : xc.opsz);
             out.named[opname] = x86RegVarnode(0, sz);
         } else if (mname == "sreg") {
             static const char* seg[8] = {"es", "cs", "ss", "ds", "fs", "gs", "?", "?"};
@@ -1557,7 +1714,11 @@ bool SleighEngine::disassemble(
         } else if (mname == "rq" || mname.rfind("rq", 0) == 0) {
             const int idx = (readByte(0) & 7) | (xc.rexb ? 8 : 0);
             out.named[opname] = x86RegVarnode(idx, magicSize(mname));
-        } else if (mname == "rmmem") {
+        } else if (mname.rfind("rmmem", 0) == 0) {
+            if (mname.size() > 5 && xc.mod == 1) {
+                // EVEX compressed disp8: disp8 * N
+                xc.disp *= atoi(mname.c_str() + 5);
+            }
             const uint64_t ea = materializeAddr();
             auto it = out.varnodes.find(ea);
             if (it != out.varnodes.end()) it->second.name = addrText();
@@ -1630,8 +1791,818 @@ bool SleighEngine::disassemble(
         }
     }
 
-    // emit semantics
-    for (const auto& st : matched->stmts) {
+    // Integer x86 instructions share flag behavior across many encodings.
+    // Emit that behavior centrally so register, immediate, and memory forms
+    // cannot silently drift apart in the language specification.
+    bool x86Handled = false;
+    if (archX86_) {
+        auto magicFor = [&](const std::string& operand) {
+            for (auto it = magicExports.rbegin(); it != magicExports.rend(); ++it)
+                if (it->first == operand) return it->second;
+            return std::string();
+        };
+        auto isMemory = [&](const std::string& operand) {
+            return magicFor(operand).rfind("rmmem", 0) == 0;
+        };
+        auto tmp = [&](int size, const std::string& name = std::string()) {
+            return makeVarnode(out, Varnode::UNIQUE, nextId_++, size, name)->id;
+        };
+        auto emit1 = [&](POp op, uint64_t a, int size) {
+            const uint64_t r = tmp(size);
+            out.ops.push_back(PcodeOp{op, r, a, 0, 0});
+            return r;
+        };
+        auto emit2 = [&](POp op, uint64_t a, uint64_t b, int size) {
+            const uint64_t r = tmp(size);
+            out.ops.push_back(PcodeOp{op, r, a, b, 0});
+            return r;
+        };
+        auto emitSelect = [&](uint64_t c, uint64_t yes, uint64_t no, int size) {
+            const uint64_t r = tmp(size);
+            out.ops.push_back(PcodeOp{POp::SELECT, r, c, yes, no});
+            return r;
+        };
+        auto resized = [&](uint64_t id, int size, bool signExtend) {
+            const Varnode* v = out.find(id);
+            if (v && v->size == size) return id;
+            if (v && v->isConst()) {
+                const int fromBits = std::max(1, v->size * 8);
+                const uint64_t fromMask = fromBits >= 64
+                                              ? ~0ULL
+                                              : ((1ULL << fromBits) - 1);
+                uint64_t value = v->offset & fromMask;
+                if (signExtend && fromBits < size * 8) {
+                    const uint64_t sign = 1ULL << (fromBits - 1);
+                    value = (value ^ sign) - sign;
+                }
+                return constVarnode(out, value, size);
+            }
+            return emit1(signExtend ? POp::INT_SEXT : POp::INT_ZEXT, id, size);
+        };
+        auto loadValue = [&](uint64_t address, int size) {
+            const uint64_t r = tmp(size);
+            out.ops.push_back(PcodeOp{POp::LOAD, r, address, 0, 0});
+            return r;
+        };
+        auto flag = [&](const char* name) {
+            const SpecRegister* r = findReg(name);
+            return r ? regVarnode(out, *r) : uint64_t{0};
+        };
+        auto writeFlag = [&](const char* name, uint64_t value) {
+            if (const uint64_t dst = flag(name))
+                out.ops.push_back(PcodeOp{POp::COPY, dst, value, 0, 0});
+        };
+        auto bitFlag = [&](uint64_t value, int bit, int valueSize) {
+            const uint64_t shift = constVarnode(out, static_cast<uint64_t>(bit), valueSize);
+            const uint64_t shifted = emit2(POp::INT_RIGHT, value, shift, valueSize);
+            return emit2(POp::INT_AND, shifted, constVarnode(out, 1, valueSize), 1);
+        };
+        auto auxFlag = [&](uint64_t a, uint64_t b, uint64_t result, int size) {
+            const uint64_t x = emit2(POp::INT_XOR, a, b, size);
+            const uint64_t y = emit2(POp::INT_XOR, x, result, size);
+            const uint64_t m = emit2(POp::INT_AND, y, constVarnode(out, 0x10, size), size);
+            return emit2(POp::INT_NOTEQUAL, m, constVarnode(out, 0, size), 1);
+        };
+        auto commonFlags = [&](uint64_t a, uint64_t b, uint64_t result,
+                               int size, POp overflowOp) {
+            writeFlag("PF", emit1(POp::INT_PARITY, result, 1));
+            writeFlag("AF", auxFlag(a, b, result, size));
+            writeFlag("ZF", emit2(POp::INT_EQUAL, result,
+                                    constVarnode(out, 0, size), 1));
+            writeFlag("SF", bitFlag(result, size * 8 - 1, size));
+            writeFlag("OF", emit2(overflowOp, a, b, 1));
+        };
+        auto byteOpcode = [&](uint8_t op) {
+            switch (op) {
+            case 0x00: case 0x02: case 0x04: case 0x08: case 0x0A: case 0x0C:
+            case 0x10: case 0x12: case 0x18: case 0x1A: case 0x20: case 0x22:
+            case 0x24: case 0x28: case 0x2A: case 0x2C: case 0x30: case 0x32:
+            case 0x34: case 0x38: case 0x3A: case 0x3C: case 0x80: case 0x84:
+            case 0xA8: case 0xC0: case 0xD0: case 0xD2: case 0xF6: case 0xFE:
+                return true;
+            default: return false;
+            }
+        };
+        auto condition = [&](const std::string& cc) {
+            const uint64_t zero = constVarnode(out, 0, 1);
+            auto eq0 = [&](const char* n) {
+                return emit2(POp::INT_EQUAL, flag(n), zero, 1);
+            };
+            auto ne0 = [&](const char* n) {
+                return emit2(POp::INT_NOTEQUAL, flag(n), zero, 1);
+            };
+            if (cc == "o") return ne0("OF");
+            if (cc == "no") return eq0("OF");
+            if (cc == "b") return ne0("CF");
+            if (cc == "ae") return eq0("CF");
+            if (cc == "e") return ne0("ZF");
+            if (cc == "ne") return eq0("ZF");
+            if (cc == "be") return emit2(POp::INT_OR, ne0("CF"), ne0("ZF"), 1);
+            if (cc == "a") return emit2(POp::INT_AND, eq0("CF"), eq0("ZF"), 1);
+            if (cc == "s") return ne0("SF");
+            if (cc == "ns") return eq0("SF");
+            if (cc == "p") return ne0("PF");
+            if (cc == "np") return eq0("PF");
+            if (cc == "l") return emit2(POp::INT_NOTEQUAL, flag("SF"), flag("OF"), 1);
+            if (cc == "ge") return emit2(POp::INT_EQUAL, flag("SF"), flag("OF"), 1);
+            if (cc == "le")
+                return emit2(POp::INT_OR, ne0("ZF"),
+                             emit2(POp::INT_NOTEQUAL, flag("SF"), flag("OF"), 1), 1);
+            if (cc == "g")
+                return emit2(POp::INT_AND, eq0("ZF"),
+                             emit2(POp::INT_EQUAL, flag("SF"), flag("OF"), 1), 1);
+            return zero;
+        };
+
+        const std::string& name = matched->name;
+        const std::set<std::string> arithmetic = {
+            "add", "adc", "sub", "sbb", "cmp", "and", "or", "xor",
+            "test", "inc", "dec", "neg", "xadd"
+        };
+        if (arithmetic.count(name) && out.named.count("dst")) {
+            const uint8_t opcodeByte = readByte(0);
+            const bool dstMem = isMemory("dst");
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int size = (byteOpcode(opcodeByte) ||
+                              (name == "xadd" && readByte(1) == 0xC0))
+                                 ? 1
+                                 : (dstMem ? xc.opsz
+                                           : (dstNode && dstNode->size
+                                                  ? dstNode->size : xc.opsz));
+            uint64_t a = dstMem ? loadValue(dstId, size)
+                                : resized(dstId, size, false);
+            if (name == "xadd") {
+                const uint64_t snapshot = tmp(size);
+                out.ops.push_back(PcodeOp{POp::COPY, snapshot, a, 0, 0});
+                a = snapshot;
+            }
+            uint64_t b = constVarnode(out, 1, size);
+            std::string rhsName;
+            if (out.named.count("src")) rhsName = "src";
+            else if (out.named.count("imm")) rhsName = "imm";
+            if (!rhsName.empty()) {
+                const uint64_t rhsId = out.named[rhsName];
+                b = isMemory(rhsName) ? loadValue(rhsId, size)
+                                      : resized(rhsId, size, rhsName == "imm");
+            }
+
+            uint64_t result = 0;
+            if (name == "and" || name == "or" || name == "xor" || name == "test") {
+                const POp op = name == "and" || name == "test" ? POp::INT_AND
+                               : name == "or" ? POp::INT_OR : POp::INT_XOR;
+                result = emit2(op, a, b, size);
+                const uint64_t zero = constVarnode(out, 0, 1);
+                writeFlag("CF", zero);
+                writeFlag("OF", zero);
+                writeFlag("AF", zero); // architecturally undefined; deterministic IR
+                writeFlag("PF", emit1(POp::INT_PARITY, result, 1));
+                writeFlag("ZF", emit2(POp::INT_EQUAL, result,
+                                       constVarnode(out, 0, size), 1));
+                writeFlag("SF", bitFlag(result, size * 8 - 1, size));
+            } else if (name == "add" || name == "xadd") {
+                result = emit2(POp::INT_ADD, a, b, size);
+                writeFlag("CF", emit2(POp::INT_CARRY, a, b, 1));
+                commonFlags(a, b, result, size, POp::INT_SCARRY);
+            } else if (name == "sub" || name == "cmp") {
+                result = emit2(POp::INT_SUB, a, b, size);
+                writeFlag("CF", emit2(POp::INT_LESS, a, b, 1));
+                commonFlags(a, b, result, size, POp::INT_SBORROW);
+            } else if (name == "inc" || name == "dec") {
+                const bool isInc = name == "inc";
+                result = emit2(isInc ? POp::INT_ADD : POp::INT_SUB, a, b, size);
+                commonFlags(a, b, result, size,
+                            isInc ? POp::INT_SCARRY : POp::INT_SBORROW);
+            } else if (name == "neg") {
+                const uint64_t zero = constVarnode(out, 0, size);
+                result = emit2(POp::INT_SUB, zero, a, size);
+                writeFlag("CF", emit2(POp::INT_NOTEQUAL, a, zero, 1));
+                commonFlags(zero, a, result, size, POp::INT_SBORROW);
+            } else if (name == "adc" || name == "sbb") {
+                const uint64_t cin1 = tmp(1);
+                out.ops.push_back(PcodeOp{POp::COPY, cin1, flag("CF"), 0, 0});
+                const uint64_t cin = resized(cin1, size, false);
+                const bool add = name == "adc";
+                const uint64_t first = emit2(add ? POp::INT_ADD : POp::INT_SUB,
+                                             a, b, size);
+                result = emit2(add ? POp::INT_ADD : POp::INT_SUB,
+                               first, cin, size);
+                const uint64_t c0 = emit2(add ? POp::INT_CARRY : POp::INT_LESS,
+                                          a, b, 1);
+                const uint64_t c1 = emit2(add ? POp::INT_CARRY : POp::INT_LESS,
+                                          first, cin, 1);
+                writeFlag("CF", emit2(POp::INT_OR, c0, c1, 1));
+                const POp signedOverflow = add ? POp::INT_SCARRY
+                                               : POp::INT_SBORROW;
+                const uint64_t o0 = emit2(signedOverflow, a, b, 1);
+                const uint64_t o1 = emit2(signedOverflow, first, cin, 1);
+                // The two one-bit additions/subtractions cannot overflow in
+                // the same direction simultaneously.  XOR therefore gives
+                // the exact overflow of a +/- b +/- carry-in, including the
+                // INT_MAX+CF and INT_MIN-1 cancellation boundaries.
+                const uint64_t overflow = emit2(POp::INT_XOR, o0, o1, 1);
+                commonFlags(a, b, result, size, signedOverflow);
+                writeFlag("OF", overflow);
+            }
+
+            if (name != "cmp" && name != "test") {
+                if (dstMem)
+                    out.ops.push_back(PcodeOp{POp::STORE, 0, dstId, 0, result});
+                else
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                if (name == "xadd" && out.named.count("src"))
+                    out.ops.push_back(PcodeOp{POp::COPY, out.named["src"], a, 0, 0});
+            }
+            x86Handled = result != 0;
+        }
+
+        if (!x86Handled && name == "imul" && out.named.count("dst") &&
+            out.named.count("src")) {
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int size = dstNode && dstNode->size ? dstNode->size : xc.opsz;
+            const uint64_t srcId = out.named["src"];
+            uint64_t a = out.named.count("imm")
+                             ? (isMemory("src") ? loadValue(srcId, size)
+                                                : resized(srcId, size, false))
+                             : resized(dstId, size, false);
+            uint64_t b = out.named.count("imm")
+                             ? resized(out.named["imm"], size, true)
+                             : (isMemory("src") ? loadValue(srcId, size)
+                                                : resized(srcId, size, false));
+            const uint64_t result = emit2(POp::INT_MULT, a, b, size);
+            const uint64_t overflow = emit2(POp::INT_SMULT_OVERFLOW, a, b, 1);
+            writeFlag("CF", overflow); writeFlag("OF", overflow);
+            out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled && name == "cmpxchg" && out.named.count("dst") &&
+            out.named.count("src")) {
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const bool dstMem = isMemory("dst");
+            const int size = readByte(1) == 0xB0 ? 1
+                                 : (dstMem ? xc.opsz
+                                           : (dstNode ? dstNode->size : xc.opsz));
+            const uint64_t oldDst = dstMem ? loadValue(dstId, size)
+                                           : resized(dstId, size, false);
+            const uint64_t src = resized(out.named["src"], size, false);
+            const uint64_t accumulator = x86RegVarnode(0, size);
+            const uint64_t oldAcc = resized(accumulator, size, false);
+            const uint64_t difference = emit2(POp::INT_SUB, oldAcc, oldDst, size);
+            writeFlag("CF", emit2(POp::INT_LESS, oldAcc, oldDst, 1));
+            commonFlags(oldAcc, oldDst, difference, size, POp::INT_SBORROW);
+            const uint64_t equal = emit2(POp::INT_EQUAL, oldAcc, oldDst, 1);
+            const uint64_t newDst = emitSelect(equal, src, oldDst, size);
+            const uint64_t newAcc = emitSelect(equal, oldAcc, oldDst, size);
+            if (dstMem)
+                out.ops.push_back(PcodeOp{POp::STORE, 0, dstId, 0, newDst});
+            else
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, newDst, 0, 0});
+            out.ops.push_back(PcodeOp{POp::COPY, accumulator, newAcc, 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled && (name == "shl" || name == "sal" ||
+                            name == "shr" || name == "sar") &&
+            out.named.count("dst")) {
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const bool dstMem = isMemory("dst");
+            const int size = byteOpcode(readByte(0))
+                                 ? 1
+                                 : (dstMem ? xc.opsz
+                                           : (dstNode ? dstNode->size : xc.opsz));
+            const uint64_t a = dstMem ? loadValue(dstId, size)
+                                      : resized(dstId, size, false);
+            uint64_t count = constVarnode(out, 1, size);
+            if (out.named.count("imm"))
+                count = resized(out.named["imm"], size, false);
+            else if (readByte(0) == 0xD2 || readByte(0) == 0xD3)
+                count = resized(x86RegVarnode(1, 1), size, false);
+            const uint64_t mask = constVarnode(out, size == 8 ? 0x3f : 0x1f, size);
+            count = emit2(POp::INT_AND, count, mask, size);
+            const POp shiftOp = (name == "shl" || name == "sal") ? POp::INT_LEFT
+                                : name == "shr" ? POp::INT_RIGHT
+                                                : POp::INT_SRIGHT;
+            const uint64_t result = emit2(shiftOp, a, count, size);
+            const uint64_t one = constVarnode(out, 1, size);
+            const uint64_t nonzero = emit2(POp::INT_NOTEQUAL, count,
+                                           constVarnode(out, 0, size), 1);
+            uint64_t cfCandidate = 0;
+            if (name == "shl" || name == "sal") {
+                const uint64_t fromTop = emit2(POp::INT_SUB,
+                                               constVarnode(out, size * 8, size),
+                                               count, size);
+                cfCandidate = emit2(POp::INT_AND,
+                                    emit2(POp::INT_RIGHT, a, fromTop, size), one, 1);
+            } else {
+                const uint64_t pos = emit2(POp::INT_SUB, count, one, size);
+                cfCandidate = emit2(POp::INT_AND,
+                                    emit2(POp::INT_RIGHT, a, pos, size), one, 1);
+            }
+            const uint64_t oldCF = flag("CF"), oldOF = flag("OF");
+            writeFlag("CF", emitSelect(nonzero, cfCandidate, oldCF, 1));
+            const uint64_t isOne = emit2(POp::INT_EQUAL, count, one, 1);
+            uint64_t ofCandidate = constVarnode(out, 0, 1);
+            if (name == "shl" || name == "sal")
+                ofCandidate = emit2(POp::INT_XOR,
+                                    bitFlag(result, size * 8 - 1, size), cfCandidate, 1);
+            else if (name == "shr")
+                ofCandidate = bitFlag(a, size * 8 - 1, size);
+            writeFlag("OF", emitSelect(isOne, ofCandidate, oldOF, 1));
+            writeFlag("PF", emitSelect(nonzero, emit1(POp::INT_PARITY, result, 1),
+                                        flag("PF"), 1));
+            writeFlag("ZF", emitSelect(nonzero,
+                                        emit2(POp::INT_EQUAL, result,
+                                              constVarnode(out, 0, size), 1),
+                                        flag("ZF"), 1));
+            writeFlag("SF", emitSelect(nonzero,
+                                        bitFlag(result, size * 8 - 1, size),
+                                        flag("SF"), 1));
+            if (dstMem)
+                out.ops.push_back(PcodeOp{POp::STORE, 0, dstId, 0, result});
+            else
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled && (name == "shld" || name == "shrd") &&
+            out.named.count("dst") && out.named.count("src")) {
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const bool dstMem = isMemory("dst");
+            const int size = dstMem ? xc.opsz
+                                    : (dstNode && dstNode->size
+                                           ? dstNode->size : xc.opsz);
+            const int bits = size * 8;
+            const uint64_t destination = dstMem ? loadValue(dstId, size)
+                                                : resized(dstId, size, false);
+            const uint64_t source = resized(out.named["src"], size, false);
+            uint64_t count = out.named.count("imm")
+                                 ? resized(out.named["imm"], size, false)
+                                 : resized(x86RegVarnode(1, 1), size, false);
+            count = emit2(POp::INT_AND, count,
+                          constVarnode(out, size == 8 ? 0x3f : 0x1f, size), size);
+            const uint64_t zero = constVarnode(out, 0, size);
+            const uint64_t one = constVarnode(out, 1, size);
+            const uint64_t nonzero = emit2(POp::INT_NOTEQUAL, count, zero, 1);
+            const uint64_t complementary = emit2(
+                POp::INT_SUB, constVarnode(out, bits, size), count, size);
+            uint64_t candidate = 0, carry = 0;
+            if (name == "shld") {
+                candidate = emit2(
+                    POp::INT_OR,
+                    emit2(POp::INT_LEFT, destination, count, size),
+                    emit2(POp::INT_RIGHT, source, complementary, size), size);
+                carry = emit2(POp::INT_AND,
+                              emit2(POp::INT_RIGHT, destination,
+                                    complementary, size), one, 1);
+            } else {
+                candidate = emit2(
+                    POp::INT_OR,
+                    emit2(POp::INT_RIGHT, destination, count, size),
+                    emit2(POp::INT_LEFT, source, complementary, size), size);
+                const uint64_t carryPosition = emit2(POp::INT_SUB, count, one, size);
+                carry = emit2(POp::INT_AND,
+                              emit2(POp::INT_RIGHT, destination,
+                                    carryPosition, size), one, 1);
+            }
+            const uint64_t result = emitSelect(nonzero, candidate, destination, size);
+            writeFlag("CF", emitSelect(nonzero, carry, flag("CF"), 1));
+            const uint64_t isOne = emit2(POp::INT_EQUAL, count, one, 1);
+            const uint64_t overflow = name == "shld"
+                ? emit2(POp::INT_XOR, bitFlag(result, bits - 1, size), carry, 1)
+                : emit2(POp::INT_XOR, bitFlag(destination, bits - 1, size),
+                        bitFlag(result, bits - 1, size), 1);
+            writeFlag("OF", emitSelect(isOne, overflow, flag("OF"), 1));
+            writeFlag("PF", emitSelect(nonzero,
+                                        emit1(POp::INT_PARITY, result, 1),
+                                        flag("PF"), 1));
+            writeFlag("ZF", emitSelect(nonzero,
+                                        emit2(POp::INT_EQUAL, result, zero, 1),
+                                        flag("ZF"), 1));
+            writeFlag("SF", emitSelect(nonzero,
+                                        bitFlag(result, bits - 1, size),
+                                        flag("SF"), 1));
+            if (dstMem)
+                out.ops.push_back(PcodeOp{POp::STORE, 0, dstId, 0, result});
+            else
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled && (name == "rol" || name == "ror" ||
+                            name == "rcl" || name == "rcr") &&
+            out.named.count("dst")) {
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const bool dstMem = isMemory("dst");
+            const int size = byteOpcode(readByte(0)) ? 1
+                                 : (dstMem ? xc.opsz
+                                           : (dstNode ? dstNode->size : xc.opsz));
+            const int bits = size * 8;
+            const uint64_t value = dstMem ? loadValue(dstId, size)
+                                          : resized(dstId, size, false);
+            uint64_t count = constVarnode(out, 1, size);
+            if (out.named.count("imm")) count = resized(out.named["imm"], size, false);
+            else if (readByte(0) == 0xD2 || readByte(0) == 0xD3)
+                count = resized(x86RegVarnode(1, 1), size, false);
+            count = emit2(POp::INT_AND, count,
+                          constVarnode(out, size == 8 ? 0x3f : 0x1f, size), size);
+            const bool throughCarry = name == "rcl" || name == "rcr";
+            count = emit2(POp::INT_REM, count,
+                          constVarnode(out, bits + (throughCarry ? 1 : 0), size), size);
+            const uint64_t zero = constVarnode(out, 0, size);
+            const uint64_t one = constVarnode(out, 1, size);
+            const uint64_t nonzero = emit2(POp::INT_NOTEQUAL, count, zero, 1);
+            const uint64_t oldCF = flag("CF"), oldOF = flag("OF");
+            uint64_t result = value, cfCandidate = oldCF;
+            if (name == "rol" || name == "ror") {
+                const uint64_t other = emit2(POp::INT_SUB,
+                                             constVarnode(out, bits, size), count, size);
+                const uint64_t left = emit2(POp::INT_LEFT, value,
+                                            name == "rol" ? count : other, size);
+                const uint64_t right = emit2(POp::INT_RIGHT, value,
+                                             name == "rol" ? other : count, size);
+                result = emit2(POp::INT_OR, left, right, size);
+                cfCandidate = name == "rol" ? emit2(POp::INT_AND, result, one, 1)
+                                             : bitFlag(result, bits - 1, size);
+            } else {
+                const uint64_t cin = resized(oldCF, size, false);
+                if (name == "rcl") {
+                    const uint64_t left = emit2(POp::INT_LEFT, value, count, size);
+                    const uint64_t cinPos = emit2(POp::INT_SUB, count, one, size);
+                    const uint64_t cinPart = emit2(POp::INT_LEFT, cin, cinPos, size);
+                    const uint64_t rightPos = emit2(
+                        POp::INT_SUB, constVarnode(out, bits + 1, size), count, size);
+                    const uint64_t right = emit2(POp::INT_RIGHT, value, rightPos, size);
+                    result = emit2(POp::INT_OR, emit2(POp::INT_OR, left, cinPart, size),
+                                   right, size);
+                    const uint64_t cfPos = emit2(POp::INT_SUB,
+                                                 constVarnode(out, bits, size), count, size);
+                    cfCandidate = emit2(POp::INT_AND,
+                                        emit2(POp::INT_RIGHT, value, cfPos, size), one, 1);
+                } else {
+                    const uint64_t right = emit2(POp::INT_RIGHT, value, count, size);
+                    const uint64_t cinPos = emit2(
+                        POp::INT_SUB, constVarnode(out, bits, size), count, size);
+                    const uint64_t cinPart = emit2(POp::INT_LEFT, cin, cinPos, size);
+                    const uint64_t leftPos = emit2(
+                        POp::INT_SUB, constVarnode(out, bits + 1, size), count, size);
+                    const uint64_t left = emit2(POp::INT_LEFT, value, leftPos, size);
+                    result = emit2(POp::INT_OR, emit2(POp::INT_OR, right, cinPart, size),
+                                   left, size);
+                    const uint64_t cfPos = emit2(POp::INT_SUB, count, one, size);
+                    cfCandidate = emit2(POp::INT_AND,
+                                        emit2(POp::INT_RIGHT, value, cfPos, size), one, 1);
+                }
+            }
+            result = emitSelect(nonzero, result, value, size);
+            writeFlag("CF", emitSelect(nonzero, cfCandidate, oldCF, 1));
+            const uint64_t isOne = emit2(POp::INT_EQUAL, count, one, 1);
+            const uint64_t msb = bitFlag(result, bits - 1, size);
+            const uint64_t ofCandidate = (name == "rol" || name == "rcl")
+                                             ? emit2(POp::INT_XOR, msb, cfCandidate, 1)
+                                             : emit2(POp::INT_XOR, msb,
+                                                     bitFlag(result, bits - 2, size), 1);
+            writeFlag("OF", emitSelect(isOne, ofCandidate, oldOF, 1));
+            if (dstMem)
+                out.ops.push_back(PcodeOp{POp::STORE, 0, dstId, 0, result});
+            else
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled && (name == "bsf" || name == "bsr" ||
+                            name == "tzcnt" || name == "lzcnt" ||
+                            name == "popcnt") && out.named.count("dst") &&
+            out.named.count("src")) {
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int size = dstNode && dstNode->size ? dstNode->size : xc.opsz;
+            const uint64_t srcId = out.named["src"];
+            const uint64_t src = isMemory("src") ? loadValue(srcId, size)
+                                                   : resized(srcId, size, false);
+            const uint64_t zero = constVarnode(out, 0, size);
+            const uint64_t inputZero = emit2(POp::INT_EQUAL, src, zero, 1);
+            POp countOp = (name == "bsf" || name == "tzcnt")
+                              ? POp::INT_COUNT_TRAILING_ZERO
+                              : POp::INT_COUNT_LEADING_ZERO;
+            uint64_t result = name == "popcnt"
+                                  ? emit1(POp::INT_POPCOUNT, src, size)
+                                  : emit1(countOp, src, size);
+            if (name == "bsr")
+                result = emit2(POp::INT_SUB,
+                               constVarnode(out, size * 8 - 1, size), result, size);
+            if (name == "bsf" || name == "bsr") {
+                result = emitSelect(inputZero, dstId, result, size);
+                writeFlag("ZF", inputZero);
+            } else if (name == "popcnt") {
+                writeFlag("ZF", inputZero);
+                const uint64_t flagZero = constVarnode(out, 0, 1);
+                writeFlag("CF", flagZero); writeFlag("OF", flagZero);
+                writeFlag("SF", flagZero); writeFlag("AF", flagZero);
+                writeFlag("PF", flagZero);
+            } else {
+                writeFlag("CF", inputZero);
+                writeFlag("ZF", emit2(POp::INT_EQUAL, result, zero, 1));
+                const uint64_t flagZero = constVarnode(out, 0, 1);
+                writeFlag("OF", flagZero); writeFlag("SF", flagZero);
+                writeFlag("AF", flagZero); writeFlag("PF", flagZero);
+            }
+            out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled && (name == "bt" || name == "bts" ||
+                            name == "btr" || name == "btc") &&
+            out.named.count("dst")) {
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const bool dstMem = isMemory("dst");
+            const int size = dstMem ? xc.opsz
+                                    : (dstNode && dstNode->size ? dstNode->size : xc.opsz);
+            const uint64_t value = dstMem ? loadValue(dstId, size)
+                                          : resized(dstId, size, false);
+            std::string bitName = out.named.count("src") ? "src" : "imm";
+            if (out.named.count(bitName)) {
+                uint64_t bit = resized(out.named[bitName], size, false);
+                bit = emit2(POp::INT_AND, bit,
+                            constVarnode(out, size * 8 - 1, size), size);
+                const uint64_t shifted = emit2(POp::INT_RIGHT, value, bit, size);
+                writeFlag("CF", emit2(POp::INT_AND, shifted,
+                                      constVarnode(out, 1, size), 1));
+                if (name != "bt") {
+                    const uint64_t mask = emit2(POp::INT_LEFT,
+                                                constVarnode(out, 1, size), bit, size);
+                    uint64_t result = value;
+                    if (name == "bts") result = emit2(POp::INT_OR, value, mask, size);
+                    else if (name == "btc") result = emit2(POp::INT_XOR, value, mask, size);
+                    else result = emit2(POp::INT_AND, value,
+                                        emit2(POp::INT_XOR, mask,
+                                              constVarnode(out,
+                                                           size >= 8 ? ~0ULL
+                                                                     : ((1ULL << (size * 8)) - 1),
+                                                           size), size),
+                                        size);
+                    if (dstMem)
+                        out.ops.push_back(PcodeOp{POp::STORE, 0, dstId, 0, result});
+                    else
+                        out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                }
+                x86Handled = true;
+            }
+        }
+
+        // Full-width aligned/unaligned SIMD moves.  Store encodings reverse
+        // the ModRM roles relative to load encodings, so use the opcode rather
+        // than the constructor's display operand names.
+        if (!x86Handled && out.named.count("dst") && out.named.count("src")) {
+            std::string moveName = name;
+            if (!moveName.empty() && moveName[0] == 'v') moveName.erase(moveName.begin());
+            const std::set<std::string> vectorMoves = {
+                "movups", "movupd", "movaps", "movapd", "movdqa", "movdqu"
+            };
+            if (vectorMoves.count(moveName)) {
+                const int actualOpcode = (xc.vex || xc.evex) ? readByte(0) : readByte(1);
+                const bool storeEncoding = actualOpcode == 0x11 || actualOpcode == 0x29 ||
+                                           actualOpcode == 0x7F;
+                const uint64_t dstId = out.named["dst"];
+                const uint64_t srcId = out.named["src"];
+                const Varnode* dstNode = out.find(dstId);
+                const Varnode* srcNode = out.find(srcId);
+                const int size = dstNode && dstNode->size > 8 ? dstNode->size
+                                 : srcNode && srcNode->size > 8 ? srcNode->size : 16;
+                if (storeEncoding) {
+                    if (isMemory("src"))
+                        out.ops.push_back(PcodeOp{POp::STORE, 0, srcId, 0, dstId});
+                    else
+                        out.ops.push_back(PcodeOp{POp::COPY, srcId, dstId, 0, 0});
+                } else {
+                    const uint64_t value = isMemory("src") ? loadValue(srcId, size) : srcId;
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, value, 0, 0});
+                }
+                x86Handled = true;
+            }
+        }
+
+        // Packed bitwise and wrapping integer lane operations.
+        if (!x86Handled && out.named.count("dst")) {
+            std::string vectorName = name;
+            const bool vexVector = !vectorName.empty() && vectorName[0] == 'v';
+            if (vexVector) vectorName.erase(vectorName.begin());
+            POp vectorOp = POp::UNIMPLEMENTED;
+            int laneBits = 0;
+            if (vectorName == "andps" || vectorName == "andpd" ||
+                vectorName == "pand" || vectorName == "pandd" || vectorName == "pandq")
+                vectorOp = POp::INT_AND;
+            else if (vectorName == "orps" || vectorName == "orpd" ||
+                     vectorName == "por")
+                vectorOp = POp::INT_OR;
+            else if (vectorName == "xorps" || vectorName == "xorpd" ||
+                     vectorName == "pxor")
+                vectorOp = POp::INT_XOR;
+            else if (vectorName == "paddb") { vectorOp = POp::INT_ADD; laneBits = 8; }
+            else if (vectorName == "paddw") { vectorOp = POp::INT_ADD; laneBits = 16; }
+            else if (vectorName == "paddd") { vectorOp = POp::INT_ADD; laneBits = 32; }
+            else if (vectorName == "paddq") { vectorOp = POp::INT_ADD; laneBits = 64; }
+            else if (vectorName == "psubb") { vectorOp = POp::INT_SUB; laneBits = 8; }
+            else if (vectorName == "psubw") { vectorOp = POp::INT_SUB; laneBits = 16; }
+            else if (vectorName == "psubd") { vectorOp = POp::INT_SUB; laneBits = 32; }
+            else if (vectorName == "psubq") { vectorOp = POp::INT_SUB; laneBits = 64; }
+            else if (vectorName == "pmullw") { vectorOp = POp::INT_MULT; laneBits = 16; }
+            else if (vectorName == "pmulld") { vectorOp = POp::INT_MULT; laneBits = 32; }
+            if (vectorOp != POp::UNIMPLEMENTED) {
+                const uint64_t dstId = out.named["dst"];
+                const Varnode* dstNode = out.find(dstId);
+                const int size = dstNode && dstNode->size ? dstNode->size : 16;
+                uint64_t a = dstId, b = 0;
+                if (vexVector && out.named.count("src1") && out.named.count("src2")) {
+                    a = out.named["src1"];
+                    b = isMemory("src2") ? loadValue(out.named["src2"], size)
+                                          : out.named["src2"];
+                } else if (out.named.count("src")) {
+                    b = isMemory("src") ? loadValue(out.named["src"], size)
+                                         : out.named["src"];
+                }
+                if (b) {
+                    const uint64_t result = tmp(size);
+                    out.ops.push_back(PcodeOp{vectorOp, result, a, b, 0,
+                                              static_cast<uint16_t>(laneBits)});
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+        }
+
+        // Common scalar SSE conversion families.  Keeping these as typed
+        // p-code operations preserves their signedness, IEEE width, rounding
+        // mode (rounded vs CVTT truncation), and legacy upper-lane behavior.
+        if (!x86Handled && out.named.count("dst") && out.named.count("src")) {
+            const bool intToFloat = name == "cvtsi2ss" || name == "cvtsi2sd";
+            const bool floatToInt = name == "cvtss2si" || name == "cvtsd2si" ||
+                                    name == "cvttss2si" || name == "cvttsd2si";
+            const bool floatToFloat = name == "cvtss2sd" || name == "cvtsd2ss";
+            const uint64_t dstId = out.named["dst"];
+            const uint64_t srcId = out.named["src"];
+            const Varnode* dstNode = out.find(dstId);
+            if (intToFloat) {
+                const int integerSize = xc.rexw ? 8 : 4;
+                const int floatBits = name == "cvtsi2ss" ? 32 : 64;
+                const int destinationSize = dstNode && dstNode->size > 8
+                                                ? dstNode->size : 16;
+                const uint64_t source = isMemory("src")
+                                            ? loadValue(srcId, integerSize)
+                                            : resized(srcId, integerSize, true);
+                const uint64_t result = tmp(destinationSize);
+                out.ops.push_back(PcodeOp{POp::FLOAT_INT2FLOAT, result, source,
+                                          dstId, 0,
+                                          static_cast<uint16_t>(floatBits)});
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                x86Handled = true;
+            } else if (floatToInt) {
+                const bool single = name.find("ss2si") != std::string::npos;
+                const bool truncate = name.rfind("cvtt", 0) == 0;
+                const int floatBits = single ? 32 : 64;
+                const int integerSize = xc.rexw ? 8 : 4;
+                const uint64_t source = isMemory("src")
+                                            ? loadValue(srcId, floatBits / 8)
+                                            : srcId;
+                const uint64_t result = tmp(integerSize);
+                const uint16_t aux = static_cast<uint16_t>(
+                    floatBits | (truncate ? 0x8000 : 0));
+                out.ops.push_back(PcodeOp{POp::FLOAT_FLOAT2INT, result, source,
+                                          0, 0, aux});
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                x86Handled = true;
+            } else if (floatToFloat) {
+                const int sourceBits = name == "cvtss2sd" ? 32 : 64;
+                const int destinationBits = name == "cvtss2sd" ? 64 : 32;
+                const int destinationSize = dstNode && dstNode->size > 8
+                                                ? dstNode->size : 16;
+                const uint64_t source = isMemory("src")
+                                            ? loadValue(srcId, sourceBits / 8)
+                                            : srcId;
+                const uint64_t result = tmp(destinationSize);
+                const uint16_t aux = static_cast<uint16_t>(sourceBits |
+                                                           (destinationBits << 8));
+                out.ops.push_back(PcodeOp{POp::FLOAT_FLOAT2FLOAT, result,
+                                          source, dstId, 0, aux});
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                x86Handled = true;
+            }
+        }
+
+        // Scalar and packed IEEE-754 semantics for the common SSE/AVX
+        // arithmetic families.  aux stores lane width and the scalar marker.
+        if (!x86Handled && out.named.count("dst")) {
+            std::string floatName = name;
+            const bool vexForm = !floatName.empty() && floatName[0] == 'v';
+            if (vexForm) floatName.erase(floatName.begin());
+            const bool f32 = floatName.size() >= 2 &&
+                             (floatName.substr(floatName.size() - 2) == "ps" ||
+                              floatName.substr(floatName.size() - 2) == "ss");
+            const bool f64 = floatName.size() >= 2 &&
+                             (floatName.substr(floatName.size() - 2) == "pd" ||
+                              floatName.substr(floatName.size() - 2) == "sd");
+            const bool scalar = floatName.size() >= 2 &&
+                                (floatName.substr(floatName.size() - 2) == "ss" ||
+                                 floatName.substr(floatName.size() - 2) == "sd");
+            const std::string stem = (f32 || f64)
+                                         ? floatName.substr(0, floatName.size() - 2)
+                                         : std::string();
+            POp floatOp = POp::UNIMPLEMENTED;
+            if (stem == "add") floatOp = POp::FLOAT_ADD;
+            else if (stem == "sub") floatOp = POp::FLOAT_SUB;
+            else if (stem == "mul") floatOp = POp::FLOAT_MULT;
+            else if (stem == "div") floatOp = POp::FLOAT_DIV;
+            else if (stem == "sqrt") floatOp = POp::FLOAT_SQRT;
+            else if (stem == "min") floatOp = POp::FLOAT_MIN;
+            else if (stem == "max") floatOp = POp::FLOAT_MAX;
+            if ((f32 || f64) && floatOp != POp::UNIMPLEMENTED) {
+                const uint64_t dstId = out.named["dst"];
+                const Varnode* dstNode = out.find(dstId);
+                const int size = dstNode && dstNode->size ? dstNode->size : 16;
+                const int laneBits = f32 ? 32 : 64;
+                const uint16_t aux = static_cast<uint16_t>(laneBits |
+                                                           (scalar ? 0x8000 : 0));
+                auto sourceValue = [&](const std::string& operand, int loadSize) {
+                    const uint64_t id = out.named[operand];
+                    return isMemory(operand) ? loadValue(id, loadSize) : id;
+                };
+                uint64_t a = dstId, b = 0;
+                if (floatOp == POp::FLOAT_SQRT) {
+                    const std::string source = vexForm && out.named.count("src2")
+                                                   ? "src2" : "src";
+                    if (out.named.count(source))
+                        a = sourceValue(source, scalar ? laneBits / 8 : size);
+                    b = vexForm && out.named.count("src1") ? out.named["src1"] : dstId;
+                } else if (vexForm && out.named.count("src1") &&
+                           out.named.count("src2")) {
+                    a = out.named["src1"];
+                    b = sourceValue("src2", scalar ? laneBits / 8 : size);
+                } else if (out.named.count("src")) {
+                    a = dstId;
+                    b = sourceValue("src", scalar ? laneBits / 8 : size);
+                }
+                if (a && (b || floatOp == POp::FLOAT_SQRT)) {
+                    const uint64_t result = tmp(size);
+                    out.ops.push_back(PcodeOp{floatOp, result, a, b, 0, aux});
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+
+            const bool compare = floatName == "comiss" || floatName == "ucomiss" ||
+                                 floatName == "comisd" || floatName == "ucomisd";
+            if (!x86Handled && compare) {
+                const bool compare32 = floatName.size() >= 2 &&
+                                       floatName.substr(floatName.size() - 2) == "ss";
+                const uint16_t aux = static_cast<uint16_t>(compare32 ? 32 : 64);
+                const uint64_t lhs = out.named["dst"];
+                std::string rhsName = out.named.count("src2") ? "src2" : "src";
+                if (out.named.count(rhsName)) {
+                    const uint64_t rhsId = out.named[rhsName];
+                    const uint64_t rhs = isMemory(rhsName)
+                                             ? loadValue(rhsId, compare32 ? 4 : 8)
+                                             : rhsId;
+                    auto emitFloatCompare = [&](POp op) {
+                        const uint64_t result = tmp(1);
+                        out.ops.push_back(PcodeOp{op, result, lhs, rhs, 0, aux});
+                        return result;
+                    };
+                    const uint64_t unordered = emitFloatCompare(POp::FLOAT_NAN);
+                    const uint64_t less = emitFloatCompare(POp::FLOAT_LESS);
+                    const uint64_t equal = emitFloatCompare(POp::FLOAT_EQUAL);
+                    writeFlag("CF", emit2(POp::INT_OR, unordered, less, 1));
+                    writeFlag("PF", unordered);
+                    writeFlag("ZF", emit2(POp::INT_OR, unordered, equal, 1));
+                    const uint64_t zero = constVarnode(out, 0, 1);
+                    writeFlag("OF", zero); writeFlag("SF", zero); writeFlag("AF", zero);
+                    x86Handled = true;
+                }
+            }
+        }
+
+        if (!x86Handled && name.rfind("cmov", 0) == 0 &&
+            out.named.count("dst") && out.named.count("src")) {
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int size = dstNode && dstNode->size ? dstNode->size : xc.opsz;
+            const uint64_t srcId = out.named["src"];
+            const uint64_t src = isMemory("src") ? loadValue(srcId, size)
+                                                   : resized(srcId, size, false);
+            const uint64_t selected = emitSelect(condition(name.substr(4)), src,
+                                                 resized(dstId, size, false), size);
+            out.ops.push_back(PcodeOp{POp::COPY, dstId, selected, 0, 0});
+            x86Handled = true;
+        }
+    }
+
+    // emit semantics not replaced by the shared x86 flag implementation
+    if (!x86Handled) for (const auto& st : matched->stmts) {
         switch (st.kind) {
         case SpecCtor::SStmt::ASSIGN: {
             const uint64_t rhs = evalExpr(out, *st.rhsE);
@@ -1757,6 +2728,9 @@ bool SleighEngine::disassemble(
     }
 
     std::string text = matched->name;
+    if (getenv("CF_DBG_CTOR"))
+        std::fprintf(stderr, "[dbg] ctor=%s mod=%d reg=%d rm=%d base=%d isMem=%d rexw=%d rexb=%d\n",
+                    matched->name.c_str(), xc.mod, xc.reg, xc.rm, xc.base, xc.isMem, xc.rexw, xc.rexb);
     if (isSp && parts.size() >= 2) {
         // "c.lwsp rd, imm(sp)"
         text += " " + parts[0] + ", " + parts[1] + "(sp)";

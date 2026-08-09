@@ -19,6 +19,10 @@ def parse(lines):
             i += 1
             continue
         addr = int(m.group(1), 16)
+        # data bytes objdump itself cannot decode: not part of the oracle
+        if '(bad)' in m.group(2):
+            i += 1
+            continue
         bts = []
         for field in m.group(2).split('\t'):
             f = field.strip()
@@ -28,7 +32,9 @@ def parse(lines):
                 break
         j = i + 1
         while j < len(lines):
-            cm = re.match(r'\t+((?:[0-9a-f]{2} )*[0-9a-f]{2})\s*$', lines[j])
+            # objdump continuation: a bare address + bytes line with no
+            # mnemonic text (first line shows at most 7 bytes)
+            cm = re.match(r'\s*[0-9a-f]+:\t+((?:[0-9a-f]{2} )*[0-9a-f]{2})\s*$', lines[j])
             if cm:
                 bts.extend(cm.group(1).split())
                 j += 1

@@ -15,6 +15,7 @@
 // Expressions: ints, operands, regs, inst_next/inst_start, + - * / % << >>
 //              s>> s/ s% & | ^ ~ ! == != < <= > >= s< s<= s> s>=
 //              sext(v[,N]) zext(v[,N]) load(addr[,N])
+//              select(condition, trueValue, falseValue)
 #pragma once
 
 #include <cstdint>
@@ -67,6 +68,7 @@ struct SpecCtor {
     };
     std::vector<Term> terms;
     bool requiresVex = false; // pattern contains a vex* term
+    bool requiresEvex = false; // pattern contains an evex* term
 
     // parsed semantics (owned nodes)
     struct SExpr;
@@ -75,12 +77,15 @@ struct SpecCtor {
 };
 
 struct SpecCtor::SExpr {
-    enum Kind { VAR, CONST, INST_NEXT, INST_START, BINOP, UNOP, SEXT, ZEXT, LOAD } kind = CONST;
+    enum Kind {
+        VAR, CONST, INST_NEXT, INST_START, BINOP, UNOP, SEXT, ZEXT, LOAD,
+        SELECT
+    } kind = CONST;
     std::string var;
     uint64_t cval = 0;
     int op = 0; // char code for BINOP/UNOP
     int bits = 0;
-    std::unique_ptr<SExpr> a, b;
+    std::unique_ptr<SExpr> a, b, c;
 };
 
 struct SpecCtor::SStmt {

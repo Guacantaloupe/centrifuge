@@ -3,12 +3,15 @@
 #include "centrifuge/memory.hpp"
 
 #include <cstring>
+#include <limits>
 
 namespace centrifuge {
 
 bool MemoryImage::addBlock(std::string name, uint64_t base,
                            std::vector<uint8_t> data, int perm) {
     if (data.empty()) return false;
+    if (data.size() > std::numeric_limits<uint64_t>::max() - base)
+        return false;
     const uint64_t end = base + data.size();
     for (const auto& b : blocks_) {
         if (base < b.end() && end > b.base) return false; // overlap
@@ -39,7 +42,7 @@ bool MemoryImage::read(uint64_t addr, void* dst, size_t n) const {
     const auto* b = blockAt(addr);
     if (!b) return false;
     const size_t off = static_cast<size_t>(addr - b->base);
-    if (off + n > b->data.size()) return false;
+    if (off > b->data.size() || n > b->data.size() - off) return false;
     std::memcpy(dst, b->data.data() + off, n);
     return true;
 }
@@ -47,6 +50,8 @@ bool MemoryImage::read(uint64_t addr, void* dst, size_t n) const {
 bool MemoryImage::readString(uint64_t addr, std::string& out, size_t maxLen) const {
     out.clear();
     for (size_t i = 0; i < maxLen; ++i) {
+        if (i > std::numeric_limits<uint64_t>::max() - addr)
+            return !out.empty();
         uint8_t c = 0;
         if (!read(addr + i, &c, 1)) return !out.empty();
         if (c == 0) return true;

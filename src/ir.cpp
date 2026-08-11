@@ -2,11 +2,20 @@
 #include "centrifuge/ir.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <sstream>
+#include <thread>
 #include <tuple>
+
+#include "centrifuge/decompile.hpp"
 
 namespace centrifuge {
 namespace {
@@ -23,8 +32,8 @@ int inputCount(POp op) {
     case POp::FLOAT_NEG: case POp::FLOAT_ABS: case POp::FLOAT_SQRT:
     case POp::FLOAT_FLOAT2INT:
         return 1;
-    case POp::STORE: case POp::SELECT: return 3;
-    case POp::RETURN: return 0;
+    case POp::STORE: case POp::SELECT: case POp::SIMD_MASK: return 3;
+    case POp::RETURN: case POp::TRAP: case POp::SYSCALL: return 0;
     default: return 2;
     }
 }
@@ -32,7 +41,8 @@ int inputCount(POp op) {
 bool pure(POp op) {
     return op != POp::STORE && op != POp::BRANCH && op != POp::CBRANCH &&
            op != POp::BRANCHIND && op != POp::CALL && op != POp::CALLIND &&
-           op != POp::RETURN && op != POp::LOAD;
+           op != POp::RETURN && op != POp::TRAP && op != POp::SYSCALL &&
+           op != POp::LOAD;
 }
 
 uint64_t maskFor(int size) {
@@ -65,8 +75,13 @@ DataType mergeType(DataType a, DataType b) {
     if (a.kind == TypeKind::UNKNOWN) return b;
     if (b.kind == TypeKind::UNKNOWN) return a;
     if (a == b) return a;
-    if (a.kind == TypeKind::POINTER || b.kind == TypeKind::POINTER)
-        return {TypeKind::POINTER, std::max(a.bits, b.bits), 1};
+    if (a.kind == TypeKind::FUNCTION_POINTER || b.kind == TypeKind::FUNCTION_POINTER)
+        return a.kind == TypeKind::FUNCTION_POINTER ? a : b;
+    if (a.kind == TypeKind::POINTER || b.kind == TypeKind::POINTER) {
+        DataType result{TypeKind::POINTER, std::max(a.bits, b.bits), 1};
+        result.detail = a.kind == TypeKind::POINTER && a.detail ? a.detail : b.detail;
+        return result;
+    }
     if (a.kind == TypeKind::VECTOR || b.kind == TypeKind::VECTOR)
         return {TypeKind::VECTOR, std::max(a.bits, b.bits),
                 std::max(a.lanes, b.lanes)};
@@ -79,6 +94,30 @@ DataType mergeType(DataType a, DataType b) {
             std::max(a.bits, b.bits), 1};
 }
 
+std::vector<std::pair<uint64_t, std::string>> abiArguments(
+    const std::string& architecture, const std::string& callingConvention) {
+    std::vector<std::pair<uint64_t, std::string>> arguments;
+    if (architecture.rfind("x86", 0) == 0) {
+        if (callingConvention == "win64" || callingConvention == "ms")
+            return {{1 * 8, "arg0"}, {2 * 8, "arg1"},
+                    {8 * 8, "arg2"}, {9 * 8, "arg3"}};
+        return {{7 * 8, "arg0"}, {6 * 8, "arg1"}, {2 * 8, "arg2"},
+                {1 * 8, "arg3"}, {8 * 8, "arg4"}, {9 * 8, "arg5"}};
+    }
+    if (architecture.rfind("riscv", 0) == 0) {
+        for (int index = 0; index < 8; ++index)
+            arguments.emplace_back((10 + index) * 8,
+                                   "arg" + std::to_string(index));
+        return arguments;
+    }
+    if (architecture == "aarch64" || architecture == "arm64") {
+        for (int index = 0; index < 8; ++index)
+            arguments.emplace_back(index * 8, "arg" + std::to_string(index));
+        return arguments;
+    }
+    return {{0, "arg0"}, {8, "arg1"}, {16, "arg2"}, {24, "arg3"}};
+}
+
 } // namespace
 
 std::string DataType::name() const {
@@ -88,6 +127,17 @@ std::string DataType::name() const {
     case TypeKind::FLOAT: return bits <= 32 ? "float" : "double";
     case TypeKind::VECTOR:
         return "vector" + std::to_string(bits) + "x" + std::to_string(lanes);
+    case TypeKind::ARRAY:
+        return detail && detail->elementType ? detail->elementType->name() + " *"
+                                             : "void *";
+    case TypeKind::STRUCT:
+        return "struct " + (detail && !detail->name.empty() ? detail->name
+                                                              : "anonymous");
+    case TypeKind::UNION:
+        return "union " + (detail && !detail->name.empty() ? detail->name
+                                                              : "anonymous");
+    case TypeKind::FUNCTION_POINTER:
+        return "void (*)(void)";
     case TypeKind::SIGNED_INT: return "int" + std::to_string(bits) + "_t";
     case TypeKind::UNSIGNED_INT: return "uint" + std::to_string(bits) + "_t";
     case TypeKind::MEMORY: return "memory";
@@ -98,20 +148,42 @@ std::string DataType::name() const {
     return "uint64_t";
 }
 
+std::string DataType::declaration(const std::string& identifier) const {
+    if (kind == TypeKind::ARRAY && detail && detail->elementType)
+        return detail->elementType->name() + " " + identifier + "[" +
+               std::to_string(detail->elementCount) + "]";
+    if (kind == TypeKind::FUNCTION_POINTER && detail) {
+        const std::string result = detail->returnType
+                                       ? detail->returnType->name() : "void";
+        std::string out = result + " (*" + identifier + ")(";
+        for (size_t i = 0; i < detail->parameterTypes.size(); ++i) {
+            if (i) out += ", ";
+            out += detail->parameterTypes[i].name();
+        }
+        if (detail->variadic)
+            out += detail->parameterTypes.empty() ? "..." : ", ...";
+        else if (detail->parameterTypes.empty()) out += "void";
+        return out + ")";
+    }
+    if (kind == TypeKind::POINTER && detail && detail->elementType)
+        return detail->elementType->kind == TypeKind::ARRAY &&
+                       detail->elementType->detail &&
+                       detail->elementType->detail->elementType
+                   ? detail->elementType->detail->elementType->name() + " *" +
+                         identifier
+                   : detail->elementType->name() + " *" + identifier;
+    return name() + " " + identifier;
+}
+
 std::string FunctionSignature::declaration(const std::string& name) const {
     std::string out = returnType.name() + " " + name + "(";
     if (parameters.empty() && !variadic) out += "void";
     for (size_t i = 0; i < parameters.size(); ++i) {
         if (i) out += ", ";
-        out += parameters[i].type.name() + " " + parameters[i].name;
+        out += parameters[i].type.declaration(parameters[i].name);
     }
     if (variadic) out += parameters.empty() ? "..." : ", ...";
     return out + ")";
-}
-
-const SsaValue* FunctionIR::value(SsaId id) const {
-    const auto it = values_.find(id);
-    return it == values_.end() ? nullptr : &it->second;
 }
 
 bool FunctionIR::build(const CfgBuilder& cfg, const std::string& architecture,
@@ -119,17 +191,40 @@ bool FunctionIR::build(const CfgBuilder& cfg, const std::string& architecture,
     arch_ = architecture;
     callingConvention_ = callingConvention;
     blocks_.clear(); blockIndex_.clear(); values_.clear(); outgoing_.clear();
-    parameters_.clear(); nextId_ = 1;
+    parameters_.clear(); stackInputs_.clear(); nextId_ = 1;
+    hasTailCall_ = false;
+    memoryObjects_.clear(); memoryPartitions_.clear(); nextMemoryObject_ = 1;
     if (cfg.blocks().empty()) return false;
 
     std::set<RegKey> registers;
-    for (const auto& block : cfg.blocks())
+    bool containsCall = false;
+    for (const auto& block : cfg.blocks()) {
+        containsCall |= block.isTailCall();
+        hasTailCall_ |= block.isTailCall();
         for (const auto& insn : block.insns)
-            for (const auto& kv : insn.varnodes) {
-                const Varnode& v = kv.second;
-                if (v.kind == Varnode::REGISTER)
-                    registers.emplace(v.offset, v.size);
+            for (const PcodeOp& operation : insn.ops) {
+                containsCall |= operation.op == POp::CALL ||
+                                operation.op == POp::CALLIND;
+                const Varnode* nodes[] = {insn.find(operation.in0),
+                                          insn.find(operation.in1),
+                                          insn.find(operation.in2),
+                                          insn.find(operation.out)};
+                for (const Varnode* node : nodes)
+                    if (node && node->kind == Varnode::REGISTER)
+                        registers.emplace(node->offset, node->size);
             }
+    }
+
+    // A machine CALL consumes the current ABI argument registers even when
+    // the instruction encoding only names its target.  Materialize those
+    // live-ins so forwarding thunks do not silently replace RCX/RDX/R8/R9
+    // (or the equivalent registers on other targets) with zero.
+    if (containsCall) {
+        const int registerBytes = architecture == "x86" ? 4 : 8;
+        for (const auto& argument : abiArguments(architecture,
+                                                 callingConvention_))
+            registers.emplace(argument.first, registerBytes);
+    }
 
     auto makeValue = [&](SsaValue value) {
         value.id = nextId_++;
@@ -196,7 +291,14 @@ bool FunctionIR::build(const CfgBuilder& cfg, const std::string& architecture,
                 const Varnode* outNode = insn.find(op.out);
                 RegKey key = memoryKey;
                 SsaValue v;
-                if (op.op == POp::STORE) {
+                if (op.op == POp::CALL || op.op == POp::CALLIND) {
+                    key = {std::numeric_limits<uint64_t>::max() - 1,
+                           static_cast<int>(nextId_ & 0x7fffffff)};
+                    v.storage = SsaValue::TEMPORARY;
+                    v.size = architecture.rfind("x86", 0) == 0 &&
+                                     architecture == "x86" ? 4 : 8;
+                    v.type = {TypeKind::UNKNOWN, v.size * 8, 1};
+                } else if (op.op == POp::STORE) {
                     v.storage = SsaValue::MEMORY_STATE; v.type = {TypeKind::MEMORY, 0, 1};
                 } else if (!outNode) {
                     continue;
@@ -279,6 +381,112 @@ bool FunctionIR::build(const CfgBuilder& cfg, const std::string& architecture,
         }
     }
 
+    // Recover the architectural stack-pointer value at each instruction,
+    // relative to the function-entry SP.  Stack operands in p-code are
+    // expressed relative to the *current* SP; treating every SP reference as
+    // entry-relative misclassifies saved nonvolatile registers as arguments
+    // and moves real Win64 stack arguments by the size of the prologue.
+    const uint64_t functionSpOffset = arch_.rfind("x86", 0) == 0 ? 4 * 8
+                                      : arch_.rfind("riscv", 0) == 0 ? 2 * 8
+                                      : (arch_ == "aarch64" || arch_ == "arm64")
+                                            ? 31 * 8 : 0;
+    auto relativeToInstructionSp = [&](const PcodeInsn& insn, uint64_t id) {
+        std::function<std::optional<int64_t>(uint64_t, std::set<uint64_t>&)>
+            resolve;
+        resolve = [&](uint64_t valueId, std::set<uint64_t>& visiting)
+            -> std::optional<int64_t> {
+            if (!visiting.insert(valueId).second) return std::nullopt;
+            const Varnode* node = insn.find(valueId);
+            if (!node) return std::nullopt;
+            if (node->kind == Varnode::REGISTER &&
+                node->offset == functionSpOffset)
+                return 0;
+            if (node->kind != Varnode::UNIQUE) return std::nullopt;
+            for (const PcodeOp& definition : insn.ops) {
+                if (definition.out != valueId) continue;
+                if (definition.op == POp::COPY)
+                    return resolve(definition.in0, visiting);
+                if (definition.op != POp::INT_ADD &&
+                    definition.op != POp::INT_SUB)
+                    continue;
+                for (int side = 0; side < 2; ++side) {
+                    std::set<uint64_t> nested = visiting;
+                    const auto base = resolve(
+                        side ? definition.in1 : definition.in0, nested);
+                    const Varnode* displacement = insn.find(
+                        side ? definition.in0 : definition.in1);
+                    if (!base || !displacement || !displacement->isConst())
+                        continue;
+                    int64_t delta = static_cast<int64_t>(displacement->offset);
+                    if (definition.op == POp::INT_SUB && side == 0)
+                        delta = -delta;
+                    else if (definition.op == POp::INT_SUB)
+                        continue;
+                    return *base + delta;
+                }
+            }
+            return std::nullopt;
+        };
+        std::set<uint64_t> visiting;
+        return resolve(id, visiting);
+    };
+    auto stackAdjustment = [&](const PcodeInsn& insn)
+        -> std::optional<int64_t> {
+        std::optional<int64_t> result;
+        for (const PcodeOp& op : insn.ops) {
+            const Varnode* output = insn.find(op.out);
+            if (!output || output->kind != Varnode::REGISTER ||
+                output->offset != functionSpOffset)
+                continue;
+            if (op.op == POp::COPY) {
+                result = relativeToInstructionSp(insn, op.in0);
+                continue;
+            }
+            if (op.op != POp::INT_ADD && op.op != POp::INT_SUB) continue;
+            for (int side = 0; side < 2; ++side) {
+                const auto base = relativeToInstructionSp(
+                    insn, side ? op.in1 : op.in0);
+                const Varnode* displacement = insn.find(
+                    side ? op.in0 : op.in1);
+                if (!base || !displacement || !displacement->isConst())
+                    continue;
+                int64_t delta = static_cast<int64_t>(displacement->offset);
+                if (op.op == POp::INT_SUB && side == 0)
+                    delta = -delta;
+                else if (op.op == POp::INT_SUB)
+                    continue;
+                result = *base + delta;
+                break;
+            }
+        }
+        return result;
+    };
+    std::map<uint64_t, int64_t> blockEntryStackBias;
+    std::map<uint64_t, int64_t> instructionStackBias;
+    if (!cfg.blocks().empty()) {
+        std::deque<uint64_t> pendingBlocks{cfg.blocks().front().start};
+        blockEntryStackBias[cfg.blocks().front().start] = 0;
+        while (!pendingBlocks.empty()) {
+            const uint64_t address = pendingBlocks.front();
+            pendingBlocks.pop_front();
+            const CfgBlock* block = cfg.blockAt(address);
+            if (!block) continue;
+            int64_t bias = blockEntryStackBias[address];
+            for (const PcodeInsn& insn : block->insns) {
+                instructionStackBias.emplace(insn.addr, bias);
+                if (const auto adjustment = stackAdjustment(insn))
+                    bias += *adjustment;
+            }
+            for (uint64_t successor : block->succs) {
+                const auto inserted = blockEntryStackBias.emplace(successor, bias);
+                if (inserted.second) pendingBlocks.push_back(successor);
+                // A balanced ABI frame has the same SP at every join.  On a
+                // conflict retain the first proven path instead of iterating
+                // an alloca-style loop indefinitely.
+            }
+        }
+    }
+
     // Rename p-code uses in block order.
     for (const auto& block : cfg.blocks()) {
         SsaBlock& sb = blocks_[blockIndex_.at(block.start)];
@@ -290,6 +498,46 @@ bool FunctionIR::build(const CfgBuilder& cfg, const std::string& architecture,
 
         for (const auto& insn : block.insns) {
             std::map<uint64_t, SsaId> local;
+            const uint64_t spOffset = functionSpOffset;
+            const auto knownBias = instructionStackBias.find(insn.addr);
+            const int64_t instructionBias = knownBias == instructionStackBias.end()
+                                                ? 0 : knownBias->second;
+            std::function<std::optional<int64_t>(uint64_t, std::set<uint64_t>&)>
+                stackOffsetOf;
+            stackOffsetOf = [&](uint64_t id, std::set<uint64_t>& visiting)
+                -> std::optional<int64_t> {
+                if (!visiting.insert(id).second) return std::nullopt;
+                const Varnode* node = insn.find(id);
+                if (!node) return std::nullopt;
+                if (node->kind == Varnode::REGISTER &&
+                    node->offset == spOffset)
+                    return instructionBias;
+                if (node->kind != Varnode::UNIQUE) return std::nullopt;
+                for (const PcodeOp& definition : insn.ops) {
+                    if (definition.out != id) continue;
+                    if (definition.op == POp::COPY)
+                        return stackOffsetOf(definition.in0, visiting);
+                    if (definition.op != POp::INT_ADD &&
+                        definition.op != POp::INT_SUB)
+                        continue;
+                    for (int side = 0; side < 2; ++side) {
+                        std::set<uint64_t> nested = visiting;
+                        const auto base = stackOffsetOf(
+                            side ? definition.in1 : definition.in0, nested);
+                        const Varnode* displacement = insn.find(
+                            side ? definition.in0 : definition.in1);
+                        if (!base || !displacement || !displacement->isConst())
+                            continue;
+                        int64_t delta = static_cast<int64_t>(displacement->offset);
+                        if (definition.op == POp::INT_SUB && side == 0)
+                            delta = -delta;
+                        else if (definition.op == POp::INT_SUB)
+                            continue;
+                        return *base + delta;
+                    }
+                }
+                return std::nullopt;
+            };
             auto use = [&](uint64_t varnodeId) -> SsaId {
                 if (!varnodeId) return 0;
                 if (local.count(varnodeId)) return local[varnodeId];
@@ -317,6 +565,27 @@ bool FunctionIR::build(const CfgBuilder& cfg, const std::string& architecture,
                 if (count >= 2) so.inputs.push_back(use(op.in1));
                 if (count >= 3) so.inputs.push_back(use(op.in2));
                 if (op.op == POp::LOAD) so.inputs.push_back(state[memoryKey]);
+                if (op.op == POp::CALL || op.op == POp::CALLIND) {
+                    const int registerBytes = arch_ == "x86" ? 4 : 8;
+                    for (const auto& argument : abiArguments(
+                             arch_, callingConvention_)) {
+                        const RegKey key{argument.first, registerBytes};
+                        const auto current = state.find(key);
+                        if (current != state.end())
+                            so.inputs.push_back(current->second);
+                    }
+                }
+                if (block.isTailCall() &&
+                    (op.op == POp::BRANCH || op.op == POp::BRANCHIND)) {
+                    const int registerBytes = arch_ == "x86" ? 4 : 8;
+                    for (const auto& argument : abiArguments(
+                             arch_, callingConvention_)) {
+                        const RegKey key{argument.first, registerBytes};
+                        const auto current = state.find(key);
+                        if (current != state.end())
+                            so.inputs.push_back(current->second);
+                    }
+                }
                 const auto def = definitions.find({block.start, insn.addr, oi});
                 if (def != definitions.end()) {
                     so.output = def->second.id;
@@ -326,12 +595,36 @@ bool FunctionIR::build(const CfgBuilder& cfg, const std::string& architecture,
                         values_.at(so.output).storage == SsaValue::REGISTER)
                         state[def->second.key] = so.output;
                 }
+                if (op.op == POp::LOAD && so.output) {
+                    std::set<uint64_t> visiting;
+                    const auto offset = stackOffsetOf(op.in0, visiting);
+                    const int64_t firstArgument =
+                        arch_.rfind("x86", 0) == 0
+                            ? ((callingConvention_ == "win64" ||
+                                callingConvention_ == "ms") ? 40 : 8)
+                            : 0;
+                    if (offset && *offset >= firstArgument)
+                        stackInputs_.emplace(*offset, so.output);
+                }
                 sb.ops.push_back(std::move(so));
             }
         }
     }
+    const bool reportProgress = std::getenv("CENTRIFUGE_ANALYSIS_PROGRESS") != nullptr;
+    auto reportBuildStage = [&](const char* stage) {
+        if (!reportProgress) return;
+        std::fprintf(stderr, "[midir 0x%llx] %s\n",
+                     static_cast<unsigned long long>(blocks_.front().start), stage);
+        std::fflush(stderr);
+    };
+    reportBuildStage("renamed");
     inferTypes();
-    return true;
+    reportBuildStage("types");
+    partitionMemory();
+    reportBuildStage("memory-ssa");
+    const MidIRVerification verification = verify();
+    reportBuildStage("verified");
+    return verification.valid();
 }
 
 void FunctionIR::inferTypes() {
@@ -351,11 +644,35 @@ void FunctionIR::inferTypes() {
                 for (SsaId input : phi.inputs)
                     if (const SsaValue* v = value(input)) merged = mergeType(merged, v->type);
                 changed |= constrain(phi.output, merged);
+                // A phi represents one logical value on all incoming edges.
+                // Propagate the joined type back to entry/live-in values so
+                // pointer evidence discovered after a loop is not stranded
+                // on the phi result.
+                if (const SsaValue* output = value(phi.output))
+                    for (SsaId input : phi.inputs)
+                        changed |= constrain(input, output->type);
             }
             for (const SsaOp& op : block.ops) {
                 const SsaValue* out = value(op.output);
                 const int bits = out && out->size ? out->size * 8 : 64;
                 switch (op.op) {
+                case POp::COPY:
+                    if (!op.inputs.empty()) {
+                        const SsaValue* input = value(op.inputs[0]);
+                        if (input) changed |= constrain(op.output, input->type);
+                        if (const SsaValue* output = value(op.output))
+                            changed |= constrain(op.inputs[0], output->type);
+                    }
+                    break;
+                case POp::CALLIND:
+                    if (!op.inputs.empty()) {
+                        DataType functionPointer{TypeKind::FUNCTION_POINTER, 64, 1};
+                        functionPointer.detail = std::make_shared<TypeDetail>();
+                        functionPointer.detail->returnType = std::make_shared<DataType>(
+                            DataType{TypeKind::UNKNOWN, 64, 1});
+                        changed |= constrain(op.inputs[0], functionPointer);
+                    }
+                    break;
                 case POp::CBRANCH:
                     if (op.inputs.size() > 1) changed |= constrain(op.inputs[1], {TypeKind::BOOL, 1, 1});
                     break;
@@ -389,6 +706,22 @@ void FunctionIR::inferTypes() {
                             (b && b->type.kind == TypeKind::POINTER))
                             changed |= constrain(op.output, {TypeKind::POINTER, bits, 1});
                         else changed |= constrain(op.output, {TypeKind::UNSIGNED_INT, bits, 1});
+                        // LOAD/STORE may establish that the arithmetic result
+                        // is an address only on a later fixed-point pass.
+                        // Push that evidence through base +/- displacement;
+                        // otherwise a 64-bit Windows pointer used at one field
+                        // can be emitted as uint32_t and truncated at the ABI.
+                        const SsaValue* output = value(op.output);
+                        if (output && output->type.kind == TypeKind::POINTER) {
+                            const bool aConstant = a && a->constant.has_value();
+                            const bool bConstant = b && b->constant.has_value();
+                            if (!aConstant && (bConstant || op.op == POp::INT_SUB))
+                                changed |= constrain(op.inputs[0],
+                                    {TypeKind::POINTER, 64, 1});
+                            if (op.op == POp::INT_ADD && !bConstant && aConstant)
+                                changed |= constrain(op.inputs[1],
+                                    {TypeKind::POINTER, 64, 1});
+                        }
                     }
                     break;
                 case POp::SELECT:
@@ -436,6 +769,12 @@ void FunctionIR::inferTypes() {
                     for (SsaId input : op.inputs)
                         changed |= constrain(input, {TypeKind::FLOAT, 0, 1});
                     break;
+                case POp::SIMD_MASK:
+                    changed |= constrain(op.output, {TypeKind::VECTOR, bits, 1});
+                    if (op.inputs.size() > 2)
+                        changed |= constrain(op.inputs[2],
+                                             {TypeKind::UNSIGNED_INT, 64, 1});
+                    break;
                 default:
                     if (op.output) changed |= constrain(op.output, {TypeKind::UNSIGNED_INT, bits, 1});
                     break;
@@ -443,29 +782,116 @@ void FunctionIR::inferTypes() {
             }
         }
     }
+
+    // Recover aggregate pointees from constant-offset accesses rooted at an
+    // entry ABI value.  Repeated equal-stride fields become arrays, aliasing
+    // fields become unions, and otherwise a synthetic structure is created.
+    std::map<SsaId, std::pair<SsaId, int64_t>> provenance;
+    for (const auto& parameter : parameters_) {
+        const SsaValue* v = value(parameter.second);
+        if (v && v->storage == SsaValue::REGISTER)
+            provenance[parameter.second] = {parameter.second, 0};
+    }
+    for (int pass = 0; pass < 8; ++pass) {
+        bool progress = false;
+        for (const SsaBlock& block : blocks_)
+            for (const SsaOp& op : block.ops) {
+                if (!op.output || op.inputs.empty()) continue;
+                if (op.op == POp::COPY && provenance.count(op.inputs[0]))
+                    progress |= provenance.emplace(op.output,
+                                                   provenance[op.inputs[0]]).second;
+                if ((op.op != POp::INT_ADD && op.op != POp::INT_SUB) ||
+                    op.inputs.size() < 2)
+                    continue;
+                for (int side = 0; side < 2; ++side) {
+                    const SsaId base = op.inputs[side];
+                    const SsaValue* displacement = value(op.inputs[1 - side]);
+                    if (!provenance.count(base) || !displacement ||
+                        !displacement->constant)
+                        continue;
+                    int64_t delta = static_cast<int64_t>(*displacement->constant);
+                    if (op.op == POp::INT_SUB && side == 0) delta = -delta;
+                    else if (op.op == POp::INT_SUB) continue;
+                    auto derived = provenance[base];
+                    derived.second += delta;
+                    progress |= provenance.emplace(op.output, derived).second;
+                }
+            }
+        if (!progress) break;
+    }
+    std::map<SsaId, std::vector<TypeField>> accessedFields;
+    for (const SsaBlock& block : blocks_)
+        for (const SsaOp& op : block.ops) {
+            if ((op.op != POp::LOAD && op.op != POp::STORE) || op.inputs.empty() ||
+                !provenance.count(op.inputs[0]))
+                continue;
+            const auto origin = provenance[op.inputs[0]];
+            if (origin.second < 0) continue;
+            const SsaValue* fieldValue = op.op == POp::LOAD
+                                             ? value(op.output)
+                                             : (op.inputs.size() > 2
+                                                    ? value(op.inputs[2]) : nullptr);
+            if (!fieldValue) continue;
+            accessedFields[origin.first].push_back(
+                {"field_" + std::to_string(origin.second),
+                 static_cast<uint64_t>(origin.second), fieldValue->type});
+        }
+    for (auto& entry : accessedFields) {
+        auto& fields = entry.second;
+        // One constant-offset dereference is already sufficient to establish
+        // that an ABI live-in is an address.  Multiple observations are only
+        // required to choose between struct/array/union layout patterns.
+        // Requiring two fields truncated single-field objects such as the
+        // Windows CONTEXT pointer passed to RtlCaptureContext to uint32_t.
+        if (fields.empty()) continue;
+        std::sort(fields.begin(), fields.end(), [](const TypeField& a,
+                                                   const TypeField& b) {
+            return std::tie(a.byteOffset, a.name) < std::tie(b.byteOffset, b.name);
+        });
+        bool overlaps = false;
+        for (size_t i = 1; i < fields.size(); ++i)
+            overlaps |= fields[i - 1].byteOffset == fields[i].byteOffset &&
+                        fields[i - 1].type != fields[i].type;
+        bool array = fields.size() >= 3 && !overlaps;
+        uint64_t stride = array ? fields[1].byteOffset - fields[0].byteOffset : 0;
+        for (size_t i = 1; array && i < fields.size(); ++i)
+            array &= stride != 0 && fields[i].byteOffset - fields[i - 1].byteOffset ==
+                                      stride && fields[i].type == fields[0].type;
+
+        auto aggregateDetail = std::make_shared<TypeDetail>();
+        aggregateDetail->name = "recovered_" + std::to_string(entry.first);
+        DataType aggregate;
+        if (array) {
+            aggregate.kind = TypeKind::ARRAY;
+            aggregateDetail->elementType = std::make_shared<DataType>(fields[0].type);
+            aggregateDetail->elementCount = fields.size();
+        } else {
+            aggregate.kind = overlaps ? TypeKind::UNION : TypeKind::STRUCT;
+            aggregateDetail->fields = fields;
+        }
+        aggregate.detail = aggregateDetail;
+        const TypeField& last = fields.back();
+        aggregate.bits = static_cast<int>((last.byteOffset +
+                                           std::max(1, last.type.bits / 8)) * 8);
+        DataType pointer{TypeKind::POINTER, 64, 1};
+        pointer.detail = std::make_shared<TypeDetail>();
+        pointer.detail->elementType = std::make_shared<DataType>(aggregate);
+        values_[entry.first].type = std::move(pointer);
+    }
 }
 
 FunctionSignature FunctionIR::inferSignature() const {
     FunctionSignature sig;
-    std::vector<std::pair<uint64_t, std::string>> abiArgs;
-    uint64_t returnReg = 0;
+    const auto abiArgs = abiArguments(arch_, callingConvention_);
+    std::vector<uint64_t> returnRegs;
     if (arch_.rfind("x86", 0) == 0) {
-        if (callingConvention_ == "win64" || callingConvention_ == "ms")
-            abiArgs = {{1 * 8, "arg0"}, {2 * 8, "arg1"},
-                       {8 * 8, "arg2"}, {9 * 8, "arg3"}};
-        else
-            abiArgs = {{7 * 8, "arg0"}, {6 * 8, "arg1"}, {2 * 8, "arg2"},
-                       {1 * 8, "arg3"}, {8 * 8, "arg4"}, {9 * 8, "arg5"}};
-        returnReg = 0;
+        returnRegs = {0, 2 * 8};
     } else if (arch_.rfind("riscv", 0) == 0) {
-        for (int i = 0; i < 8; ++i) abiArgs.emplace_back((10 + i) * 8, "arg" + std::to_string(i));
-        returnReg = 10 * 8;
+        returnRegs = {10 * 8, 11 * 8};
     } else if (arch_ == "aarch64" || arch_ == "arm64") {
-        for (int i = 0; i < 8; ++i) abiArgs.emplace_back(i * 8, "arg" + std::to_string(i));
-        returnReg = 0;
+        returnRegs = {0, 8};
     } else {
-        abiArgs = {{0, "arg0"}, {8, "arg1"}, {16, "arg2"}, {24, "arg3"}};
-        returnReg = 0;
+        returnRegs = {0, 8};
     }
 
     std::set<SsaId> used;
@@ -482,17 +908,43 @@ FunctionSignature FunctionIR::inferSignature() const {
             }
     }
     for (const auto& arg : abiArgs) {
+        DataType mergedType;
+        SsaId representative = 0;
+        int widestBytes = 0;
         for (const auto& param : parameters_) {
             if (param.first.first != arg.first || !used.count(param.second)) continue;
             const SsaValue& v = values_.at(param.second);
-            sig.parameters.push_back({arg.second, arg.first, param.second,
-                                      v.type.kind == TypeKind::UNKNOWN
-                                          ? DataType{TypeKind::UNSIGNED_INT, v.size * 8, 1}
-                                          : v.type});
-            break;
+            DataType viewType = v.type.kind == TypeKind::UNKNOWN
+                ? DataType{TypeKind::UNSIGNED_INT, v.size * 8, 1}
+                : v.type;
+            mergedType = mergeType(mergedType, viewType);
+            if (v.size > widestBytes) {
+                widestBytes = v.size;
+                representative = param.second;
+            }
         }
+        // x86 subregisters share one architectural ABI argument.  ECX and
+        // RCX can both have live-in SSA values in a function; choosing the
+        // first map entry silently preferred the 32-bit view and truncated
+        // pointers.  Merge every used view and retain the widest SSA value.
+        if (representative)
+            sig.parameters.push_back({arg.second, arg.first, representative,
+                                      mergedType});
     }
 
+    for (const auto& stack : stackInputs_) {
+        if (!used.count(stack.second)) continue;
+        const SsaValue& value = values_.at(stack.second);
+        const DataType type = value.type.kind == TypeKind::UNKNOWN
+                                  ? DataType{TypeKind::UNSIGNED_INT,
+                                             value.size * 8, 1}
+                                  : value.type;
+        sig.parameters.push_back({"stack_arg" +
+                                      std::to_string(sig.parameters.size()),
+                                  0, stack.second, type, true, stack.first});
+    }
+
+    std::map<uint64_t, DataType> returnedComponents;
     for (const SsaBlock& block : blocks_) {
         bool returns = false;
         for (const SsaOp& op : block.ops) if (op.op == POp::RETURN) returns = true;
@@ -500,18 +952,51 @@ FunctionSignature FunctionIR::inferSignature() const {
         for (const auto& state : outgoing_) {
             if (state.first != block.start) continue;
             for (const auto& reg : state.second) {
-                if (reg.first.first != returnReg) continue;
+                if (std::find(returnRegs.begin(), returnRegs.end(),
+                              reg.first.first) == returnRegs.end())
+                    continue;
                 const SsaValue& v = values_.at(reg.second);
                 if (v.version == 0) continue;
+                if (reg.first.first != returnRegs.front()) {
+                    bool definedHere = false;
+                    for (const SsaOp& op : block.ops)
+                        definedHere |= op.output == v.id;
+                    if (!definedHere) continue;
+                }
                 sig.returnValues.push_back(v.id);
-                sig.returnType = mergeType(sig.returnType.kind == TypeKind::VOID_TYPE
-                                               ? DataType{} : sig.returnType,
-                                           v.type);
+                returnedComponents[reg.first.first] =
+                    mergeType(returnedComponents[reg.first.first], v.type);
             }
         }
     }
-    if (!sig.returnValues.empty() && sig.returnType.kind == TypeKind::UNKNOWN)
+    if (returnedComponents.empty() && hasTailCall_) {
+        // A tail jump returns exactly what its target returns.  Until the
+        // external/import prototype is known, preserving the machine return
+        // register is safer than erasing it as void.
         sig.returnType = {TypeKind::UNSIGNED_INT, 64, 1};
+        sig.returnComponents.push_back(sig.returnType);
+    } else if (returnedComponents.size() == 1) {
+        sig.returnType = returnedComponents.begin()->second;
+        if (sig.returnType.kind == TypeKind::UNKNOWN)
+            sig.returnType = {TypeKind::UNSIGNED_INT, 64, 1};
+        sig.returnComponents.push_back(sig.returnType);
+    } else if (returnedComponents.size() > 1) {
+        auto detail = std::make_shared<TypeDetail>();
+        detail->name = "return_pair";
+        int bits = 0;
+        size_t index = 0;
+        for (const auto& component : returnedComponents) {
+            DataType type = component.second;
+            if (type.kind == TypeKind::UNKNOWN)
+                type = {TypeKind::UNSIGNED_INT, 64, 1};
+            sig.returnComponents.push_back(type);
+            detail->fields.push_back({"part" + std::to_string(index++),
+                                      static_cast<uint64_t>(bits / 8), type});
+            bits += std::max(64, type.bits);
+        }
+        sig.returnType = {TypeKind::STRUCT, bits, 1};
+        sig.returnType.detail = std::move(detail);
+    }
     return sig;
 }
 
@@ -521,8 +1006,11 @@ void FunctionIR::optimize() {
         while (replace.count(id)) id = replace[id];
         return id;
     };
-    std::map<std::tuple<POp, SsaId, SsaId>, SsaId> expressions;
     for (SsaBlock& block : blocks_) {
+        // Local value numbering is deliberately block-scoped until MidIR has
+        // a full dominator-tree GVN pass.  Reusing a value from an unrelated
+        // predecessor is not valid SSA optimization.
+        std::map<std::tuple<POp, SsaId, SsaId>, SsaId> expressions;
         for (SsaOp& op : block.ops) {
             for (SsaId& input : op.inputs) input = canonical(input);
             if (!op.output || !pure(op.op)) continue;
@@ -562,6 +1050,53 @@ void FunctionIR::optimize() {
             }
         }
     }
+    // Alias-aware load forwarding.  A store only invalidates earlier loads
+    // whose byte ranges may overlap; stores to proven-disjoint stack/global
+    // objects no longer destroy all memory knowledge.
+    const AliasAnalysis aliases(*this);
+    for (SsaBlock& block : blocks_) {
+        std::vector<SsaOp*> availableLoads;
+        for (SsaOp& op : block.ops) {
+            for (SsaId& input : op.inputs) input = canonical(input);
+            if (op.removed) continue;
+            if (op.op == POp::CALL || op.op == POp::CALLIND ||
+                op.op == POp::SYSCALL) {
+                availableLoads.clear();
+                continue;
+            }
+            if (op.op == POp::STORE) {
+                availableLoads.erase(
+                    std::remove_if(availableLoads.begin(), availableLoads.end(),
+                                   [&](const SsaOp* load) {
+                                       return aliases.mayClobber(op, *load);
+                                   }),
+                    availableLoads.end());
+                continue;
+            }
+            if (op.op != POp::LOAD || op.inputs.empty() || !op.output) continue;
+            const SsaValue* output = value(op.output);
+            const uint64_t size = output && output->size > 0
+                                      ? static_cast<uint64_t>(output->size) : 0;
+            bool forwarded = false;
+            for (auto it = availableLoads.rbegin(); it != availableLoads.rend(); ++it) {
+                const SsaOp* previous = *it;
+                const SsaValue* previousOutput = value(previous->output);
+                const uint64_t previousSize = previousOutput && previousOutput->size > 0
+                                                  ? static_cast<uint64_t>(previousOutput->size)
+                                                  : 0;
+                if (size == previousSize &&
+                    aliases.alias(op.inputs[0], size,
+                                  previous->inputs[0], previousSize) ==
+                        AliasResult::MUST_ALIAS) {
+                    replace[op.output] = canonical(previous->output);
+                    op.removed = true;
+                    forwarded = true;
+                    break;
+                }
+            }
+            if (!forwarded) availableLoads.push_back(&op);
+        }
+    }
     for (SsaBlock& block : blocks_) {
         for (SsaOp& phi : block.phis) for (SsaId& input : phi.inputs) input = canonical(input);
         for (SsaOp& op : block.ops) for (SsaId& input : op.inputs) input = canonical(input);
@@ -577,33 +1112,6 @@ void FunctionIR::optimize() {
             if (!op.removed && out && out->storage == SsaValue::TEMPORARY &&
                 uses[op.output] == 0 && pure(op.op)) op.removed = true;
         }
-}
-
-size_t FunctionIR::phiCount() const {
-    size_t n = 0; for (const auto& b : blocks_) n += b.phis.size(); return n;
-}
-size_t FunctionIR::liveOpCount() const {
-    size_t n = 0; for (const auto& b : blocks_) for (const auto& op : b.ops) n += !op.removed; return n;
-}
-
-std::string FunctionIR::dump() const {
-    std::ostringstream out;
-    for (const auto& block : blocks_) {
-        out << "block 0x" << std::hex << block.start << std::dec << ":\n";
-        auto print = [&](const SsaOp& op) {
-            if (op.removed) return;
-            if (op.output) out << "  v" << op.output << " = "; else out << "  ";
-            out << (op.phi ? "PHI" : pOpName(op.op)) << "(";
-            for (size_t i = 0; i < op.inputs.size(); ++i) {
-                if (i) out << ", ";
-                out << "v" << op.inputs[i];
-            }
-            out << ")\n";
-        };
-        for (const auto& op : block.phis) print(op);
-        for (const auto& op : block.ops) print(op);
-    }
-    return out.str();
 }
 
 std::vector<JumpTable> recoverJumpTables(const CfgBuilder& cfg,
@@ -676,6 +1184,788 @@ std::vector<JumpTable> recoverJumpTables(const CfgBuilder& cfg,
         }
     }
     return result;
+}
+
+bool FunctionEffects::mergeFrom(const FunctionEffects& other) {
+    const FunctionEffects before = *this;
+    readsMemory |= other.readsMemory;
+    writesMemory |= other.writesMemory;
+    allocates |= other.allocates;
+    frees |= other.frees;
+    unknownCall |= other.unknownCall;
+    referencedObjects.insert(other.referencedObjects.begin(),
+                             other.referencedObjects.end());
+    modifiedObjects.insert(other.modifiedObjects.begin(),
+                           other.modifiedObjects.end());
+    return readsMemory != before.readsMemory ||
+           writesMemory != before.writesMemory ||
+           allocates != before.allocates || frees != before.frees ||
+           unknownCall != before.unknownCall ||
+           referencedObjects != before.referencedObjects ||
+           modifiedObjects != before.modifiedObjects;
+}
+
+const AnalyzedFunction* ProgramAnalysis::functionAt(uint64_t address) const {
+    const auto found = functions_.find(address);
+    return found == functions_.end() ? nullptr : &found->second;
+}
+
+std::optional<FunctionEffects> ProgramAnalysis::effectsAt(
+    uint64_t address) const {
+    const AnalyzedFunction* function = functionAt(address);
+    return function ? std::optional<FunctionEffects>(function->effects)
+                    : std::nullopt;
+}
+
+std::optional<FunctionSignature> ProgramAnalysis::signatureAt(
+    uint64_t address) const {
+    const AnalyzedFunction* function = functionAt(address);
+    return function ? std::optional<FunctionSignature>(function->signature)
+                    : std::nullopt;
+}
+
+bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
+                            const std::string& callingConvention,
+                            size_t maximumFunctions) {
+    architecture_ = program.arch;
+    callingConvention_ = callingConvention;
+    functions_.clear();
+    cppTypes_ = recoverCppTypes(program);
+
+    const std::shared_ptr<const SleighEngine> engineReference(
+        &engine, [](const SleighEngine*) {});
+    SpecDisassembler disassembler(engineReference);
+    const std::vector<Function> discovered = findFunctions(program, &disassembler);
+    if (discovered.empty()) return false;
+
+    auto read = [&](uint64_t address, void* output, size_t size) {
+        return program.memory.read(address, output, size);
+    };
+    auto executable = [&](uint64_t address) {
+        return program.memory.isExecutable(address);
+    };
+    std::map<uint64_t, std::string> importNamesByIat;
+    for (const ImportSymbol& imported : program.imports)
+        if (!imported.byOrdinal)
+            importNamesByIat[imported.iatAddress] = imported.name;
+    std::map<uint64_t, const Symbol*> functionSymbolsByAddress;
+    for (const Symbol& symbol : program.symbols)
+        if (symbol.isFunction && symbol.addr)
+            functionSymbolsByAddress.emplace(symbol.addr, &symbol);
+
+    // A bounded analysis must still contain the binary's real entry point.
+    // Large PE images commonly place CRT startup far above thousands of
+    // unwind-discovered helpers, so taking the first N addresses alone made a
+    // generated project structurally incapable of exposing its true entry.
+    std::map<uint64_t, const Function*> discoveredByAddress;
+    for (const Function& function : discovered)
+        discoveredByAddress.emplace(function.addr, &function);
+    std::vector<const Function*> selected;
+    std::deque<Function> dynamicallyDiscovered;
+    std::set<uint64_t> queued;
+    const bool bounded = maximumFunctions && discovered.size() > maximumFunctions;
+    size_t nextOrdinary = 0;
+    auto queueFunction = [&](const Function* function) {
+        if (!function || !queued.insert(function->addr).second)
+            return false;
+        selected.push_back(function);
+        return true;
+    };
+    auto ensureDiscovered = [&](uint64_t address) -> const Function* {
+        const auto known = discoveredByAddress.find(address);
+        if (known != discoveredByAddress.end()) return known->second;
+        if (!program.memory.isExecutable(address)) return nullptr;
+        Function function;
+        char name[32];
+        std::snprintf(name, sizeof(name),
+                      architecture_.rfind("x86", 0) == 0 &&
+                              architecture_ != "x86"
+                          ? "FUN_%016llX" : "FUN_%08llX",
+                      static_cast<unsigned long long>(address));
+        function.name = name;
+        function.addr = address;
+        function.src = Function::SCAN;
+        uint64_t limit = std::numeric_limits<uint64_t>::max();
+        const auto next = discoveredByAddress.upper_bound(address);
+        if (next != discoveredByAddress.end()) limit = next->first;
+        if (const MemoryBlock* block = program.memory.blockAt(address))
+            limit = std::min(limit, block->end());
+        if (limit > address) function.size = limit - address;
+        dynamicallyDiscovered.push_back(std::move(function));
+        const Function* inserted = &dynamicallyDiscovered.back();
+        discoveredByAddress.emplace(address, inserted);
+        return inserted;
+    };
+    if (!bounded) {
+        for (const Function& function : discovered) queueFunction(&function);
+    } else {
+        const auto entry = discoveredByAddress.find(program.entryPoint);
+        if (entry != discoveredByAddress.end()) queueFunction(entry->second);
+        else if (!discovered.empty()) queueFunction(&discovered.front());
+    }
+    // Windows invokes PE TLS callbacks before the executable entry point.
+    // They therefore form startup roots just like the real entry and must not
+    // be displaced by low-address helpers in a bounded large-program run.
+    if (program.tls)
+        for (uint64_t callback : program.tls->callbacks)
+            queueFunction(ensureDiscovered(callback));
+    auto queueOrdinaryWhenIdle = [&](size_t processedIndex) {
+        if (!bounded || processedIndex + 1 >= maximumFunctions ||
+            processedIndex + 1 < selected.size())
+            return;
+        while (nextOrdinary < discovered.size()) {
+            if (queueFunction(&discovered[nextOrdinary++])) break;
+        }
+    };
+    const bool reportProgress = std::getenv("CENTRIFUGE_ANALYSIS_PROGRESS") != nullptr;
+    size_t queuedCrtErrorInitializers = 0;
+    size_t queuedCrtNormalInitializers = 0;
+    // A few compiler-generated CRT initializers are hundreds of kilobytes
+    // long.  Building one monolithic CFG/SSA graph for them is both wasteful
+    // and, on real Blender images, can dominate the entire analysis.  Keep
+    // their call-graph contribution with a bounded streaming scan and report
+    // them explicitly as incomplete until the project emitter outlines them
+    // into independently recoverable chunks.
+    constexpr uint64_t maximumMonolithicFunctionBytes = 64U * 1024U;
+    const auto analysisProfileStarted = std::chrono::steady_clock::now();
+    double profiledCfgSeconds = 0.0;
+    double profiledIrSeconds = 0.0;
+    double profiledPostSeconds = 0.0;
+    std::map<uint64_t, std::unique_ptr<CfgBuilder>> prefetchedCfgs;
+    std::set<uint64_t> failedCfgs;
+    size_t analysisWorkers = std::max<size_t>(
+        1, std::thread::hardware_concurrency());
+    if (const char* configured = std::getenv("CENTRIFUGE_ANALYSIS_THREADS")) {
+        char* parsedEnd = nullptr;
+        const unsigned long parsed = std::strtoul(configured, &parsedEnd, 10);
+        if (parsedEnd != configured && !*parsedEnd && parsed)
+            analysisWorkers = static_cast<size_t>(parsed);
+    }
+    if (const char* configured = std::getenv("CENTRIFUGE_CFG_THREADS")) {
+        char* parsedEnd = nullptr;
+        const unsigned long parsed = std::strtoul(configured, &parsedEnd, 10);
+        if (parsedEnd != configured && !*parsedEnd && parsed)
+            analysisWorkers = static_cast<size_t>(parsed);
+    }
+    // One in-flight job per worker is the best default for a dynamically
+    // growing startup closure: a wider speculative window can analyze
+    // ordinary functions that later CRT-root insertion pushes past the
+    // bounded selection limit.  Advanced benchmarks may tune this upward.
+    size_t cfgPrefetchFactor = 1;
+    if (const char* configured = std::getenv("CENTRIFUGE_CFG_PREFETCH_FACTOR")) {
+        char* parsedEnd = nullptr;
+        const unsigned long parsed = std::strtoul(configured, &parsedEnd, 10);
+        if (parsedEnd != configured && !*parsedEnd && parsed && parsed <= 64)
+            cfgPrefetchFactor = static_cast<size_t>(parsed);
+    }
+
+    for (size_t selectedIndex = 0;
+         selectedIndex < selected.size() &&
+         (!bounded || selectedIndex < maximumFunctions);
+         ++selectedIndex) {
+        if (std::getenv("CENTRIFUGE_ANALYSIS_PROFILE") &&
+            selectedIndex % 250 == 0) {
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - analysisProfileStarted).count();
+            std::fprintf(stderr,
+                "[analysis-profile-progress] index=%zu queued=%zu "
+                "elapsed=%.3fs cfg=%.3fs ir=%.3fs post=%.3fs\n",
+                selectedIndex, selected.size(), elapsed, profiledCfgSeconds,
+                profiledIrSeconds, profiledPostSeconds);
+            std::fflush(stderr);
+        }
+        const Function* selectedFunction = selected[selectedIndex];
+        const Function& function = *selectedFunction;
+        const auto functionStarted = std::chrono::steady_clock::now();
+        if (reportProgress) {
+            std::fprintf(stderr, "[analysis %zu/%zu] begin 0x%llx %s\n",
+                         selectedIndex + 1, selected.size(),
+                         static_cast<unsigned long long>(function.addr),
+                         function.name.c_str());
+            std::fflush(stderr);
+        }
+        auto reportStage = [&](const char* stage) {
+            if (!reportProgress) return;
+            const double seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - functionStarted).count();
+            std::fprintf(stderr, "[analysis %zu/%zu] stage 0x%llx %s %.3fs\n",
+                         selectedIndex + 1, selected.size(),
+                         static_cast<unsigned long long>(function.addr), stage,
+                         seconds);
+            std::fflush(stderr);
+        };
+        AnalyzedFunction analyzed;
+        analyzed.function = function;
+        uint64_t end = 0;
+        if (function.size && function.addr <=
+                                 std::numeric_limits<uint64_t>::max() - function.size)
+            end = function.addr + function.size;
+        if (function.size > maximumMonolithicFunctionBytes) {
+            std::set<uint64_t> callees;
+            if ((architecture_ == "x86" || architecture_ == "x86-64") &&
+                function.size <= std::numeric_limits<size_t>::max()) {
+                std::vector<uint8_t> bytes(static_cast<size_t>(function.size));
+                if (program.memory.read(function.addr, bytes.data(), bytes.size())) {
+                    auto addRelativeTarget = [&](size_t offset) {
+                        int32_t displacement = 0;
+                        std::memcpy(&displacement, bytes.data() + offset + 1,
+                                    sizeof(displacement));
+                        const uint64_t next = function.addr + offset + 5;
+                        uint64_t target = 0;
+                        if (displacement >= 0) {
+                            const uint64_t amount =
+                                static_cast<uint32_t>(displacement);
+                            if (next > std::numeric_limits<uint64_t>::max() - amount)
+                                return;
+                            target = next + amount;
+                        } else {
+                            const uint64_t amount = static_cast<uint64_t>(
+                                -static_cast<int64_t>(displacement));
+                            if (next < amount) return;
+                            target = next - amount;
+                        }
+                        // The byte scan is deliberately accepted only when it
+                        // lands on an independently discovered function.  This
+                        // filters E8/E9 bytes embedded in immediates or data.
+                        if (discoveredByAddress.count(target)) callees.insert(target);
+                    };
+                    for (size_t offset = 0; offset + 5 <= bytes.size(); ++offset) {
+                        if (bytes[offset] == 0xe8)
+                            addRelativeTarget(offset);
+                        else if (bytes[offset] == 0xe9 &&
+                                 offset + 32 >= bytes.size())
+                            addRelativeTarget(offset);
+                    }
+                }
+            } else {
+                uint64_t cursor = function.addr;
+                while (cursor < end) {
+                    Insn instruction;
+                    if (!disassembler.disasmOne(program.memory, cursor,
+                                                instruction) ||
+                        instruction.size == 0)
+                        break;
+                    if ((instruction.kind == Insn::CALL ||
+                         instruction.kind == Insn::JMP) &&
+                        instruction.targetKnown &&
+                        discoveredByAddress.count(instruction.target))
+                        callees.insert(instruction.target);
+                    if (cursor > std::numeric_limits<uint64_t>::max() -
+                                     instruction.size)
+                        break;
+                    cursor += instruction.size;
+                }
+            }
+            analyzed.callees.assign(callees.begin(), callees.end());
+            analyzed.effects.unknownCall = true;
+            analyzed.complexityLimited = true;
+            analyzed.incompleteReason = "function exceeds monolithic CFG limit";
+            size_t insertion = selectedIndex + 1;
+            for (uint64_t callee : analyzed.callees) {
+                const bool previouslyDiscovered =
+                    discoveredByAddress.count(callee) != 0;
+                const Function* target = ensureDiscovered(callee);
+                if (!target || functions_.count(target->addr)) continue;
+                if (!queued.insert(target->addr).second) continue;
+                if (previouslyDiscovered)
+                    selected.push_back(target);
+                else
+                    selected.insert(selected.begin() +
+                                        static_cast<std::ptrdiff_t>(insertion++),
+                                    target);
+            }
+            functions_.emplace(function.addr, std::move(analyzed));
+            if (reportProgress) {
+                const double seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - functionStarted).count();
+                std::fprintf(stderr,
+                    "[analysis %zu/%zu] end 0x%llx %.3fs [streamed-large]\n",
+                    selectedIndex + 1, selected.size(),
+                    static_cast<unsigned long long>(function.addr), seconds);
+                std::fflush(stderr);
+            }
+            queueOrdinaryWhenIdle(selectedIndex);
+            continue;
+        }
+        if (!prefetchedCfgs.count(function.addr) &&
+            !failedCfgs.count(function.addr)) {
+            struct CfgJob {
+                const Function* function = nullptr;
+                uint64_t end = 0;
+                std::unique_ptr<CfgBuilder> cfg;
+                bool built = false;
+            };
+            std::vector<CfgJob> jobs;
+            const size_t selectionLimit = bounded
+                ? std::min(selected.size(), maximumFunctions)
+                : selected.size();
+            const size_t available = selectionLimit - selectedIndex;
+            const size_t prefetchSpan = analysisWorkers >
+                    std::numeric_limits<size_t>::max() / cfgPrefetchFactor
+                ? available
+                : std::min(available, analysisWorkers * cfgPrefetchFactor);
+            const size_t prefetchLimit = selectedIndex + prefetchSpan;
+            for (size_t index = selectedIndex; index < prefetchLimit; ++index) {
+                const Function* candidate = selected[index];
+                if (!candidate ||
+                    candidate->size > maximumMonolithicFunctionBytes ||
+                    prefetchedCfgs.count(candidate->addr) ||
+                    failedCfgs.count(candidate->addr) ||
+                    functions_.count(candidate->addr))
+                    continue;
+                uint64_t candidateEnd = 0;
+                if (candidate->size && candidate->addr <=
+                        std::numeric_limits<uint64_t>::max() - candidate->size)
+                    candidateEnd = candidate->addr + candidate->size;
+                jobs.push_back({candidate, candidateEnd, nullptr, false});
+            }
+            const auto cfgBatchStarted = std::chrono::steady_clock::now();
+            std::atomic<size_t> nextJob{0};
+            auto buildCfg = [&]() {
+                for (;;) {
+                    const size_t index = nextJob.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (index >= jobs.size()) break;
+                    CfgJob& job = jobs[index];
+                    job.cfg = std::make_unique<CfgBuilder>();
+                    job.built = job.cfg->build(engine, read,
+                        job.function->addr, job.end, executable);
+                }
+            };
+            const size_t batchWorkers = std::min(analysisWorkers, jobs.size());
+            std::vector<std::thread> cfgWorkers;
+            cfgWorkers.reserve(batchWorkers);
+            for (size_t index = 0; index < batchWorkers; ++index)
+                cfgWorkers.emplace_back(buildCfg);
+            for (std::thread& worker : cfgWorkers) worker.join();
+            profiledCfgSeconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - cfgBatchStarted).count();
+            // Merge in selection order so cache contents and diagnostics are
+            // independent of worker scheduling.
+            for (CfgJob& job : jobs) {
+                if (job.built)
+                    prefetchedCfgs.emplace(job.function->addr,
+                                           std::move(job.cfg));
+                else
+                    failedCfgs.insert(job.function->addr);
+            }
+        }
+        if (failedCfgs.erase(function.addr)) {
+            functions_.emplace(function.addr, std::move(analyzed));
+            queueOrdinaryWhenIdle(selectedIndex);
+            continue;
+        }
+        const auto cachedCfg = prefetchedCfgs.find(function.addr);
+        if (cachedCfg == prefetchedCfgs.end()) {
+            functions_.emplace(function.addr, std::move(analyzed));
+            queueOrdinaryWhenIdle(selectedIndex);
+            continue;
+        }
+        CfgBuilder cfg = std::move(*cachedCfg->second);
+        prefetchedCfgs.erase(cachedCfg);
+        reportStage("cfg");
+        cfg.applyExceptionRegions(program.exceptionRegions);
+        const auto irStarted = std::chrono::steady_clock::now();
+        FunctionIR ir;
+        if (!ir.build(cfg, architecture_, callingConvention_)) {
+            profiledIrSeconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - irStarted).count();
+            functions_.emplace(function.addr, std::move(analyzed));
+            queueOrdinaryWhenIdle(selectedIndex);
+            continue;
+        }
+        profiledIrSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - irStarted).count();
+        const auto postStarted = std::chrono::steady_clock::now();
+        reportStage("ssa");
+        // Constant addresses are already classified as precise globals by
+        // AliasAnalysis.  Installing every PE symbol into every FunctionIR
+        // made whole-program recovery O(functions * symbols) before a single
+        // memory access was inspected (over 43 million object insertions for
+        // a 12k-function Blender closure).  Named field objects can be added
+        // lazily when a referenced address needs a symbolic label.
+        bool memoryModelChanged = false;
+        for (const MidBlock& block : ir.blocks())
+            for (const MidInstruction& operation : block.ops) {
+                if ((operation.op != POp::CALL &&
+                     operation.op != POp::CALLIND) ||
+                    !operation.output || operation.inputs.empty())
+                    continue;
+                const MidValue* targetValue = ir.value(operation.inputs[0]);
+                if (!targetValue || !targetValue->constant) continue;
+                const auto symbol = functionSymbolsByAddress.find(
+                    *targetValue->constant);
+                const Symbol* targetSymbol = symbol ==
+                    functionSymbolsByAddress.end() ? nullptr : symbol->second;
+                if (!targetSymbol) continue;
+                const std::string& targetName = targetSymbol->name;
+                const bool allocator = targetName == "malloc" ||
+                    targetName == "calloc" || targetName == "realloc" ||
+                    targetName == "operator new" ||
+                    targetName.rfind("_Zn", 0) == 0;
+                if (!allocator) continue;
+                MemoryObject heap;
+                heap.kind = MemoryObjectKind::HEAP;
+                heap.value = operation.output;
+                heap.allocationSite = operation.address;
+                heap.name = targetName + "@" +
+                            std::to_string(operation.address);
+                ir.addMemoryObject(std::move(heap));
+                memoryModelChanged = true;
+            }
+        reportStage("types");
+        if (memoryModelChanged) ir.partitionMemory();
+        reportStage("memory-ssa");
+        analyzed.signature = ir.inferSignature();
+        {
+            std::map<SsaId, const SsaOp*> definitions;
+            for (const SsaBlock& block : ir.blocks()) {
+                for (const SsaOp& phi : block.phis)
+                    if (phi.output) definitions[phi.output] = &phi;
+                for (const SsaOp& operation : block.ops)
+                    if (operation.output) definitions[operation.output] = &operation;
+            }
+            // Constant recovery is queried repeatedly for call targets and
+            // arguments.  Copying a visiting set down every PHI path makes a
+            // large SSA diamond exponential.  Values are immutable within a
+            // FunctionIR, so memoize completed proofs and keep only one
+            // active recursion set for cycle detection.
+            std::map<SsaId, std::optional<uint64_t>> constantCache;
+            std::set<SsaId> constantResolving;
+            std::function<std::optional<uint64_t>(SsaId)> constantValue;
+            constantValue = [&](SsaId id) -> std::optional<uint64_t> {
+                if (!id) return std::nullopt;
+                const auto cached = constantCache.find(id);
+                if (cached != constantCache.end()) return cached->second;
+                if (!constantResolving.insert(id).second) return std::nullopt;
+
+                std::optional<uint64_t> result;
+                const SsaValue* value = ir.value(id);
+                if (value && value->constant) {
+                    result = value->constant;
+                } else if (value) {
+                    const auto definition = definitions.find(id);
+                    if (definition != definitions.end()) {
+                        const SsaOp& operation = *definition->second;
+                        if (operation.phi) {
+                            std::optional<uint64_t> merged;
+                            bool valid = !operation.inputs.empty();
+                            for (SsaId input : operation.inputs) {
+                                const auto candidate = constantValue(input);
+                                if (!candidate ||
+                                    (merged && *merged != *candidate)) {
+                                    valid = false;
+                                    break;
+                                }
+                                merged = candidate;
+                            }
+                            if (valid) result = merged;
+                        } else if ((operation.op == POp::COPY ||
+                                    operation.op == POp::INT_ZEXT ||
+                                    operation.op == POp::INT_SEXT) &&
+                                   !operation.inputs.empty()) {
+                            result = constantValue(operation.inputs[0]);
+                        } else if (operation.inputs.size() >= 2) {
+                            const auto left = constantValue(operation.inputs[0]);
+                            const auto right = constantValue(operation.inputs[1]);
+                            if (left && right)
+                                result = fold(operation.op, *left, *right,
+                                              value->size > 0 ? value->size : 8);
+                        }
+                    }
+                }
+                constantResolving.erase(id);
+                constantCache.emplace(id, result);
+                return result;
+            };
+            for (const SsaBlock& block : ir.blocks())
+                for (const SsaOp& operation : block.ops) {
+                    if (operation.op != POp::CALL &&
+                        operation.op != POp::CALLIND)
+                        continue;
+                    AnalyzedCallSite callSite;
+                    callSite.address = operation.address;
+                    callSite.indirect = operation.op == POp::CALLIND;
+                    if (!operation.inputs.empty())
+                        callSite.target = constantValue(operation.inputs[0]);
+                    for (size_t index = 1; index < operation.inputs.size() &&
+                                                index <= 8; ++index) {
+                        callSite.arguments.push_back(
+                            constantValue(operation.inputs[index]));
+                    }
+                    analyzed.callSites.push_back(std::move(callSite));
+                }
+        }
+        static const std::set<std::string> knownVariadic = {
+            "printf", "fprintf", "sprintf", "snprintf", "scanf", "sscanf",
+            "execl", "execlp", "fcntl", "ioctl"
+        };
+        analyzed.signature.variadic = knownVariadic.count(function.name) != 0;
+        ir.optimize();
+        reportStage("optimize");
+        analyzed.blocks = ir.blocks().size();
+        analyzed.phiNodes = ir.phiCount();
+        analyzed.liveOperations = ir.liveOpCount();
+        analyzed.complete = true;
+        size_t indirectCalls = 0;
+        bool hasSystemCall = false;
+        for (const MidBlock& block : ir.blocks())
+            for (const MidInstruction& operation : block.ops) {
+                if (operation.removed) continue;
+                MemoryObjectKind objectKind = MemoryObjectKind::UNKNOWN;
+                const auto partition =
+                    ir.memoryPartitions().find(operation.memoryPartition);
+                if (partition != ir.memoryPartitions().end())
+                    objectKind = partition->second.kind;
+                if (operation.op == POp::LOAD) {
+                    analyzed.effects.readsMemory = true;
+                    analyzed.effects.referencedObjects.insert(objectKind);
+                } else if (operation.op == POp::STORE) {
+                    analyzed.effects.writesMemory = true;
+                    analyzed.effects.modifiedObjects.insert(objectKind);
+                } else if (operation.op == POp::CALLIND) {
+                    ++indirectCalls;
+                } else if (operation.op == POp::SYSCALL) {
+                    hasSystemCall = true;
+                }
+            }
+        if (function.name == "malloc" || function.name == "calloc" ||
+            function.name == "realloc" || function.name == "operator new" ||
+            function.name.rfind("_Zn", 0) == 0)
+            analyzed.effects.allocates = true;
+        if (function.name == "free" || function.name == "operator delete" ||
+            function.name.rfind("_Zdl", 0) == 0 ||
+            function.name.rfind("_Zda", 0) == 0) {
+            analyzed.effects.frees = true;
+            analyzed.effects.writesMemory = true;
+            analyzed.effects.modifiedObjects.insert(MemoryObjectKind::HEAP);
+        }
+        std::set<uint64_t> callees;
+        for (const CfgBlock& block : cfg.blocks()) {
+            callees.insert(block.calls.begin(), block.calls.end());
+            if (block.tailCallTarget) callees.insert(*block.tailCallTarget);
+            // Recover register-relative direct calls such as RISC-V's
+            // AUIPC+JALR sequence.  Concrete propagation is deliberately
+            // block-local: crossing a join without a phi proof would create
+            // false call-graph edges.
+            std::map<uint64_t, uint64_t> knownRegisters;
+            for (const PcodeInsn& instruction : block.insns) {
+                PcodeEvaluator evaluator(instruction);
+                evaluator.regs = knownRegisters;
+                evaluator.run();
+                const bool callLike = instruction.kind == Insn::CALL ||
+                    instruction.text.rfind("call", 0) == 0 ||
+                    instruction.text.rfind("jalr", 0) == 0;
+                if (callLike && evaluator.lastBranchTarget())
+                    callees.insert(*evaluator.lastBranchTarget());
+                if (callLike)
+                    for (const PcodeOp& op : instruction.ops)
+                        if (op.op == POp::CALL || op.op == POp::CALLIND)
+                            if (const auto target = evaluator.varnodeValue(op.in0))
+                                callees.insert(*target);
+                for (const PcodeOp& op : instruction.ops) {
+                    const Varnode* output = instruction.find(op.out);
+                    if (!output || output->kind != Varnode::REGISTER) continue;
+                    const auto value = evaluator.varnodeValue(op.out);
+                    if (value) knownRegisters[output->offset] = *value;
+                    else knownRegisters.erase(output->offset);
+                }
+            }
+        }
+        analyzed.callees.assign(callees.begin(), callees.end());
+        {
+            size_t insertion = selectedIndex + 1;
+            for (uint64_t callee : analyzed.callees) {
+                const bool previouslyDiscovered =
+                    discoveredByAddress.count(callee) != 0;
+                const Function* target = ensureDiscovered(callee);
+                if (!target || functions_.count(target->addr)) continue;
+                if (!queued.insert(target->addr).second) continue;
+                if (previouslyDiscovered)
+                    selected.push_back(target);
+                else
+                    selected.insert(selected.begin() +
+                                        static_cast<std::ptrdiff_t>(insertion++),
+                                    target);
+            }
+        }
+        // MSVC's _initterm/_initterm_e receive half-open arrays of function
+        // pointers.  These callbacks are data-flow roots, not direct call
+        // edges, so prioritize them explicitly in a bounded startup closure.
+        // Without this step a project can recover the CRT thunk yet silently
+        // omit every C/C++ static initializer it dispatches.
+        std::string crtInitializerKind;
+        for (uint64_t callee : analyzed.callees) {
+            const auto imported = importNamesByIat.find(callee);
+            if (imported != importNamesByIat.end() &&
+                (imported->second == "_initterm" ||
+                 imported->second == "_initterm_e"))
+                crtInitializerKind = imported->second;
+        }
+        if (!crtInitializerKind.empty()) {
+            size_t& queuedInitializers = crtInitializerKind == "_initterm_e"
+                ? queuedCrtErrorInitializers : queuedCrtNormalInitializers;
+            const size_t initializerBudget = !bounded
+                ? std::numeric_limits<size_t>::max()
+                : crtInitializerKind == "_initterm_e"
+                    ? std::max<size_t>(4, maximumFunctions / 32)
+                    : std::max<size_t>(8, maximumFunctions / 2);
+            size_t insertion = selectedIndex + 1;
+            for (const auto& caller : functions_)
+                for (const AnalyzedCallSite& callSite : caller.second.callSites) {
+                    if (!callSite.target || *callSite.target != function.addr ||
+                        callSite.arguments.size() < 2 ||
+                        !callSite.arguments[0] || !callSite.arguments[1])
+                        continue;
+                    const uint64_t first = *callSite.arguments[0];
+                    const uint64_t last = *callSite.arguments[1];
+                    if (last < first || (last - first) % 8 != 0 ||
+                        last - first > 16U * 1024U * 1024U)
+                        continue;
+                    for (uint64_t cursor = first; cursor < last; cursor += 8) {
+                        if (queuedInitializers >= initializerBudget) break;
+                        uint64_t callback = 0;
+                        if (!program.memory.read(cursor, &callback,
+                                                 sizeof(callback)) ||
+                            !callback || !program.memory.isExecutable(callback))
+                            continue;
+                        const Function* target = ensureDiscovered(callback);
+                        if (!target || functions_.count(target->addr) ||
+                            !queued.insert(target->addr).second)
+                            continue;
+                        selected.insert(selected.begin() +
+                                            static_cast<std::ptrdiff_t>(insertion++),
+                                        target);
+                        ++queuedInitializers;
+                    }
+                }
+        }
+        if (hasSystemCall || indirectCalls > analyzed.callees.size())
+            analyzed.effects.unknownCall = true;
+        functions_.emplace(function.addr, std::move(analyzed));
+        profiledPostSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - postStarted).count();
+        if (reportProgress) {
+            const double seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - functionStarted).count();
+            std::fprintf(stderr, "[analysis %zu/%zu] end 0x%llx %.3fs\n",
+                         selectedIndex + 1, selected.size(),
+                         static_cast<unsigned long long>(function.addr), seconds);
+            std::fflush(stderr);
+        }
+        queueOrdinaryWhenIdle(selectedIndex);
+    }
+
+    const auto mainAnalysisFinished = std::chrono::steady_clock::now();
+
+    for (const auto& caller : functions_)
+        for (uint64_t calleeAddress : caller.second.callees) {
+            auto callee = functions_.find(calleeAddress);
+            if (callee != functions_.end()) callee->second.callers.push_back(caller.first);
+        }
+    for (auto& function : functions_) {
+        std::sort(function.second.callers.begin(), function.second.callers.end());
+        function.second.callers.erase(
+            std::unique(function.second.callers.begin(), function.second.callers.end()),
+            function.second.callers.end());
+    }
+    // Interprocedural Mod/Ref reaches a fixed point over recursion and mutual
+    // recursion.  Missing direct callees conservatively make the caller
+    // unknown, while known callees contribute their object-class effects.
+    const auto modRefStarted = std::chrono::steady_clock::now();
+    for (size_t pass = 0; pass < functions_.size() + 1; ++pass) {
+        bool changed = false;
+        for (auto& caller : functions_)
+            for (uint64_t calleeAddress : caller.second.callees) {
+                const auto callee = functions_.find(calleeAddress);
+                if (callee == functions_.end()) {
+                    if (!caller.second.effects.unknownCall) {
+                        caller.second.effects.unknownCall = true;
+                        changed = true;
+                    }
+                } else {
+                    changed |= caller.second.effects.mergeFrom(
+                        callee->second.effects);
+                }
+            }
+        if (!changed) break;
+    }
+    const auto modRefFinished = std::chrono::steady_clock::now();
+    refineCppObjectGraph(program, engine, *this, cppTypes_);
+    const auto refinementFinished = std::chrono::steady_clock::now();
+    if (std::getenv("CENTRIFUGE_ANALYSIS_PROFILE")) {
+        const auto secondsBetween = [](const auto& begin, const auto& end) {
+            return std::chrono::duration<double>(end - begin).count();
+        };
+        std::fprintf(stderr,
+            "[analysis-profile] functions=%zu threads=%zu main=%.3fs cfg=%.3fs "
+            "ir=%.3fs post=%.3fs modref=%.3fs cpp=%.3fs total=%.3fs\n",
+            functions_.size(), analysisWorkers,
+            secondsBetween(analysisProfileStarted, mainAnalysisFinished),
+            profiledCfgSeconds, profiledIrSeconds, profiledPostSeconds,
+            secondsBetween(modRefStarted, modRefFinished),
+            secondsBetween(modRefFinished, refinementFinished),
+            secondsBetween(analysisProfileStarted, refinementFinished));
+        std::fflush(stderr);
+    }
+    return true;
+}
+
+std::string ProgramAnalysis::decompileFunction(const Program& program,
+                                               const SleighEngine& engine,
+                                               uint64_t address) const {
+    const AnalyzedFunction* analyzed = functionAt(address);
+    if (!analyzed || !analyzed->complete) return "// function analysis unavailable\n";
+    auto read = [&](uint64_t source, void* output, size_t size) {
+        return program.memory.read(source, output, size);
+    };
+    auto nameOf = [&](uint64_t target) {
+        const AnalyzedFunction* function = functionAt(target);
+        if (function) return function->function.name;
+        char buffer[32];
+        std::snprintf(buffer, sizeof(buffer), "FUN_%llx",
+                      static_cast<unsigned long long>(target));
+        return std::string(buffer);
+    };
+    auto signatureOf = [&](uint64_t target) { return signatureAt(target); };
+    uint64_t end = 0;
+    if (analyzed->function.size && address <=
+            std::numeric_limits<uint64_t>::max() - analyzed->function.size)
+        end = address + analyzed->function.size;
+    std::ostringstream output;
+    output << "#include <stdint.h>\n\n";
+    std::set<std::string> emittedTypes;
+    std::function<void(const DataType&)> emitType;
+    emitType = [&](const DataType& type) {
+        if (type.kind == TypeKind::POINTER && type.detail &&
+            type.detail->elementType) {
+            emitType(*type.detail->elementType);
+            return;
+        }
+        if ((type.kind != TypeKind::STRUCT && type.kind != TypeKind::UNION) ||
+            !type.detail || !emittedTypes.insert(type.detail->name).second)
+            return;
+        for (const TypeField& field : type.detail->fields) emitType(field.type);
+        output << (type.kind == TypeKind::STRUCT ? "struct " : "union ")
+               << type.detail->name << " {\n";
+        for (const TypeField& field : type.detail->fields)
+            output << "    " << field.type.declaration(field.name) << ";\n";
+        output << "};\n\n";
+    };
+    emitType(analyzed->signature.returnType);
+    for (const FunctionParameter& parameter : analyzed->signature.parameters)
+        emitType(parameter.type);
+    for (uint64_t calleeAddress : analyzed->callees) {
+        if (calleeAddress == address) continue;
+        const AnalyzedFunction* callee = functionAt(calleeAddress);
+        if (callee && callee->complete)
+            output << callee->signature.declaration(callee->function.name) << ";\n";
+    }
+    if (!analyzed->callees.empty()) output << "\n";
+    output << decompileTyped(engine, read, address, end, architecture_,
+                             analyzed->function.name, analyzed->signature,
+                             nameOf, signatureOf);
+    return output.str();
 }
 
 } // namespace centrifuge

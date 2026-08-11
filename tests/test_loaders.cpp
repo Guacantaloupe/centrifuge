@@ -1,5 +1,6 @@
 // Loader boundary and malformed-input regression tests.
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -34,9 +35,59 @@ void put32(std::vector<uint8_t>& data, size_t off, uint32_t value) {
         data[off + i] = static_cast<uint8_t>(value >> (i * 8));
 }
 
+void put16(std::vector<uint8_t>& data, size_t off, uint16_t value) {
+    for (unsigned i = 0; i < 2; ++i)
+        data[off + i] = static_cast<uint8_t>(value >> (i * 8));
+}
+
 void put64(std::vector<uint8_t>& data, size_t off, uint64_t value) {
     for (unsigned i = 0; i < 8; ++i)
         data[off + i] = static_cast<uint8_t>(value >> (i * 8));
+}
+
+std::vector<uint8_t> makeTlsPe64() {
+    constexpr uint64_t imageBase = 0x140000000ULL;
+    std::vector<uint8_t> data(0x600, 0);
+    data[0] = 'M'; data[1] = 'Z';
+    put32(data, 0x3c, 0x80);
+    put32(data, 0x80, 0x00004550);
+    put16(data, 0x84, 0x8664);
+    put16(data, 0x86, 2);
+    put16(data, 0x94, 240);
+    constexpr size_t optional = 0x98;
+    put16(data, optional, 0x20b);
+    put32(data, optional + 16, 0x1010);
+    put64(data, optional + 24, imageBase);
+    put32(data, optional + 56, 0x3000);
+    put32(data, optional + 60, 0x200);
+    put32(data, optional + 108, 16);
+    put32(data, optional + 112 + 9 * 8, 0x2000);
+    put32(data, optional + 112 + 9 * 8 + 4, 40);
+    constexpr size_t sections = optional + 240;
+    std::memcpy(data.data() + sections, ".text", 5);
+    put32(data, sections + 8, 0x200);
+    put32(data, sections + 12, 0x1000);
+    put32(data, sections + 16, 0x200);
+    put32(data, sections + 20, 0x200);
+    put32(data, sections + 36, 0x60000020);
+    constexpr size_t writable = sections + 40;
+    std::memcpy(data.data() + writable, ".data", 5);
+    put32(data, writable + 8, 0x200);
+    put32(data, writable + 12, 0x2000);
+    put32(data, writable + 16, 0x200);
+    put32(data, writable + 20, 0x400);
+    put32(data, writable + 36, 0xc0000040);
+    put64(data, 0x400, imageBase + 0x2050);
+    put64(data, 0x408, imageBase + 0x2070);
+    put64(data, 0x410, imageBase + 0x2070);
+    put64(data, 0x418, imageBase + 0x2080);
+    put32(data, 0x420, 16);
+    put32(data, 0x424, 0x800000);
+    for (size_t index = 0; index < 0x20; ++index)
+        data[0x450 + index] = static_cast<uint8_t>(0x80 + index);
+    put64(data, 0x480, imageBase + 0x1010);
+    put64(data, 0x488, 0);
+    return data;
 }
 
 bool rejected(const std::vector<uint8_t>& data) {
@@ -64,6 +115,32 @@ int main(int argc, char** argv) {
     CHECK(p64 && p64->format == "ELF64", "valid ELF64 pointer load");
     auto pe = loadData(pe64, "pe64-memory", error);
     CHECK(pe && pe->format == "PE32+", "valid PE32+ memory load");
+    CHECK(pe && pe->entryPoint != 0, "PE AddressOfEntryPoint is preserved");
+    CHECK(pe && !pe->dataRegions.empty() &&
+              pe->dataRegions.front().initializedSize <=
+                  pe->dataRegions.front().size,
+          "PE non-executable global-data regions are preserved");
+    {
+        const auto tlsPe = makeTlsPe64();
+        auto tlsProgram = loadData(tlsPe, "tls-pe64-memory", error);
+        CHECK(tlsProgram && tlsProgram->tls.has_value(),
+              "PE64 TLS directory is preserved");
+        CHECK(tlsProgram && tlsProgram->tls &&
+                  tlsProgram->tls->rawDataStart == 0x140002050ULL &&
+                  tlsProgram->tls->rawDataEnd == 0x140002070ULL &&
+                  tlsProgram->tls->addressOfIndex == 0x140002070ULL &&
+                  tlsProgram->tls->zeroFillSize == 16,
+              "PE64 TLS template and index metadata are exact");
+        CHECK(tlsProgram && tlsProgram->tls &&
+                  tlsProgram->tls->callbacks.size() == 1 &&
+                  tlsProgram->tls->callbacks.front() == 0x140001010ULL,
+              "PE64 TLS callback array is recovered");
+
+        auto malformedTls = tlsPe;
+        put64(malformedTls, 0x408, 0x14000204fULL);
+        CHECK(rejected(malformedTls),
+              "backwards PE TLS template range rejected");
+    }
 
     LoadOptions tinyLimit;
     tinyLimit.maxMappedBytes = 1;

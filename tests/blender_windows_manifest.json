@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "name": "blender-windows-x64-lts",
+  "version": "4.2.0",
+  "binary": "blender.exe",
+  "official_url": "https://download.blender.org/release/Blender4.2/blender-4.2.0-windows-x64.zip",
+  "sha256": "b6e72874f8cb5c4ed77f9b03d7f1fde851b9455a7ff02a1e1119c876318ebc65",
+  "binary_sha256": "80fb653019a0afb3bda0947ec74e84dc0a94d0d388f9b3849433c0e1a4efdabe",
+  "archive_bytes": 383542405,
+  "spec": "sleigh/x86-64.slaspec",
+  "abi": "win64",
+  "maximum_functions": 1024,
+  "maximum_unresolved_markers": 0,
+  "minimum_knowledge_nodes": 6000,
+  "minimum_imported_libraries": 60,
+  "minimum_imported_symbols": 3500,
+  "minimum_data_regions": 7,
+  "minimum_resources": 100,
+  "requirements": {
+    "project_generation": true,
+    "recovered_project_compiles": true,
+    "recovered_verifier_runs": true,
+    "semantic_equivalence_required": false
+  },
+  "notes": "Semantic equivalence remains false until Blender startup and render traces can be replayed against the recovered executable."
+}

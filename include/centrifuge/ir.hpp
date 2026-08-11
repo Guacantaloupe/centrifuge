@@ -3,12 +3,15 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "centrifuge/cfg.hpp"
+#include "centrifuge/analysis.hpp"
+#include "centrifuge/cpp_recovery.hpp"
 
 namespace centrifuge {
 
@@ -20,24 +23,54 @@ enum class TypeKind {
     POINTER,
     FLOAT,
     VECTOR,
+    ARRAY,
+    STRUCT,
+    UNION,
+    FUNCTION_POINTER,
     MEMORY,
     VOID_TYPE,
 };
+
+struct TypeDetail;
 
 struct DataType {
     TypeKind kind = TypeKind::UNKNOWN;
     int bits = 0;
     int lanes = 1;
+    std::shared_ptr<TypeDetail> detail;
+    DataType() = default;
+    DataType(TypeKind kindValue, int bitCount, int laneCount = 1)
+        : kind(kindValue), bits(bitCount), lanes(laneCount) {}
     bool operator==(const DataType& other) const {
-        return kind == other.kind && bits == other.bits && lanes == other.lanes;
+        return kind == other.kind && bits == other.bits && lanes == other.lanes &&
+               ((!detail && !other.detail) ||
+                (detail && other.detail && detail == other.detail));
     }
     bool operator!=(const DataType& other) const { return !(*this == other); }
     std::string name() const;
+    std::string declaration(const std::string& identifier) const;
 };
 
-using SsaId = uint64_t;
+struct TypeField {
+    std::string name;
+    uint64_t byteOffset = 0;
+    DataType type;
+};
 
-struct SsaValue {
+struct TypeDetail {
+    std::string name;
+    std::vector<TypeField> fields;
+    std::shared_ptr<DataType> elementType;
+    size_t elementCount = 0;
+    std::shared_ptr<DataType> returnType;
+    std::vector<DataType> parameterTypes;
+    bool variadic = false;
+};
+
+using MidValueId = uint64_t;
+using SsaId = MidValueId;
+
+struct MidValue {
     enum Storage { CONSTANT, REGISTER, TEMPORARY, MEMORY_STATE } storage = TEMPORARY;
     SsaId id = 0;
     uint64_t offset = 0;
@@ -47,22 +80,123 @@ struct SsaValue {
     DataType type;
     std::optional<uint64_t> constant;
 };
+using SsaValue = MidValue;
 
-struct SsaOp {
+enum class MidOperationClass {
+    PHI,
+    PURE,
+    MEMORY_READ,
+    MEMORY_WRITE,
+    CALL,
+    TERMINATOR,
+};
+
+struct MidInstruction {
     POp op = POp::UNIMPLEMENTED;
     SsaId output = 0;
     std::vector<SsaId> inputs;
     uint64_t address = 0;
     bool phi = false;
     bool removed = false;
+    uint32_t memoryPartition = 0;
+    uint32_t memoryVersionIn = 0;
+    uint32_t memoryVersionOut = 0;
 };
+using SsaOp = MidInstruction;
 
-struct SsaBlock {
+struct MidBlock {
     uint64_t start = 0;
     std::vector<uint64_t> predecessors;
     std::vector<uint64_t> successors;
     std::vector<SsaOp> phis;
     std::vector<SsaOp> ops;
+    std::map<uint32_t, uint32_t> memoryPhis;
+};
+using SsaBlock = MidBlock;
+
+MidOperationClass classifyMidOperation(const MidInstruction& operation);
+
+struct MidIRVerification {
+    std::vector<std::string> errors;
+    bool valid() const { return errors.empty(); }
+};
+
+enum class MemoryObjectKind { UNKNOWN, STACK, GLOBAL, HEAP, PARAMETER };
+
+struct MemoryObject {
+    uint64_t id = 0;
+    MemoryObjectKind kind = MemoryObjectKind::UNKNOWN;
+    uint64_t address = 0;
+    uint64_t size = 0;
+    MidValueId value = 0;
+    uint64_t allocationSite = 0;
+    std::string name;
+};
+
+struct MemoryPartition {
+    uint32_t id = 0;
+    MemoryObjectKind kind = MemoryObjectKind::UNKNOWN;
+    uint64_t object = 0;
+    int64_t byteOffset = 0;
+    uint64_t byteSize = 0;
+    std::string fieldPath;
+};
+
+class MidIR {
+public:
+    const std::vector<MidBlock>& blocks() const { return blocks_; }
+    const std::map<MidValueId, MidValue>& values() const { return values_; }
+    const MidValue* value(MidValueId id) const;
+    const std::string& architecture() const { return arch_; }
+    size_t phiCount() const;
+    size_t liveOpCount() const;
+    std::string dump() const;
+    MidIRVerification verify() const;
+    uint64_t addMemoryObject(MemoryObject object);
+    void partitionMemory();
+    const std::map<uint64_t, MemoryObject>& memoryObjects() const {
+        return memoryObjects_;
+    }
+    const std::map<uint32_t, MemoryPartition>& memoryPartitions() const {
+        return memoryPartitions_;
+    }
+
+protected:
+    std::string arch_;
+    std::vector<MidBlock> blocks_;
+    std::map<uint64_t, size_t> blockIndex_;
+    std::map<MidValueId, MidValue> values_;
+    std::map<uint64_t, MemoryObject> memoryObjects_;
+    std::map<uint32_t, MemoryPartition> memoryPartitions_;
+    uint64_t nextMemoryObject_ = 1;
+};
+
+enum class AliasResult { NO_ALIAS, MAY_ALIAS, PARTIAL_ALIAS, MUST_ALIAS };
+
+struct MemoryLocation {
+    MemoryObjectKind kind = MemoryObjectKind::UNKNOWN;
+    MidValueId object = 0;
+    int64_t byteOffset = 0;
+    uint64_t byteSize = 0;
+    bool precise = false;
+    std::string fieldPath;
+};
+
+class AliasAnalysis {
+public:
+    explicit AliasAnalysis(const MidIR& ir);
+    MemoryLocation location(MidValueId pointer, uint64_t byteSize = 0) const;
+    AliasResult alias(MidValueId left, uint64_t leftSize,
+                      MidValueId right, uint64_t rightSize) const;
+    bool mayClobber(const MidInstruction& write,
+                    const MidInstruction& read) const;
+
+private:
+    MemoryLocation resolve(MidValueId pointer,
+                           std::set<MidValueId>& visiting) const;
+    const MidIR& ir_;
+    std::map<MidValueId, const MidInstruction*> definitions_;
+    mutable std::map<MidValueId, MemoryLocation> resolvedLocations_;
 };
 
 struct FunctionParameter {
@@ -70,6 +204,8 @@ struct FunctionParameter {
     uint64_t registerOffset = 0;
     SsaId value = 0;
     DataType type;
+    bool onStack = false;
+    int64_t stackOffset = 0;
 };
 
 struct FunctionSignature {
@@ -77,10 +213,12 @@ struct FunctionSignature {
     DataType returnType{TypeKind::VOID_TYPE, 0, 1};
     std::vector<SsaId> returnValues;
     bool variadic = false;
+    bool hiddenSret = false;
+    std::vector<DataType> returnComponents;
     std::string declaration(const std::string& name) const;
 };
 
-class FunctionIR {
+class FunctionIR : public MidIR {
 public:
     bool build(const CfgBuilder& cfg, const std::string& architecture,
                const std::string& callingConvention = {});
@@ -88,21 +226,12 @@ public:
     FunctionSignature inferSignature() const;
     void optimize();
 
-    const std::vector<SsaBlock>& blocks() const { return blocks_; }
-    const std::map<SsaId, SsaValue>& values() const { return values_; }
-    const SsaValue* value(SsaId id) const;
-    size_t phiCount() const;
-    size_t liveOpCount() const;
-    std::string dump() const;
-
 private:
-    std::string arch_;
     std::string callingConvention_;
-    std::vector<SsaBlock> blocks_;
-    std::map<uint64_t, size_t> blockIndex_;
-    std::map<SsaId, SsaValue> values_;
     std::map<uint64_t, std::map<std::pair<uint64_t, int>, SsaId>> outgoing_;
     std::map<std::pair<uint64_t, int>, SsaId> parameters_;
+    std::map<int64_t, SsaId> stackInputs_;
+    bool hasTailCall_ = false;
     SsaId nextId_ = 1;
 };
 
@@ -118,5 +247,72 @@ std::vector<JumpTable> recoverJumpTables(const CfgBuilder& cfg,
                                          const MemoryImage& memory,
                                          int pointerSize = 8,
                                          size_t maxEntries = 256);
+
+enum class ModRefInfo { NO_ACCESS, REF, MOD, MOD_REF, UNKNOWN };
+
+struct FunctionEffects {
+    bool readsMemory = false;
+    bool writesMemory = false;
+    bool allocates = false;
+    bool frees = false;
+    bool unknownCall = false;
+    std::set<MemoryObjectKind> referencedObjects;
+    std::set<MemoryObjectKind> modifiedObjects;
+    ModRefInfo modRef() const {
+        if (unknownCall) return ModRefInfo::UNKNOWN;
+        if (readsMemory && writesMemory) return ModRefInfo::MOD_REF;
+        if (writesMemory) return ModRefInfo::MOD;
+        if (readsMemory) return ModRefInfo::REF;
+        return ModRefInfo::NO_ACCESS;
+    }
+    bool mergeFrom(const FunctionEffects& other);
+};
+
+struct AnalyzedCallSite {
+    uint64_t address = 0;
+    std::optional<uint64_t> target;
+    std::vector<std::optional<uint64_t>> arguments;
+    bool indirect = false;
+};
+
+struct AnalyzedFunction {
+    Function function;
+    FunctionSignature signature;
+    std::vector<uint64_t> callers;
+    std::vector<uint64_t> callees;
+    std::vector<AnalyzedCallSite> callSites;
+    size_t blocks = 0;
+    size_t phiNodes = 0;
+    size_t liveOperations = 0;
+    FunctionEffects effects;
+    bool complete = false;
+    bool complexityLimited = false;
+    std::string incompleteReason;
+};
+
+// Whole-program orchestration over function discovery, CFG/SSA construction,
+// signature recovery and direct-call graph propagation.
+class ProgramAnalysis {
+public:
+    bool build(const Program& program, const SleighEngine& engine,
+               const std::string& callingConvention = {},
+               size_t maximumFunctions = 0);
+    const std::map<uint64_t, AnalyzedFunction>& functions() const {
+        return functions_;
+    }
+    const AnalyzedFunction* functionAt(uint64_t address) const;
+    std::optional<FunctionSignature> signatureAt(uint64_t address) const;
+    std::optional<FunctionEffects> effectsAt(uint64_t address) const;
+    const CppRecoveryResult& cppTypes() const { return cppTypes_; }
+    std::string decompileFunction(const Program& program,
+                                  const SleighEngine& engine,
+                                  uint64_t address) const;
+
+private:
+    std::string architecture_;
+    std::string callingConvention_;
+    std::map<uint64_t, AnalyzedFunction> functions_;
+    CppRecoveryResult cppTypes_;
+};
 
 } // namespace centrifuge

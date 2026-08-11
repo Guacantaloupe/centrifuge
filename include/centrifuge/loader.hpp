@@ -28,13 +28,85 @@ struct Symbol {
     bool isExported = false; // came from dynsym / PE export table
 };
 
+// A PE import-address-table binding.  Keeping both the lookup and IAT
+// addresses lets later passes distinguish the symbolic API from the mutable
+// loader slot used by indirect calls.
+struct ImportSymbol {
+    std::string library;
+    std::string name;
+    uint16_t hint = 0;
+    uint16_t ordinal = 0;
+    uint64_t lookupAddress = 0;
+    uint64_t iatAddress = 0;
+    bool byOrdinal = false;
+    bool delayed = false;
+};
+
+// An initialized or zero-extended non-executable image region.  Its bytes
+// remain available through Program::memory; this record preserves the file
+// extent and permissions needed to reproduce global storage in a source
+// project.
+struct DataRegion {
+    std::string name;
+    uint64_t address = 0;
+    uint64_t size = 0;
+    uint64_t initializedSize = 0;
+    int perm = 0;
+};
+
+// Leaf of a PE resource directory.  Numeric and named identifiers are kept
+// separately so custom resource types survive a round trip without inventing
+// names or losing stable integer IDs.
+struct ResourceEntry {
+    uint32_t typeId = 0;
+    uint32_t nameId = 0;
+    uint32_t languageId = 0;
+    std::string typeName;
+    std::string name;
+    uint64_t dataAddress = 0;
+    uint32_t size = 0;
+    uint32_t codePage = 0;
+};
+
+// PE thread-local-storage directory.  The raw template is already present in
+// Program::memory; these addresses preserve the loader contract needed to
+// materialize one private copy per host thread and to run process-attach TLS
+// callbacks before the recovered entry point.
+struct ThreadLocalStorage {
+    uint64_t rawDataStart = 0;
+    uint64_t rawDataEnd = 0;
+    uint64_t addressOfIndex = 0;
+    uint64_t addressOfCallbacks = 0;
+    uint32_t zeroFillSize = 0;
+    uint32_t characteristics = 0;
+    std::vector<uint64_t> callbacks;
+};
+
 struct ExceptionRegion {
     enum Kind { WINDOWS_UNWIND, DWARF_CFI } kind = WINDOWS_UNWIND;
     uint64_t start = 0;
     uint64_t end = 0;
     uint64_t unwindInfo = 0;
+    // Windows UNW_FLAG_CHAININFO links a secondary RUNTIME_FUNCTION range
+    // back to another range of the same logical function.
+    uint64_t chainedStart = 0;
+    uint64_t chainedEnd = 0;
+    uint64_t chainedUnwindInfo = 0;
     uint64_t handler = 0;
     uint64_t languageData = 0;
+    struct Handler {
+        uint64_t start = 0;
+        uint64_t end = 0;
+        uint64_t landingPad = 0;
+        int64_t action = 0;
+    };
+    std::vector<Handler> handlers;
+    ExceptionRegion() = default;
+    ExceptionRegion(Kind regionKind, uint64_t begin, uint64_t finish,
+                    uint64_t unwind, uint64_t personality,
+                    uint64_t languageSpecificData)
+        : kind(regionKind), start(begin), end(finish), unwindInfo(unwind),
+          handler(personality), languageData(languageSpecificData) {}
 };
 
 struct Program {
@@ -45,6 +117,11 @@ struct Program {
     uint64_t entryPoint = 0;
     std::vector<Section> sections;
     std::vector<Symbol> symbols;
+    std::vector<std::string> importedLibraries;
+    std::vector<ImportSymbol> imports;
+    std::vector<DataRegion> dataRegions;
+    std::vector<ResourceEntry> resources;
+    std::optional<ThreadLocalStorage> tls;
     std::vector<ExceptionRegion> exceptionRegions;
     MemoryImage memory;
 };

@@ -1,10 +1,13 @@
 // centrifuge - a Ghidra reimplementation in C++17
-// loader_pe.cpp - PE32/PE32+ loader with export-table parsing
+// loader_pe.cpp - PE32/PE32+ loader with imports, exports and resources
 #include "centrifuge/loader.hpp"
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <set>
+#include <sstream>
 
 namespace centrifuge {
 namespace {
@@ -106,6 +109,40 @@ std::string cstrAt(const std::vector<uint8_t>& d, size_t off, size_t maxLen) {
     return s;
 }
 
+std::string utf16ResourceString(const std::vector<uint8_t>& data, size_t off) {
+    if (!rangeInFile(off, 2, data.size())) return {};
+    const uint16_t length = rd16(data, off);
+    if (length > 4096 || !rangeInFile(off + 2,
+                                      static_cast<uint64_t>(length) * 2,
+                                      data.size()))
+        return {};
+    std::string result;
+    for (uint16_t index = 0; index < length; ++index) {
+        const uint16_t code = rd16(data, off + 2 + index * 2);
+        if (code < 0x80) {
+            result.push_back(static_cast<char>(code));
+        } else if (code < 0x800) {
+            result.push_back(static_cast<char>(0xc0 | (code >> 6)));
+            result.push_back(static_cast<char>(0x80 | (code & 0x3f)));
+        } else {
+            result.push_back(static_cast<char>(0xe0 | (code >> 12)));
+            result.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3f)));
+            result.push_back(static_cast<char>(0x80 | (code & 0x3f)));
+        }
+    }
+    return result;
+}
+
+std::string standardResourceType(uint32_t id) {
+    static const char* names[] = {
+        "", "CURSOR", "BITMAP", "ICON", "MENU", "DIALOG", "STRING",
+        "FONTDIR", "FONT", "ACCELERATOR", "RCDATA", "MESSAGETABLE",
+        "GROUP_CURSOR", "", "GROUP_ICON", "", "VERSION", "DLGINCLUDE",
+        "", "PLUGPLAY", "VXD", "ANICURSOR", "ANIICON", "HTML", "MANIFEST"
+    };
+    return id < sizeof(names) / sizeof(names[0]) ? names[id] : std::string();
+}
+
 std::string sectionName(const char (&name)[8]) {
     size_t n = 0;
     while (n < sizeof(name) && name[n] != '\0') ++n;
@@ -167,6 +204,7 @@ std::optional<Program> loadPeImpl(const std::vector<uint8_t>& d,
 
     const uint32_t entryRva = rd32(d, optOff + 16);
     const uint32_t sizeOfImage = rd32(d, optOff + 56);
+    const uint32_t sizeOfHeaders = rd32(d, optOff + 60);
     const uint32_t numRvaSizes = rd32(d, optOff + (is64 ? 108 : 92));
     const size_t dataDirOff = optOff + (is64 ? 112 : 96);
     if (is64) {
@@ -201,8 +239,22 @@ std::optional<Program> loadPeImpl(const std::vector<uint8_t>& d,
         ps.secs.push_back(s);
     }
 
-    // ---- memory image: one block per section (zero-padded to virtual size) ----
-    uint64_t mappedTotal = 0;
+    // ---- memory image: PE headers plus one block per section ----
+    // The mapped headers are observable at ImageBase and are consulted by the
+    // MSVC CRT, RTTI helpers, resource lookup, and exception machinery.
+    if (!sizeOfHeaders || sizeOfHeaders > d.size() ||
+        sizeOfHeaders > maxMappedBytes) {
+        err = "invalid PE SizeOfHeaders";
+        return std::nullopt;
+    }
+    std::vector<uint8_t> headerBytes(sizeOfHeaders);
+    std::memcpy(headerBytes.data(), d.data(), sizeOfHeaders);
+    if (!p.memory.addBlock("headers", p.imageBase, std::move(headerBytes),
+                           static_cast<int>(Perm::R))) {
+        err = "invalid PE header mapping";
+        return std::nullopt;
+    }
+    uint64_t mappedTotal = sizeOfHeaders;
     for (const auto& s : ps.secs) {
         const std::string name = sectionName(s.name);
         const uint32_t memSz = std::max(s.virtualSize, s.sizeOfRawData);
@@ -238,6 +290,347 @@ std::optional<Program> loadPeImpl(const std::vector<uint8_t>& d,
         p.sections.push_back(Section{
             name.empty() ? "(unnamed)" : name, sectionAddr,
             memSz, s.pointerToRawData, s.sizeOfRawData, perm});
+        if ((perm & static_cast<int>(Perm::X)) == 0) {
+            p.dataRegions.push_back(DataRegion{
+                name.empty() ? "(unnamed)" : name, sectionAddr, memSz,
+                s.sizeOfRawData, perm});
+        }
+    }
+
+    const size_t directoryBytes = coff.sizeOfOptionalHeader >
+            dataDirOff - optOff
+        ? coff.sizeOfOptionalHeader - (dataDirOff - optOff) : 0;
+    const size_t availableDirectories = std::min<size_t>(
+        numRvaSizes, directoryBytes / 8);
+    auto directory = [&](size_t index) {
+        std::pair<uint32_t, uint32_t> result{};
+        if (index < availableDirectories) {
+            result.first = rd32(d, dataDirOff + index * 8);
+            result.second = rd32(d, dataDirOff + index * 8 + 4);
+        }
+        return result;
+    };
+    const unsigned thunkWidth = is64 ? 8U : 4U;
+
+    // ---- thread-local storage template and loader callbacks ----
+    // IMAGE_TLS_DIRECTORY stores virtual addresses (not RVAs).  Keeping the
+    // exact template range is essential for MSVC's per-thread static-local
+    // epoch at GS:[0x58] -> TLS slot; a zero-filled stand-in changes guard
+    // ordering and can skip constructors entirely.
+    const auto tlsDirectory = directory(9);
+    if (tlsDirectory.first) {
+        const size_t structureSize = is64 ? 40U : 24U;
+        const auto tlsOff = ps.rvaToOffset(tlsDirectory.first);
+        if (!tlsOff || tlsDirectory.second < structureSize ||
+            !rangeInFile(*tlsOff, structureSize, d.size())) {
+            err = "invalid PE TLS directory";
+            return std::nullopt;
+        }
+        ThreadLocalStorage tls;
+        if (is64) {
+            tls.rawDataStart = rd64(d, *tlsOff);
+            tls.rawDataEnd = rd64(d, *tlsOff + 8);
+            tls.addressOfIndex = rd64(d, *tlsOff + 16);
+            tls.addressOfCallbacks = rd64(d, *tlsOff + 24);
+            tls.zeroFillSize = rd32(d, *tlsOff + 32);
+            tls.characteristics = rd32(d, *tlsOff + 36);
+        } else {
+            tls.rawDataStart = rd32(d, *tlsOff);
+            tls.rawDataEnd = rd32(d, *tlsOff + 4);
+            tls.addressOfIndex = rd32(d, *tlsOff + 8);
+            tls.addressOfCallbacks = rd32(d, *tlsOff + 12);
+            tls.zeroFillSize = rd32(d, *tlsOff + 16);
+            tls.characteristics = rd32(d, *tlsOff + 20);
+        }
+        if (tls.rawDataEnd < tls.rawDataStart ||
+            tls.rawDataEnd - tls.rawDataStart > maxMappedBytes ||
+            static_cast<uint64_t>(tls.zeroFillSize) > maxMappedBytes -
+                (tls.rawDataEnd - tls.rawDataStart)) {
+            err = "invalid PE TLS template range";
+            return std::nullopt;
+        }
+        const uint64_t rawSize = tls.rawDataEnd - tls.rawDataStart;
+        uint8_t boundary = 0;
+        uint32_t indexValue = 0;
+        const MemoryBlock* rawBlock = rawSize
+            ? p.memory.blockAt(tls.rawDataStart) : nullptr;
+        if ((rawSize &&
+             (!rawBlock || tls.rawDataStart > rawBlock->end() ||
+              rawSize > rawBlock->end() - tls.rawDataStart ||
+              !p.memory.read(tls.rawDataStart, &boundary, 1) ||
+              !p.memory.read(tls.rawDataEnd - 1, &boundary, 1))) ||
+            !tls.addressOfIndex ||
+            !p.memory.read(tls.addressOfIndex, &indexValue,
+                           sizeof(indexValue))) {
+            err = "PE TLS storage is outside the mapped image";
+            return std::nullopt;
+        }
+        if (tls.addressOfCallbacks) {
+            bool terminated = false;
+            for (size_t index = 0; index < 4096; ++index) {
+                const uint64_t byteOffset =
+                    static_cast<uint64_t>(index) * thunkWidth;
+                if (tls.addressOfCallbacks >
+                    std::numeric_limits<uint64_t>::max() - byteOffset) {
+                    err = "PE TLS callback address overflow";
+                    return std::nullopt;
+                }
+                uint64_t callback = 0;
+                if (is64) {
+                    if (!p.memory.read(tls.addressOfCallbacks + byteOffset,
+                                       &callback, sizeof(callback)))
+                        break;
+                } else {
+                    uint32_t callback32 = 0;
+                    if (!p.memory.read(tls.addressOfCallbacks + byteOffset,
+                                       &callback32, sizeof(callback32)))
+                        break;
+                    callback = callback32;
+                }
+                if (!callback) {
+                    terminated = true;
+                    break;
+                }
+                if (!p.memory.isExecutable(callback)) {
+                    err = "PE TLS callback is not executable";
+                    return std::nullopt;
+                }
+                tls.callbacks.push_back(callback);
+            }
+            if (!terminated) {
+                err = "unterminated PE TLS callback array";
+                return std::nullopt;
+            }
+        }
+        p.tls = std::move(tls);
+    }
+
+    // ---- import and delay-import tables ----
+    auto addLibrary = [&](const std::string& library) {
+        if (std::find(p.importedLibraries.begin(), p.importedLibraries.end(),
+                      library) == p.importedLibraries.end())
+            p.importedLibraries.push_back(library);
+    };
+    auto parseThunks = [&](const std::string& library, uint32_t lookupRva,
+                           uint32_t iatRva, bool delayed) {
+        const auto lookupOff = ps.rvaToOffset(lookupRva);
+        const auto iatOff = ps.rvaToOffset(iatRva);
+        if (!lookupOff || !iatOff) return false;
+        bool terminated = false;
+        const uint64_t ordinalMask = is64 ? (1ULL << 63) : (1ULL << 31);
+        for (size_t index = 0; index < 1'000'000; ++index) {
+            const uint64_t byteIndex = static_cast<uint64_t>(index) * thunkWidth;
+            if (!rangeInFile(static_cast<uint64_t>(*lookupOff) + byteIndex,
+                             thunkWidth, d.size()) ||
+                !rangeInFile(static_cast<uint64_t>(*iatOff) + byteIndex,
+                             thunkWidth, d.size()))
+                return false;
+            const uint64_t thunk = is64
+                ? rd64(d, static_cast<size_t>(*lookupOff + byteIndex))
+                : rd32(d, static_cast<size_t>(*lookupOff + byteIndex));
+            if (!thunk) {
+                terminated = true;
+                break;
+            }
+            ImportSymbol imported;
+            imported.library = library;
+            imported.delayed = delayed;
+            imported.byOrdinal = (thunk & ordinalMask) != 0;
+            if (imported.byOrdinal) {
+                imported.ordinal = static_cast<uint16_t>(thunk & 0xffffU);
+            } else {
+                if (thunk > std::numeric_limits<uint32_t>::max()) return false;
+                const auto nameOff = ps.rvaToOffset(static_cast<uint32_t>(thunk));
+                if (!nameOff || !rangeInFile(*nameOff, 3, d.size())) return false;
+                imported.hint = rd16(d, *nameOff);
+                imported.name = cstrAt(d, *nameOff + 2, 4096);
+                if (imported.name.empty()) return false;
+            }
+            const uint64_t lookupSlotRva =
+                static_cast<uint64_t>(lookupRva) + byteIndex;
+            const uint64_t iatSlotRva = static_cast<uint64_t>(iatRva) + byteIndex;
+            if (!addOk(p.imageBase, lookupSlotRva, imported.lookupAddress) ||
+                !addOk(p.imageBase, iatSlotRva, imported.iatAddress))
+                return false;
+            Symbol slot;
+            slot.name = library + "!" + (imported.byOrdinal
+                ? ("#" + std::to_string(imported.ordinal)) : imported.name);
+            slot.addr = imported.iatAddress;
+            slot.size = thunkWidth;
+            p.symbols.push_back(std::move(slot));
+            p.imports.push_back(std::move(imported));
+        }
+        return terminated;
+    };
+    auto parseImportDirectory = [&](uint32_t tableRva, uint32_t tableSize,
+                                    bool delayed) {
+        if (!tableRva) return true;
+        const auto tableOff = ps.rvaToOffset(tableRva);
+        const size_t descriptorSize = delayed ? 32U : 20U;
+        if (!tableOff || tableSize < descriptorSize ||
+            !rangeInFile(*tableOff, tableSize, d.size()))
+            return false;
+        const size_t descriptors = tableSize / descriptorSize;
+        bool terminated = false;
+        for (size_t index = 0; index < descriptors; ++index) {
+            const size_t at = *tableOff + index * descriptorSize;
+            bool empty = true;
+            for (size_t word = 0; word < descriptorSize; word += 4)
+                empty &= rd32(d, at + word) == 0;
+            if (empty) {
+                terminated = true;
+                break;
+            }
+            uint32_t nameRva = 0, lookupRva = 0, iatRva = 0;
+            if (!delayed) {
+                lookupRva = rd32(d, at);
+                nameRva = rd32(d, at + 12);
+                iatRva = rd32(d, at + 16);
+                if (!lookupRva) lookupRva = iatRva;
+            } else {
+                const uint32_t attributes = rd32(d, at);
+                auto asRva = [&](uint32_t value) -> uint32_t {
+                    if (!value || (attributes & 1U)) return value;
+                    if (value < p.imageBase ||
+                        static_cast<uint64_t>(value) - p.imageBase >
+                            std::numeric_limits<uint32_t>::max())
+                        return 0;
+                    return static_cast<uint32_t>(
+                        static_cast<uint64_t>(value) - p.imageBase);
+                };
+                nameRva = asRva(rd32(d, at + 4));
+                iatRva = asRva(rd32(d, at + 12));
+                lookupRva = asRva(rd32(d, at + 16));
+                if (!lookupRva) lookupRva = iatRva;
+            }
+            const auto nameOff = ps.rvaToOffset(nameRva);
+            if (!nameOff || !lookupRva || !iatRva) return false;
+            const std::string library = cstrAt(d, *nameOff, 1024);
+            if (library.empty() ||
+                !parseThunks(library, lookupRva, iatRva, delayed))
+                return false;
+            addLibrary(library);
+        }
+        return terminated;
+    };
+    const auto imports = directory(1);
+    if (imports.first &&
+        !parseImportDirectory(imports.first, imports.second, false)) {
+        err = "invalid PE import directory";
+        return std::nullopt;
+    }
+    const auto delayImports = directory(13);
+    if (delayImports.first &&
+        !parseImportDirectory(delayImports.first, delayImports.second, true)) {
+        err = "invalid PE delay-import directory";
+        return std::nullopt;
+    }
+
+    // ---- resource directory tree ----
+    const auto resourceDirectory = directory(2);
+    if (resourceDirectory.first) {
+        const auto resourceOff = ps.rvaToOffset(resourceDirectory.first);
+        if (!resourceOff || resourceDirectory.second < 16 ||
+            !rangeInFile(*resourceOff, resourceDirectory.second, d.size())) {
+            err = "invalid PE resource directory";
+            return std::nullopt;
+        }
+        struct ResourcePath {
+            uint32_t typeId = 0, nameId = 0, languageId = 0;
+            std::string typeName, name;
+        };
+        std::set<uint64_t> visited;
+        bool validResources = true;
+        auto relativeRange = [&](uint32_t relative, uint64_t size) {
+            return relative <= resourceDirectory.second &&
+                   size <= static_cast<uint64_t>(resourceDirectory.second) - relative &&
+                   rangeInFile(static_cast<uint64_t>(*resourceOff) + relative,
+                               size, d.size());
+        };
+        std::function<void(uint32_t, unsigned, ResourcePath)> walk;
+        walk = [&](uint32_t relative, unsigned depth, ResourcePath path) {
+            if (!validResources || depth > 8 || !relativeRange(relative, 16)) {
+                validResources = false;
+                return;
+            }
+            const uint64_t visitKey = (static_cast<uint64_t>(depth) << 32) | relative;
+            if (!visited.insert(visitKey).second) return;
+            const size_t at = *resourceOff + relative;
+            const uint32_t count = static_cast<uint32_t>(rd16(d, at + 12)) +
+                                   rd16(d, at + 14);
+            if (count > 1'000'000 ||
+                !relativeRange(relative + 16, static_cast<uint64_t>(count) * 8)) {
+                validResources = false;
+                return;
+            }
+            for (uint32_t index = 0; index < count; ++index) {
+                const size_t entry = at + 16 + static_cast<size_t>(index) * 8;
+                const uint32_t identifier = rd32(d, entry);
+                const uint32_t target = rd32(d, entry + 4);
+                ResourcePath next = path;
+                uint32_t numeric = 0;
+                std::string named;
+                if (identifier & 0x80000000U) {
+                    const uint32_t stringOffset = identifier & 0x7fffffffU;
+                    if (!relativeRange(stringOffset, 2)) {
+                        validResources = false;
+                        return;
+                    }
+                    named = utf16ResourceString(d, *resourceOff + stringOffset);
+                    if (named.empty()) {
+                        validResources = false;
+                        return;
+                    }
+                } else {
+                    numeric = identifier & 0xffffU;
+                }
+                if (depth == 0) {
+                    next.typeId = numeric;
+                    next.typeName = named.empty()
+                        ? standardResourceType(numeric) : named;
+                } else if (depth == 1) {
+                    next.nameId = numeric;
+                    next.name = named;
+                } else {
+                    next.languageId = numeric;
+                }
+                const uint32_t targetOffset = target & 0x7fffffffU;
+                if (target & 0x80000000U) {
+                    walk(targetOffset, depth + 1, std::move(next));
+                    continue;
+                }
+                if (!relativeRange(targetOffset, 16)) {
+                    validResources = false;
+                    return;
+                }
+                const size_t dataEntry = *resourceOff + targetOffset;
+                const uint32_t dataRva = rd32(d, dataEntry);
+                const uint32_t dataSize = rd32(d, dataEntry + 4);
+                const auto dataOff = ps.rvaToOffset(dataRva);
+                if (!dataOff || !rangeInFile(*dataOff, dataSize, d.size())) {
+                    validResources = false;
+                    return;
+                }
+                ResourceEntry resource;
+                resource.typeId = next.typeId;
+                resource.nameId = next.nameId;
+                resource.languageId = next.languageId;
+                resource.typeName = next.typeName;
+                resource.name = next.name;
+                resource.size = dataSize;
+                resource.codePage = rd32(d, dataEntry + 8);
+                if (!addOk(p.imageBase, dataRva, resource.dataAddress)) {
+                    validResources = false;
+                    return;
+                }
+                p.resources.push_back(std::move(resource));
+            }
+        };
+        walk(0, 0, {});
+        if (!validResources) {
+            err = "invalid PE resource tree";
+            return std::nullopt;
+        }
     }
 
     // ---- x64 exception directory (.pdata / IMAGE_RUNTIME_FUNCTION_ENTRY) ----
@@ -275,7 +668,22 @@ std::optional<Program> loadPeImpl(const std::vector<uint8_t>& d,
                     const uint8_t codeCount = d[*unwindOff + 2];
                     const size_t slots = (static_cast<size_t>(codeCount) + 1) & ~size_t{1};
                     const size_t handlerOff = *unwindOff + 4 + slots * 2;
-                    if ((flags & 0x3) && rangeInFile(handlerOff, 4, d.size())) {
+                    if ((flags & 0x4) &&
+                        rangeInFile(handlerOff, 12, d.size())) {
+                        const uint32_t chainedBegin = rd32(d, handlerOff);
+                        const uint32_t chainedEnd = rd32(d, handlerOff + 4);
+                        const uint32_t chainedUnwind = rd32(d, handlerOff + 8);
+                        if (!addOk(p.imageBase, chainedBegin,
+                                   region.chainedStart) ||
+                            !addOk(p.imageBase, chainedEnd,
+                                   region.chainedEnd) ||
+                            !addOk(p.imageBase, chainedUnwind,
+                                   region.chainedUnwindInfo)) {
+                            err = "PE chained unwind address overflow";
+                            return std::nullopt;
+                        }
+                    } else if ((flags & 0x3) &&
+                               rangeInFile(handlerOff, 4, d.size())) {
                         const uint32_t handlerRva = rd32(d, handlerOff);
                         if (handlerRva &&
                             !addOk(p.imageBase, handlerRva, region.handler)) {

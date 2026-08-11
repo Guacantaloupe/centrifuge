@@ -41,14 +41,19 @@ std::vector<Function> findFunctions(const Program& prog, Disassembler* disasm) {
             f.src = src;
             funcs.emplace(addr, std::move(f));
         } else {
-            if (src == Function::SYMBOL || src == Function::EXPORT) {
-                if (it->second.src == Function::SCAN ||
-                    it->second.src == Function::ENTRY) {
+            const bool replacesHeuristic = it->second.src == Function::SCAN ||
+                                           it->second.src == Function::ENTRY;
+            if (src == Function::SYMBOL || src == Function::EXPORT ||
+                src == Function::UNWIND) {
+                if (replacesHeuristic) {
                     it->second.name = std::move(name);
                     it->second.src = src;
                 }
             }
-            if (symSize > it->second.size) it->second.size = symSize;
+            if (src == Function::UNWIND && replacesHeuristic)
+                it->second.size = symSize;
+            else if (symSize > it->second.size)
+                it->second.size = symSize;
         }
     };
 
@@ -58,8 +63,45 @@ std::vector<Function> findFunctions(const Program& prog, Disassembler* disasm) {
         addFunc(s.addr, s.name,
                 s.isExported ? Function::EXPORT : Function::SYMBOL, s.size);
     }
+
     if (prog.entryPoint != 0)
         addFunc(prog.entryPoint, "entry", Function::ENTRY);
+
+    // Index authoritative unwind ranges before recursive discovery.  They are
+    // deliberately not all inserted into `funcs` yet: doing so would put every
+    // PE RUNTIME_FUNCTION on the discovery worklist.  The index still lets a
+    // caller recognize a known function boundary without recursively decoding
+    // enormous CRT/global initializers merely to rediscover their extent.
+    std::map<uint64_t, const ExceptionRegion*> unwindByStart;
+    for (const ExceptionRegion& region : prog.exceptionRegions)
+        if (region.end > region.start)
+            unwindByStart.emplace(region.start, &region);
+
+    auto unwindRoot = [&](const ExceptionRegion& initial) {
+        const ExceptionRegion* region = &initial;
+        std::set<uint64_t> visited;
+        while (region->chainedStart && visited.insert(region->start).second) {
+            const auto parent = unwindByStart.find(region->chainedStart);
+            if (parent == unwindByStart.end()) break;
+            region = parent->second;
+        }
+        return region->start;
+    };
+
+    // A single MSVC function can have several adjacent RUNTIME_FUNCTION
+    // records linked with UNW_FLAG_CHAININFO.  Treat their common root and
+    // maximum end as one logical function; otherwise stack parameters used in
+    // later fragments disappear from the recovered signature.
+    std::map<uint64_t, uint64_t> unwindSizes;
+    for (const ExceptionRegion& region : prog.exceptionRegions) {
+        if (region.end <= region.start) continue;
+        const uint64_t root = unwindRoot(region);
+        if (region.end <= root) continue;
+        const uint64_t size = region.end - root;
+        auto inserted = unwindSizes.emplace(root, size);
+        if (!inserted.second && size > inserted.first->second)
+            inserted.first->second = size;
+    }
 
     // Seed 2: recursive-descent scan from every known start. Follows direct
     // calls (promoting targets to functions) and unconditional jumps; stops at
@@ -70,7 +112,8 @@ std::vector<Function> findFunctions(const Program& prog, Disassembler* disasm) {
         for (const auto& kv : funcs) worklist.push_back(kv.first);
         std::set<uint64_t> visited;
         for (size_t wi = 0; wi < worklist.size(); ++wi) {
-            uint64_t cur = worklist[wi];
+            const uint64_t functionStart = worklist[wi];
+            uint64_t cur = functionStart;
             bool first = true;
             while (true) {
                 if (!first && funcs.count(cur)) break; // hit another function
@@ -87,14 +130,27 @@ std::vector<Function> findFunctions(const Program& prog, Disassembler* disasm) {
                     if (insn.targetKnown &&
                         prog.memory.isExecutable(insn.target) &&
                         !funcs.count(insn.target)) {
-                        addFunc(insn.target, funName(insn.target, is64),
-                                Function::SCAN);
-                        worklist.push_back(insn.target);
+                        const auto unwind = unwindSizes.find(insn.target);
+                        if (unwind != unwindSizes.end()) {
+                            addFunc(insn.target, funName(insn.target, is64),
+                                    Function::UNWIND, unwind->second);
+                        } else {
+                            addFunc(insn.target, funName(insn.target, is64),
+                                    Function::SCAN);
+                            worklist.push_back(insn.target);
+                        }
                     }
                     cur += insn.size; // keep scanning after the call
                 } else if (insn.kind == Insn::JMP) {
                     if (insn.targetKnown &&
                         prog.memory.isExecutable(insn.target)) {
+                        const auto unwind = unwindSizes.find(insn.target);
+                        if (insn.target != functionStart &&
+                            unwind != unwindSizes.end()) {
+                            addFunc(insn.target, funName(insn.target, is64),
+                                    Function::UNWIND, unwind->second);
+                            break; // tail call into an authoritative range
+                        }
                         cur = insn.target;
                     } else {
                         break; // indirect/unknown jump ends linear flow
@@ -105,6 +161,14 @@ std::vector<Function> findFunctions(const Program& prog, Disassembler* disasm) {
             }
         }
     }
+
+    // Seed 3: compiler-produced unwind tables provide authoritative function
+    // starts and end boundaries, especially for stripped Windows x64 images.
+    // Add these after recursive descent so hundreds of thousands of .pdata
+    // entries do not each trigger a redundant discovery walk.
+    for (const auto& unwind : unwindSizes)
+        addFunc(unwind.first, funName(unwind.first, is64), Function::UNWIND,
+                unwind.second);
 
     // Sizes: distance to next function start, clamped to the containing block.
     std::vector<Function> out;

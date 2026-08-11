@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "name": "linux-riscv-compiler-output",
+      "binary": "tests/real_riscv2.elf",
+      "spec": "sleigh/riscv64.slaspec",
+      "abi": "lp64",
+      "functions": ["0x80000040", "0x800003e4"],
+      "minimum_typed_characters": 200,
+      "maximum_decode_failures": 8,
+      "maximum_empty_semantics": 2
+    },
+    {
+      "name": "windows-pe64-sample",
+      "binary": "samples/sample_pe64.exe",
+      "spec": "sleigh/x86-64.slaspec",
+      "abi": "win64",
+      "functions": ["0x140001000"],
+      "minimum_typed_characters": 80
+    }
+  ]
+}

@@ -65,6 +65,20 @@ bool CfgBuilder::build(
         const uint64_t next = a + static_cast<uint64_t>(pi.size);
         insns.emplace(a, pi);
 
+        // An instruction constructor may contain a call followed by another
+        // terminator (for example a compact test/spec intrinsic).  Record
+        // direct call operations independently of the final instruction kind.
+        for (const PcodeOp& operation : pi.ops) {
+            if (operation.op != POp::CALL) continue;
+            const Varnode* target = pi.find(operation.in0);
+            if (target && target->isConst()) addUnique(calls[a], target->offset);
+        }
+
+        const bool traps = std::any_of(
+            pi.ops.begin(), pi.ops.end(), [](const PcodeOp& operation) {
+                return operation.op == POp::TRAP;
+            });
+        if (traps) continue;
         switch (pi.kind) {
         case Insn::RET:
             break;
@@ -304,11 +318,24 @@ void CfgBuilder::applyExceptionRegions(
     for (auto& block : blocks_) {
         block.exceptionSuccs.clear();
         for (const auto& region : regions) {
-            if (!region.handler || block.end <= region.start || block.start >= region.end)
-                continue;
-            if (std::find(block.exceptionSuccs.begin(), block.exceptionSuccs.end(),
-                          region.handler) == block.exceptionSuccs.end())
+            if (!region.handlers.empty()) {
+                for (const auto& handler : region.handlers) {
+                    if (!handler.landingPad || block.end <= handler.start ||
+                        block.start >= handler.end)
+                        continue;
+                    if (std::find(block.exceptionSuccs.begin(),
+                                  block.exceptionSuccs.end(),
+                                  handler.landingPad) == block.exceptionSuccs.end())
+                        block.exceptionSuccs.push_back(handler.landingPad);
+                }
+            } else if (region.kind == ExceptionRegion::WINDOWS_UNWIND &&
+                       region.handler && block.end > region.start &&
+                       block.start < region.end &&
+                       std::find(block.exceptionSuccs.begin(),
+                                 block.exceptionSuccs.end(), region.handler) ==
+                           block.exceptionSuccs.end()) {
                 block.exceptionSuccs.push_back(region.handler);
+            }
         }
         std::sort(block.exceptionSuccs.begin(), block.exceptionSuccs.end());
     }

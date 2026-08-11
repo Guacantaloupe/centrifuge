@@ -15,14 +15,15 @@ struct Function {
     std::string name;
     uint64_t addr = 0;
     uint64_t size = 0;
-    enum Src { SYMBOL, EXPORT, ENTRY, SCAN } src = SCAN;
+    enum Src { SYMBOL, EXPORT, ENTRY, UNWIND, SCAN } src = SCAN;
 };
 
 // Function discovery:
 //   1. seed with symbol-table functions, PE exports, and the entry point;
 //   2. recursive-descent scan from each seed (follow direct calls/jumps),
 //      promoting direct call targets to new function starts;
-//   3. sizes = distance to next function start (or containing block end).
+//   3. seed exact function ranges from DWARF FDE / Windows RUNTIME_FUNCTION;
+//   4. sizes = unwind range or distance to the next function start.
 // `disasm` may be null; then only symbol-derived functions are returned.
 // Heuristic: indirect calls and conditional-branch targets are not followed,
 // so hand-written asm with unusual CFG may under-report. Good enough for v0.1.

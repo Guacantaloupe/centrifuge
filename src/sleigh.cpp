@@ -17,6 +17,10 @@
 
 namespace centrifuge {
 
+thread_local int SleighEngine::x86Opsz_ = 0;
+thread_local uint64_t SleighEngine::nextId_ = 1;
+thread_local std::map<uint64_t, Varnode>* SleighEngine::cache_ = nullptr;
+
 // ---------------------------------------------------------------------------
 // lexer
 namespace {
@@ -819,13 +823,14 @@ Varnode* SleighEngine::makeVarnode(PcodeInsn& pi, Varnode::Kind k,
 
 uint64_t SleighEngine::regVarnode(PcodeInsn& pi, const SpecRegister& r) const {
     const uint64_t key = (r.offset << 8) | (r.size & 0xFF);
-    auto it = cache_.find(key);
-    if (it != cache_.end()) {
+    auto& cache = *cache_;
+    auto it = cache.find(key);
+    if (it != cache.end()) {
         pi.varnodes[it->second.id] = it->second;
         return it->second.id;
     }
     Varnode* v = makeVarnode(pi, Varnode::REGISTER, r.offset, r.size, r.name);
-    cache_[key] = *v;
+    cache[key] = *v;
     return v->id;
 }
 
@@ -1071,6 +1076,8 @@ uint64_t SleighEngine::evalExpr(PcodeInsn& pi, const SpecCtor::SExpr& e) const {
 bool SleighEngine::disassemble(
     const std::function<bool(uint64_t, void*, size_t)>& read, uint64_t addr,
     PcodeInsn& out, std::string& err) const {
+    std::map<uint64_t, Varnode> instructionCache;
+    cache_ = &instructionCache;
     (void)err;
     const int maxTok = tokenSize();
     if (maxTok <= 0) return false;
@@ -1090,6 +1097,7 @@ bool SleighEngine::disassemble(
         bool rex = false, rexw = false, rexr = false, rexx = false,
              rexb = false, op66 = false, opF2 = false, opF3 = false,
              addr67 = false;
+        int segmentOverride = -1; // 4=FS, 5=GS; other x64 segments are flat
         bool vex = false;
         int vexMap = 1;   // 1=0F, 2=0F38, 3=0F3A
         int vexVvvv = -1; // 0-15, -1 = unused
@@ -1104,6 +1112,7 @@ bool SleighEngine::disassemble(
         bool evexZ = false, evexB = false;
         int evexAaa = 0;
         int evexRprime = 0; // ~R'<<4, extends reg field to 5 bits
+        int evexVprime = 0; // ~V'<<4, extends VSIB vector index
         int opsz = 4; // operand size in bytes
         int prefixLen = 0;
         bool haveModrm = false;
@@ -1126,6 +1135,8 @@ bool SleighEngine::disassemble(
             else if (b == 0xF3) { xc.opF3 = true; p++; }
             else if (b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 ||
                      b == 0x64 || b == 0x65) {
+                if (b == 0x64) xc.segmentOverride = 4;
+                else if (b == 0x65) xc.segmentOverride = 5;
                 p++;
             }
             else if (b == 0xC5 && p + 1 < got) {
@@ -1171,6 +1182,7 @@ bool SleighEngine::disassemble(
                 xc.rexx = !((p0 >> 6) & 1);
                 xc.rexb = !((p0 >> 5) & 1);
                 xc.evexRprime = (!((p0 >> 4) & 1)) ? 16 : 0;
+                xc.evexVprime = (!((p2 >> 3) & 1)) ? 16 : 0;
                 xc.evexMap = p0 & 7;
                 xc.evexW = (p1 >> 7) & 1;
                 xc.evexVvvv =
@@ -1226,7 +1238,8 @@ bool SleighEngine::disassemble(
     std::vector<std::pair<std::string, std::string>> magicExports;
     auto isMagic = [&](const std::string& n) {
         return archX86_ &&
-               (n == "rregv" || n == "rmregv" || n.rfind("acc", 0) == 0 ||
+               (n == "rregv" || n == "rmregv" || n == "rregmm" ||
+                n == "rmregmm" || n.rfind("acc", 0) == 0 ||
                 n == "vex" ||
                 n == "vexmap" ||
                 n == "vexvvvv" || n.rfind("vexvvvv", 0) == 0 ||
@@ -1283,7 +1296,12 @@ bool SleighEngine::disassemble(
                 xc.cursor++;
                 scale = 1 << ((sib >> 6) & 3);
                 const int idx = (sib >> 3) & 7, bs = sib & 7;
-                if (idx != 4) index = idx | (xc.rexx ? 8 : 0);
+                // SIB index=4 means "no index" only when X is clear.  With
+                // REX.X/VEX.X/EVEX.X set the same encoding names r12; dropping
+                // it turned LEA [rbx+r12] into LEA [rbx] and broke loop
+                // progress in real x64 programs.
+                if (idx != 4 || xc.rexx)
+                    index = idx | (xc.rexx ? 8 : 0);
                 if (!(bs == 5 && xc.mod == 0)) base = bs | (xc.rexb ? 8 : 0);
             } else if (rm == 5 && xc.mod == 0) {
                 xc.ripRel = true;
@@ -1296,7 +1314,8 @@ bool SleighEngine::disassemble(
                 xc.cursor++;
                 scale = 1 << ((sib >> 6) & 3);
                 const int idx = (sib >> 3) & 7, bs = sib & 7;
-                if (idx != 4) index = idx;
+                if (idx != 4 || xc.rexx)
+                    index = idx | (xc.rexx ? 8 : 0);
                 if (!(bs == 5 && xc.mod == 0)) base = bs;
             } else if (rm == 5 && xc.mod == 0) {
                 // disp32 absolute, no base
@@ -1445,6 +1464,11 @@ bool SleighEngine::disassemble(
                 if (t.kind == SpecCtor::Term::FIELD_EQ &&
                     (fn.rfind("rreg", 0) == 0 || fn.rfind("rmreg", 0) == 0 ||
                      fn.rfind("rq", 0) == 0)) {
+                    if (fn.rfind("rmreg", 0) == 0 &&
+                        (!xc.haveModrm || xc.mod != 3)) {
+                        ok = false;
+                        break;
+                    }
                     int idx = fn.rfind("rmreg", 0) == 0 ? xc.rm : xc.reg;
                     if (fn.rfind("rq", 0) == 0)
                         idx = (readByte(0) & 7) | (xc.rexb ? 8 : 0);
@@ -1530,7 +1554,7 @@ bool SleighEngine::disassemble(
     out.size = insnSize;
     out.nextAddr = addr + insnSize;
     nextId_ = 1;
-    cache_.clear();
+    cache_->clear();
 
     // ---- x86 helpers (need `out` and insnSize) ----
     auto x86RegVarnode = [&](int idx, int size) -> uint64_t {
@@ -1596,12 +1620,20 @@ bool SleighEngine::disassemble(
             else
                 std::snprintf(nm, sizeof(nm), "%s", r64[idx]);
         }
+        uint64_t registerOffset = static_cast<uint64_t>(idx) * 8;
+        // Without a REX prefix, byte register encodings 4..7 name the high
+        // byte views AH/CH/DH/BH, not SPL/BPL/SIL/DIL.  Model those views as
+        // byte 1 of the corresponding RAX/RCX/RDX/RBX storage register so
+        // consumers can slice and writes can merge the correct bits.
+        if (size == 1 && !xc.rex && idx >= 4 && idx < 8)
+            registerOffset = static_cast<uint64_t>(idx - 4) * 8 + 1;
         Varnode* v = makeVarnode(out, Varnode::REGISTER,
-                                 static_cast<uint64_t>(idx) * 8, size, nm);
+                                 registerOffset, size, nm);
         return v->id;
     };
     auto addrText = [&]() -> std::string {
-        std::string s = "[";
+        std::string s = xc.segmentOverride == 4 ? "fs:["
+                        : xc.segmentOverride == 5 ? "gs:[" : "[";
         bool any = false;
         auto rn = [&](int idx) {
             char b[8];
@@ -1612,7 +1644,9 @@ bool SleighEngine::disassemble(
         };
         if (xc.ripRel) {
             char b[24];
-            std::snprintf(b, sizeof(b), "[0x%llx]",
+            std::snprintf(b, sizeof(b), "%s[0x%llx]",
+                          xc.segmentOverride == 4 ? "fs:"
+                          : xc.segmentOverride == 5 ? "gs:" : "",
                           static_cast<unsigned long long>(addr + insnSize +
                                                           xc.disp));
             return b;
@@ -1646,27 +1680,35 @@ bool SleighEngine::disassemble(
         return s;
     };
     auto materializeAddr = [&]() -> uint64_t {
-        if (xc.ripRel) {
-            Varnode* v = makeVarnode(out, Varnode::CONST,
-                                     addr + insnSize + xc.disp, 8);
-            return v->id;
-        }
         std::vector<uint64_t> parts;
-        if (xc.base >= 0) parts.push_back(x86RegVarnode(xc.base, 8));
-        if (xc.index >= 0) {
-            uint64_t v = x86RegVarnode(xc.index, 8);
-            if (xc.scale > 1) {
-                Varnode* t = makeVarnode(out, Varnode::UNIQUE, nextId_++, 8);
-                out.ops.push_back(PcodeOp{POp::INT_MULT, t->id, v,
-                                          constVarnode(out, xc.scale, 8), 0});
-                v = t->id;
-            }
-            parts.push_back(v);
+        if (xc.segmentOverride == 4 || xc.segmentOverride == 5) {
+            const uint64_t offset = xc.segmentOverride == 4
+                                        ? X86_FS_BASE_OFFSET
+                                        : X86_GS_BASE_OFFSET;
+            Varnode* segment = makeVarnode(
+                out, Varnode::REGISTER, offset, 8,
+                xc.segmentOverride == 4 ? "fsbase" : "gsbase");
+            parts.push_back(segment->id);
         }
-        if (xc.disp != 0) {
-            Varnode* c = makeVarnode(out, Varnode::CONST,
-                                     static_cast<uint64_t>(xc.disp), 8);
-            parts.push_back(c->id);
+        if (xc.ripRel) {
+            parts.push_back(constVarnode(out, addr + insnSize + xc.disp, 8));
+        } else {
+            if (xc.base >= 0) parts.push_back(x86RegVarnode(xc.base, 8));
+            if (xc.index >= 0) {
+                uint64_t v = x86RegVarnode(xc.index, 8);
+                if (xc.scale > 1) {
+                    Varnode* t = makeVarnode(out, Varnode::UNIQUE, nextId_++, 8);
+                    out.ops.push_back(PcodeOp{POp::INT_MULT, t->id, v,
+                                              constVarnode(out, xc.scale, 8), 0});
+                    v = t->id;
+                }
+                parts.push_back(v);
+            }
+            if (xc.disp != 0) {
+                Varnode* c = makeVarnode(out, Varnode::CONST,
+                                         static_cast<uint64_t>(xc.disp), 8);
+                parts.push_back(c->id);
+            }
         }
         if (parts.empty()) return constVarnode(out, 0, 8);
         uint64_t acc = parts[0];
@@ -1680,7 +1722,20 @@ bool SleighEngine::disassemble(
 
     // materialize magic exports (registers, addresses, immediates)
     for (const auto& [opname, mname] : magicExports) {
-        if (mname == "rregv" || mname == "rmregv") {
+        if (mname == "rregk") {
+            Varnode* mask = makeVarnode(
+                out, Varnode::REGISTER,
+                8192 + static_cast<uint64_t>(xc.regReg) * 8, 8,
+                "k" + std::to_string(xc.regReg));
+            out.named[opname] = mask->id;
+        } else if (mname == "rregmm" || mname == "rmregmm") {
+            const int index = mname == "rregmm" ? xc.regReg : xc.rmReg;
+            Varnode* mm = makeVarnode(
+                out, Varnode::REGISTER,
+                16384 + static_cast<uint64_t>(index) * 8, 8,
+                "mm" + std::to_string(index));
+            out.named[opname] = mm->id;
+        } else if (mname == "rregv" || mname == "rmregv") {
             const int sz = xc.evex ? (xc.evexL == 2 ? 64
                                           : xc.evexL == 1 ? 32 : 16)
                                    : (xc.vexL ? 32 : 16);
@@ -1715,7 +1770,7 @@ bool SleighEngine::disassemble(
             const int idx = (readByte(0) & 7) | (xc.rexb ? 8 : 0);
             out.named[opname] = x86RegVarnode(idx, magicSize(mname));
         } else if (mname.rfind("rmmem", 0) == 0) {
-            if (mname.size() > 5 && xc.mod == 1) {
+            if (xc.evex && mname.size() > 5 && xc.mod == 1) {
                 // EVEX compressed disp8: disp8 * N
                 xc.disp *= atoi(mname.c_str() + 5);
             }
@@ -1837,12 +1892,44 @@ bool SleighEngine::disassemble(
                 }
                 return constVarnode(out, value, size);
             }
+            // Narrowing is truncation, not extension.  Emitting INT_ZEXT for
+            // TEST AL,AL (whose decoded operand view may originate from RAX)
+            // left the decompiler free to consume unspecified upper bits.
+            if (v && v->size > size)
+                return emit1(POp::SUBPIECE, id, size);
             return emit1(signExtend ? POp::INT_SEXT : POp::INT_ZEXT, id, size);
         };
         auto loadValue = [&](uint64_t address, int size) {
             const uint64_t r = tmp(size);
             out.ops.push_back(PcodeOp{POp::LOAD, r, address, 0, 0});
             return r;
+        };
+        auto applyEvexMask = [&](uint64_t computed, uint64_t previous,
+                                 int size, int laneBits) {
+            if (!xc.evex || xc.evexAaa == 0) return computed;
+            Varnode* mask = makeVarnode(
+                out, Varnode::REGISTER,
+                8192 + static_cast<uint64_t>(xc.evexAaa) * 8, 8,
+                "k" + std::to_string(xc.evexAaa));
+            const uint64_t result = tmp(size);
+            const uint16_t aux = static_cast<uint16_t>(
+                laneBits | (xc.evexZ ? 0x8000 : 0));
+            out.ops.push_back(PcodeOp{POp::SIMD_MASK, result, computed,
+                                      previous, mask->id, aux});
+            return result;
+        };
+        auto applyEvexStoreMask = [&](uint64_t computed, uint64_t previous,
+                                      int size, int laneBits) {
+            if (!xc.evex || xc.evexAaa == 0) return computed;
+            Varnode* mask = makeVarnode(
+                out, Varnode::REGISTER,
+                8192 + static_cast<uint64_t>(xc.evexAaa) * 8, 8,
+                "k" + std::to_string(xc.evexAaa));
+            const uint64_t result = tmp(size);
+            out.ops.push_back(PcodeOp{
+                POp::SIMD_MASK, result, computed, previous, mask->id,
+                static_cast<uint16_t>(laneBits)});
+            return result;
         };
         auto flag = [&](const char* name) {
             const SpecRegister* r = findReg(name);
@@ -1915,10 +2002,391 @@ bool SleighEngine::disassemble(
         };
 
         const std::string& name = matched->name;
+        if (name == "push" && out.named.count("src")) {
+            // Keep ordinary stack transfers as first-class LOAD/STORE p-code.
+            // The x86 specification intentionally does not declare the GPR
+            // bank, so evaluating the textual `sp = sp - 8` constructor would
+            // otherwise fold an unknown `sp` to zero.  Explicit p-code also
+            // lets SSA, stack-slot recovery, and the C emitter follow saved
+            // non-volatile registers without an opaque system operation.
+            const unsigned width = xc.opsz == 2 ? 2U : 8U;
+            const uint64_t stack = x86RegVarnode(4, 8);
+            const uint64_t sourceId = out.named["src"];
+            const uint64_t value = isMemory("src")
+                                       ? loadValue(sourceId, width)
+                                       : resized(sourceId, width, true);
+            const uint64_t nextStack = emit2(
+                POp::INT_SUB, stack, constVarnode(out, width, 8), 8);
+            out.ops.push_back(PcodeOp{POp::STORE, 0, nextStack, 0, value});
+            out.ops.push_back(PcodeOp{POp::COPY, stack, nextStack, 0, 0});
+            x86Handled = true;
+        } else if (name == "int3" || name == "int1" || name == "int" ||
+            name == "ud0" || name == "ud2" || name == "udb") {
+            const uint64_t vector = constVarnode(
+                out, (name == "int3") ? 3 : (name == "int1") ? 1 :
+                     (name == "int")
+                         ? out.find(out.named.count("imm") ? out.named["imm"] :
+                                    out.named.count("n") ? out.named["n"] : 0)
+                               ? out.find(out.named.count("imm") ? out.named["imm"] :
+                                          out.named["n"])->offset : 0
+                         : 6, 1);
+            out.ops.push_back(PcodeOp{POp::X86_SYSTEM, 0, vector, 0, 0,
+                static_cast<uint16_t>(X86SystemAction::SoftwareInterrupt)});
+            x86Handled = true;
+        } else if (name == "syscall") {
+            out.ops.push_back(PcodeOp{POp::X86_SYSTEM, 0, 0, 0, 0,
+                static_cast<uint16_t>(X86SystemAction::FastSystemCall)});
+            x86Handled = true;
+        } else if (name == "lfence" || name == "sfence" ||
+                   name == "mfence" || name == "wait") {
+            const uint16_t kind = name == "lfence" ? 1
+                                  : name == "sfence" ? 2
+                                  : name == "mfence" ? 3 : 4;
+            out.ops.push_back(PcodeOp{POp::MEMORY_BARRIER, 0, 0, 0, 0, kind});
+            x86Handled = true;
+        } else if (name == "nop" || name == "pause" || name.rfind("prefetch", 0) == 0 ||
+                   name == "clflush" || name == "clflushopt" ||
+                   name == "clwb") {
+            const uint64_t address = out.named.count("dst")
+                                         ? out.named["dst"] : 0;
+            out.ops.push_back(PcodeOp{POp::CACHE_HINT, 0, address, 0, 0});
+            x86Handled = true;
+        } else if ((name == "fxsave" || name == "xsave" ||
+                    name == "xsavec" || name == "xsaves") &&
+                   out.named.count("dst")) {
+            const uint16_t format = name == "fxsave" ? 0
+                                    : name == "xsave" ? 1
+                                    : name == "xsavec" ? 2 : 3;
+            out.ops.push_back(PcodeOp{POp::X86_XSTATE_SAVE, 0,
+                                      out.named["dst"], 0, 0, format});
+            x86Handled = true;
+        } else if ((name == "fxrstor" || name == "xrstor" ||
+                    name == "xrstors") && out.named.count("dst")) {
+            const uint16_t format = name == "fxrstor" ? 0
+                                    : name == "xrstor" ? 1 : 3;
+            out.ops.push_back(PcodeOp{POp::X86_XSTATE_RESTORE, 0,
+                                      out.named["dst"], 0, 0, format});
+            x86Handled = true;
+        } else {
+            X86SystemAction action = X86SystemAction::None;
+            if (name == "cpuid") action = X86SystemAction::Cpuid;
+            else if (name == "rdmsr") action = X86SystemAction::ReadMsr;
+            else if (name == "wrmsr") action = X86SystemAction::WriteMsr;
+            else if (name == "xgetbv") action = X86SystemAction::GetXbv;
+            else if (name == "xsetbv") action = X86SystemAction::SetXbv;
+            else if (name == "clts") action = X86SystemAction::ClearTaskSwitched;
+            else if (name == "swapgs") action = X86SystemAction::SwapGs;
+            else if (name == "cli") action = X86SystemAction::DisableInterrupts;
+            else if (name == "sti") action = X86SystemAction::EnableInterrupts;
+            else if (name == "hlt") action = X86SystemAction::Halt;
+            else if (name == "invlpg") action = X86SystemAction::InvalidatePage;
+            else if (name == "invd") action = X86SystemAction::InvalidateCaches;
+            else if (name == "wbinvd")
+                action = X86SystemAction::WriteBackInvalidateCaches;
+            else if (name == "sgdt") action = X86SystemAction::StoreGdtr;
+            else if (name == "sidt") action = X86SystemAction::StoreIdtr;
+            else if (name == "lgdt") action = X86SystemAction::LoadGdtr;
+            else if (name == "lidt") action = X86SystemAction::LoadIdtr;
+            else if (name == "sldt") action = X86SystemAction::StoreLdt;
+            else if (name == "lldt") action = X86SystemAction::LoadLdt;
+            else if (name == "str") action = X86SystemAction::StoreTask;
+            else if (name == "ltr") action = X86SystemAction::LoadTask;
+            else if (name == "movcr")
+                action = readByte(1) == 0x20 ? X86SystemAction::ReadControl
+                                             : X86SystemAction::WriteControl;
+            else if (name == "in" || name == "out") {
+                const uint8_t opcode = readByte(0);
+                action = (opcode == 0xE4 || opcode == 0xE5 ||
+                          opcode == 0xEC || opcode == 0xED)
+                             ? X86SystemAction::PortIn
+                             : X86SystemAction::PortOut;
+            }
+            if (action != X86SystemAction::None) {
+                uint64_t operand = out.named.count("dst") ? out.named["dst"] : 0;
+                const bool selectorLoad = action == X86SystemAction::LoadLdt ||
+                                          action == X86SystemAction::LoadTask;
+                const bool selectorStore = action == X86SystemAction::StoreLdt ||
+                                           action == X86SystemAction::StoreTask;
+                if (selectorLoad && out.named.count("dst") && isMemory("dst"))
+                    operand = loadValue(operand, 2);
+                uint64_t output = action == X86SystemAction::ReadControl ||
+                                  (selectorStore && !isMemory("dst"))
+                                      ? operand : 0;
+                uint64_t memoryResult = 0;
+                if (selectorStore && out.named.count("dst") && isMemory("dst")) {
+                    memoryResult = tmp(2);
+                    output = memoryResult;
+                }
+                uint16_t aux = static_cast<uint16_t>(action);
+                if (name == "movcr") aux |= static_cast<uint16_t>(xc.reg << 8);
+                if (action == X86SystemAction::PortIn ||
+                    action == X86SystemAction::PortOut) {
+                    const uint8_t opcode = readByte(0);
+                    const int width = (opcode == 0xE4 || opcode == 0xE6 ||
+                                       opcode == 0xEC || opcode == 0xEE)
+                                          ? 1 : std::min(xc.opsz, 4);
+                    operand = out.named.count("imm")
+                                  ? out.named["imm"] : x86RegVarnode(2, 2);
+                    const uint64_t accumulator = out.named.count("acc")
+                                                     ? out.named["acc"]
+                                                     : x86RegVarnode(0, width);
+                    output = action == X86SystemAction::PortIn
+                                 ? accumulator : 0;
+                    aux |= static_cast<uint16_t>(width << 8);
+                    out.ops.push_back(PcodeOp{POp::X86_SYSTEM, output,
+                                              operand, accumulator, 0, aux});
+                    x86Handled = true;
+                } else {
+                    out.ops.push_back(PcodeOp{POp::X86_SYSTEM, output,
+                                              operand, 0, 0, aux});
+                    if (memoryResult)
+                        out.ops.push_back(PcodeOp{POp::STORE, 0,
+                                                  out.named["dst"], 0,
+                                                  memoryResult});
+                    x86Handled = true;
+                }
+            }
+        }
+        if (!x86Handled) {
+            X86SystemAction action = X86SystemAction::None;
+            uint64_t output = 0, input0 = 0, input1 = 0;
+            unsigned selector = 0;
+            if (name == "cwd" || name == "cdq" || name == "cqo") {
+                action = X86SystemAction::SignExtendHigh;
+                selector = name == "cwd" ? 2 : name == "cdq" ? 4 : 8;
+            } else if ((name == "mul" || name == "imul") &&
+                       !out.named.count("dst") && out.named.count("src")) {
+                const unsigned width = readByte(0) == 0xF6 ? 1 : xc.opsz;
+                const bool signedMultiply = name == "imul";
+                input0 = isMemory("src")
+                    ? loadValue(out.named["src"], width)
+                    : resized(out.named["src"], width, false);
+                if (width == 1) {
+                    // The byte form writes AX as AL:AH; keep the dedicated
+                    // architectural action for this overlapping-register case.
+                    action = X86SystemAction::MultiplyAccumulator;
+                    selector = static_cast<unsigned>(
+                        width | (signedMultiply ? 0x80 : 0));
+                } else {
+                    const uint64_t accumulator = x86RegVarnode(0, width);
+                    const uint64_t highRegister = x86RegVarnode(2, width);
+                    const uint64_t left = resized(accumulator, width, false);
+                    const uint64_t right = resized(input0, width, false);
+                    uint64_t low = 0, high = 0;
+                    if (width < 8) {
+                        const int wide = static_cast<int>(width * 2);
+                        const uint64_t wideLeft = resized(
+                            left, wide, signedMultiply);
+                        const uint64_t wideRight = resized(
+                            right, wide, signedMultiply);
+                        const uint64_t product = emit2(
+                            POp::INT_MULT, wideLeft, wideRight, wide);
+                        low = resized(product, static_cast<int>(width), false);
+                        const uint64_t shifted = emit2(
+                            POp::INT_RIGHT, product,
+                            constVarnode(out, width * 8, wide), wide);
+                        high = resized(shifted, static_cast<int>(width), false);
+                    } else {
+                        // Portable 64x64 -> 128 multiplication using four
+                        // 32-bit partial products.  This lowers to ordinary
+                        // p-code so decompilation preserves RDX:RAX instead
+                        // of silently dropping the system action.
+                        const uint64_t mask32 = constVarnode(
+                            out, 0xffffffffULL, 8);
+                        const uint64_t shift32 = constVarnode(out, 32, 8);
+                        const uint64_t leftLow = emit2(
+                            POp::INT_AND, left, mask32, 8);
+                        const uint64_t leftHigh = emit2(
+                            POp::INT_RIGHT, left, shift32, 8);
+                        const uint64_t rightLow = emit2(
+                            POp::INT_AND, right, mask32, 8);
+                        const uint64_t rightHigh = emit2(
+                            POp::INT_RIGHT, right, shift32, 8);
+                        const uint64_t first = emit2(
+                            POp::INT_MULT, leftLow, rightLow, 8);
+                        const uint64_t bottom = emit2(
+                            POp::INT_AND, first, mask32, 8);
+                        const uint64_t firstHigh = emit2(
+                            POp::INT_RIGHT, first, shift32, 8);
+                        const uint64_t second = emit2(
+                            POp::INT_ADD,
+                            emit2(POp::INT_MULT, leftHigh, rightLow, 8),
+                            firstHigh, 8);
+                        const uint64_t middle = emit2(
+                            POp::INT_AND, second, mask32, 8);
+                        const uint64_t carry = emit2(
+                            POp::INT_RIGHT, second, shift32, 8);
+                        const uint64_t third = emit2(
+                            POp::INT_ADD,
+                            emit2(POp::INT_MULT, leftLow, rightHigh, 8),
+                            middle, 8);
+                        low = emit2(
+                            POp::INT_OR,
+                            emit2(POp::INT_LEFT, third, shift32, 8),
+                            bottom, 8);
+                        high = emit2(
+                            POp::INT_ADD,
+                            emit2(POp::INT_ADD,
+                                  emit2(POp::INT_MULT, leftHigh, rightHigh, 8),
+                                  carry, 8),
+                            emit2(POp::INT_RIGHT, third, shift32, 8), 8);
+                        if (signedMultiply) {
+                            const uint64_t leftSign = bitFlag(left, 63, 8);
+                            const uint64_t rightSign = bitFlag(right, 63, 8);
+                            high = emit2(
+                                POp::INT_SUB, high,
+                                emit2(POp::INT_MULT, leftSign, right, 8), 8);
+                            high = emit2(
+                                POp::INT_SUB, high,
+                                emit2(POp::INT_MULT, rightSign, left, 8), 8);
+                        }
+                    }
+                    const uint64_t zero = constVarnode(out, 0, width);
+                    uint64_t overflow = emit2(
+                        POp::INT_NOTEQUAL, high, zero, 1);
+                    if (signedMultiply) {
+                        const uint64_t sign = bitFlag(
+                            low, static_cast<int>(width * 8 - 1), width);
+                        const uint64_t expected = emitSelect(
+                            sign, constVarnode(out,
+                                width == 8 ? ~0ULL
+                                           : ((1ULL << (width * 8)) - 1),
+                                width), zero, width);
+                        overflow = emit2(
+                            POp::INT_NOTEQUAL, high, expected, 1);
+                    }
+                    out.ops.push_back(PcodeOp{
+                        POp::COPY, accumulator, low, 0, 0});
+                    out.ops.push_back(PcodeOp{
+                        POp::COPY, highRegister, high, 0, 0});
+                    writeFlag("CF", overflow);
+                    writeFlag("OF", overflow);
+                    x86Handled = true;
+                }
+            } else if ((name == "cmpxchg8b" || name == "cmpxchg16b") &&
+                       out.named.count("dst")) {
+                action = X86SystemAction::CompareExchangeWide;
+                selector = name == "cmpxchg16b" ? 16 : 8;
+                input0 = out.named["dst"];
+            } else if (name == "enter") {
+                action = X86SystemAction::EnterFrame;
+                input0 = constVarnode(out,
+                    static_cast<uint64_t>(readByte(1)) |
+                    (static_cast<uint64_t>(readByte(2)) << 8), 2);
+                input1 = constVarnode(out, readByte(3), 1);
+            } else if (name == "pop" && out.named.count("dst")) {
+                selector = xc.opsz == 2 ? 2 : 8;
+                const bool memory = isMemory("dst");
+                const uint64_t stack = x86RegVarnode(4, 8);
+                output = loadValue(stack, selector);
+                const uint64_t nextStack = emit2(
+                    POp::INT_ADD, stack, constVarnode(out, selector, 8), 8);
+                out.ops.push_back(PcodeOp{POp::COPY, stack, nextStack, 0, 0});
+                if (memory)
+                    out.ops.push_back(PcodeOp{POp::STORE, 0, out.named["dst"], 0, output});
+                else
+                    out.ops.push_back(PcodeOp{POp::COPY, out.named["dst"],
+                                              output, 0, 0});
+                x86Handled = true;
+            } else if (name == "pushf" || name == "popf") {
+                action = name == "pushf" ? X86SystemAction::PushFlags
+                                          : X86SystemAction::PopFlags;
+                selector = xc.opsz == 2 ? 2 : 8;
+            } else if (name == "lahf") action = X86SystemAction::LoadAhFlags;
+            else if (name == "sahf") action = X86SystemAction::StoreAhFlags;
+            else if (name == "salc") action = X86SystemAction::SetAlCarry;
+            else if (name == "ldmxcsr" || name == "stmxcsr") {
+                action = name == "ldmxcsr" ? X86SystemAction::LoadMxcsr
+                                            : X86SystemAction::StoreMxcsr;
+                input0 = out.named.count("dst") ? out.named["dst"] : 0;
+            } else if (name == "insb" || name == "insd" || name == "insq" ||
+                       name == "outsb" || name == "outsd" || name == "outsq") {
+                action = name.rfind("ins", 0) == 0
+                    ? X86SystemAction::StringPortIn
+                    : X86SystemAction::StringPortOut;
+                selector = name.back() == 'b' ? 1 : name.back() == 'd' ? 4 : 8;
+            } else if (name == "rdtsc") action = X86SystemAction::ReadTimestamp;
+            else if (name == "rdtscp") action = X86SystemAction::ReadTimestampAux;
+            else if (name == "rdpmc") action = X86SystemAction::ReadPerformanceCounter;
+            else if (name == "rdrand" || name == "rdseed") {
+                action = X86SystemAction::RandomValue;
+                if (out.named.count("dst")) {
+                    output = out.named["dst"];
+                    const Varnode* node = out.find(output);
+                    selector = node ? node->size : xc.opsz;
+                }
+            } else if (name == "rdpid") {
+                action = X86SystemAction::ReadProcessorId;
+                output = out.named.count("dst") ? out.named["dst"] : 0;
+            } else if (name == "rdsspd" || name == "rdsspq") {
+                action = X86SystemAction::ReadShadowStack;
+                output = out.named.count("dst") ? out.named["dst"] : 0;
+            } else if (name == "monitor" || name == "monitorx")
+                action = X86SystemAction::ArmMonitor;
+            else if (name == "mwait" || name == "mwaitx")
+                action = X86SystemAction::MonitorWait;
+            else if (name == "clac" || name == "stac") {
+                action = X86SystemAction::SetAccessControl;
+                selector = name == "stac" ? 1 : 0;
+            } else if (name == "sysret") action = X86SystemAction::FastSystemReturn;
+            else if (name == "iret") action = X86SystemAction::InterruptReturn;
+            else if (name == "lret") {
+                action = X86SystemAction::FarReturn;
+                if (out.named.count("imm")) {
+                    const Varnode* immediate = out.find(out.named["imm"]);
+                    selector = immediate ? static_cast<unsigned>(immediate->offset) : 0;
+                }
+            } else if (name == "lar" || name == "lsl") {
+                action = name == "lar" ? X86SystemAction::AccessRights
+                                        : X86SystemAction::SegmentLimit;
+                if (out.named.count("src"))
+                    input0 = isMemory("src") ? loadValue(out.named["src"], 2)
+                                              : resized(out.named["src"], 2, false);
+                output = out.named.count("dst") ? out.named["dst"] : 0;
+            } else if (name == "xlat") action = X86SystemAction::TranslateByte;
+
+            if (!x86Handled && action != X86SystemAction::None) {
+                out.ops.push_back(PcodeOp{POp::X86_SYSTEM, output,
+                    input0, input1, 0,
+                    static_cast<uint16_t>(static_cast<uint16_t>(action) |
+                                          static_cast<uint16_t>(selector << 8))});
+                x86Handled = true;
+            }
+        }
+
         const std::set<std::string> arithmetic = {
             "add", "adc", "sub", "sbb", "cmp", "and", "or", "xor",
             "test", "inc", "dec", "neg", "xadd"
         };
+        if (!x86Handled && (name == "cld" || name == "std")) {
+            out.ops.push_back(PcodeOp{
+                POp::COPY, flag("DF"),
+                constVarnode(out, name == "std" ? 1 : 0, 1), 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled) {
+            const uint8_t opcode = readByte(0);
+            unsigned stringOperation = 0;
+            if (opcode == 0xA4 || opcode == 0xA5) stringOperation = 1;
+            else if (opcode == 0xA6 || opcode == 0xA7) stringOperation = 2;
+            else if (opcode == 0xAA || opcode == 0xAB) stringOperation = 3;
+            else if (opcode == 0xAC || opcode == 0xAD) stringOperation = 4;
+            else if (opcode == 0xAE || opcode == 0xAF) stringOperation = 5;
+            if (stringOperation) {
+                const unsigned width = (opcode & 1U) == 0
+                                           ? 1U : static_cast<unsigned>(xc.opsz);
+                const unsigned repeat = name == "rep" ? 1U
+                                          : name == "repe" ? 2U
+                                          : name == "repne" ? 3U : 0U;
+                out.ops.push_back(PcodeOp{
+                    POp::X86_STRING, 0, 0, 0, 0,
+                    static_cast<uint16_t>(stringOperation | (width << 4) |
+                                          (repeat << 8))});
+                x86Handled = true;
+            }
+        }
+
         if (arithmetic.count(name) && out.named.count("dst")) {
             const uint8_t opcodeByte = readByte(0);
             const bool dstMem = isMemory("dst");
@@ -2014,6 +2482,44 @@ bool SleighEngine::disassemble(
                     out.ops.push_back(PcodeOp{POp::COPY, out.named["src"], a, 0, 0});
             }
             x86Handled = result != 0;
+        }
+
+        if (!x86Handled && name == "bswap" && out.named.count("dst")) {
+            const int size = xc.rexw ? 8 : 4;
+            const int index = (readByte(1) - 0xc8) | (xc.rexb ? 8 : 0);
+            const uint64_t destination = x86RegVarnode(index, size);
+            const uint64_t result = tmp(size);
+            out.ops.push_back(PcodeOp{POp::INT_BSWAP, result,
+                                      destination, 0, 0});
+            out.ops.push_back(PcodeOp{POp::COPY, destination, result, 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled && name == "crc32" && out.named.count("dst") &&
+            out.named.count("src")) {
+            const int width = readByte(2) == 0xF0 ? 1 : xc.opsz;
+            const uint64_t source = isMemory("src")
+                                        ? loadValue(out.named["src"], width)
+                                        : resized(out.named["src"], width, false);
+            const uint64_t result = tmp(4);
+            out.ops.push_back(PcodeOp{POp::INT_CRC32C, result,
+                                      out.named["dst"], source, 0,
+                                      static_cast<uint16_t>(width)});
+            out.ops.push_back(PcodeOp{POp::COPY, out.named["dst"],
+                                      result, 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled && (name == "idiv" || name == "div") &&
+            out.named.count("src")) {
+            const int width = readByte(0) == 0xF6 ? 1 : xc.opsz;
+            const uint64_t divisor = isMemory("src")
+                                         ? loadValue(out.named["src"], width)
+                                         : resized(out.named["src"], width, false);
+            out.ops.push_back(PcodeOp{POp::X86_DIVIDE, 0, divisor, 0, 0,
+                                      static_cast<uint16_t>(width |
+                                          (name == "div" ? 0x0100 : 0))});
+            x86Handled = true;
         }
 
         if (!x86Handled && name == "imul" && out.named.count("dst") &&
@@ -2275,6 +2781,66 @@ bool SleighEngine::disassemble(
             x86Handled = true;
         }
 
+        if (!x86Handled && (name == "bextr" || name == "andn" ||
+                            name == "shlx" || name == "shrx" ||
+                            name == "sarx" || name == "pdep" ||
+                            name == "pext") &&
+            out.named.count("dst") && out.named.count("src1") &&
+            out.named.count("src2")) {
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int size = dstNode && dstNode->size ? dstNode->size
+                                                       : (xc.vexW ? 8 : 4);
+            const uint64_t src1 = resized(out.named["src1"], size, false);
+            const uint64_t src2 = isMemory("src2")
+                                      ? loadValue(out.named["src2"], size)
+                                      : resized(out.named["src2"], size, false);
+            uint64_t result = 0;
+            if (name == "bextr") {
+                const uint64_t start = emit2(
+                    POp::INT_AND, src1, constVarnode(out, 0xff, size), size);
+                const uint64_t length = emit2(
+                    POp::INT_AND,
+                    emit2(POp::INT_RIGHT, src1,
+                          constVarnode(out, 8, size), size),
+                    constVarnode(out, 0xff, size), size);
+                const uint64_t shifted = emit2(POp::INT_RIGHT, src2, start, size);
+                const uint64_t highBit = emit2(POp::INT_LEFT,
+                                               constVarnode(out, 1, size),
+                                               length, size);
+                const uint64_t mask = emit2(POp::INT_SUB, highBit,
+                                             constVarnode(out, 1, size), size);
+                result = emit2(POp::INT_AND, shifted, mask, size);
+                writeFlag("ZF", emit2(POp::INT_EQUAL, result,
+                                        constVarnode(out, 0, size), 1));
+            } else if (name == "andn") {
+                const uint64_t inverted = emit2(
+                    POp::INT_XOR, src1,
+                    constVarnode(out, size == 8 ? ~0ULL
+                                                : ((1ULL << (size * 8)) - 1),
+                                  size), size);
+                result = emit2(POp::INT_AND, inverted, src2, size);
+                const uint64_t zero = constVarnode(out, 0, 1);
+                writeFlag("CF", zero); writeFlag("OF", zero);
+                writeFlag("ZF", emit2(POp::INT_EQUAL, result,
+                                        constVarnode(out, 0, size), 1));
+                writeFlag("SF", bitFlag(result, size * 8 - 1, size));
+            } else if (name == "pdep" || name == "pext") {
+                result = emit2(name == "pdep" ? POp::INT_PDEP : POp::INT_PEXT,
+                               src1, src2, size);
+            } else {
+                const uint64_t count = emit2(
+                    POp::INT_AND, src1,
+                    constVarnode(out, size == 8 ? 0x3f : 0x1f, size), size);
+                const POp operation = name == "shlx" ? POp::INT_LEFT
+                                      : name == "shrx" ? POp::INT_RIGHT
+                                                       : POp::INT_SRIGHT;
+                result = emit2(operation, src2, count, size);
+            }
+            out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+            x86Handled = result != 0;
+        }
+
         if (!x86Handled && (name == "bsf" || name == "bsr" ||
                             name == "tzcnt" || name == "lzcnt" ||
                             name == "popcnt") && out.named.count("dst") &&
@@ -2356,14 +2922,669 @@ bool SleighEngine::disassemble(
             }
         }
 
+        // x87 uses a logical eight-entry stack of 80-bit IEEE extended
+        // values.  Model the logical stack directly; this is equivalent to
+        // rotating the architectural TOP field and makes SSA/data-flow
+        // recovery substantially clearer than exposing physical stack slots.
+        const bool x87Name = !name.empty() && name[0] == 'f' &&
+                             name != "fs";
+        if (!x86Handled && x87Name) {
+            std::vector<uint64_t> st(8);
+            for (size_t i = 0; i < st.size(); ++i) {
+                Varnode* value = makeVarnode(
+                    out, Varnode::REGISTER, 12288 + i * 16, 10,
+                    "st" + std::to_string(i));
+                st[i] = value->id;
+            }
+            const uint64_t controlWord = makeVarnode(
+                out, Varnode::REGISTER, 12416, 2, "fcw")->id;
+            const uint64_t statusWord = makeVarnode(
+                out, Varnode::REGISTER, 12418, 2, "fsw")->id;
+            const uint64_t tagWord = makeVarnode(
+                out, Varnode::REGISTER, 12420, 2, "ftw")->id;
+            auto convertFloat = [&](uint64_t value, int sourceBits,
+                                    int destinationBits) {
+                if (sourceBits == destinationBits) return value;
+                const uint64_t converted = tmp(destinationBits / 8);
+                const uint16_t format = static_cast<uint16_t>(
+                    sourceBits | (destinationBits << 8));
+                out.ops.push_back(PcodeOp{POp::FLOAT_FLOAT2FLOAT, converted,
+                                          value, 0, 0, format});
+                return converted;
+            };
+            auto pushX87 = [&](uint64_t value) {
+                out.ops.push_back(PcodeOp{POp::X87_PUSH, 0, value, 0, 0});
+            };
+            auto popX87 = [&]() {
+                out.ops.push_back(PcodeOp{POp::X87_POP, 0, 0, 0, 0});
+            };
+            auto requireX87 = [&](unsigned index) {
+                out.ops.push_back(PcodeOp{POp::X87_REQUIRE, 0, 0, 0, 0,
+                                          static_cast<uint16_t>(index & 7U)});
+            };
+            auto tagX87 = [&](unsigned index, uint64_t value) {
+                out.ops.push_back(PcodeOp{POp::X87_TAG, 0, value, 0, 0,
+                                          static_cast<uint16_t>(index & 7U)});
+            };
+            auto setX87Conditions = [&](uint64_t lhs, uint64_t rhs) {
+                auto compare = [&](POp operation) {
+                    const uint64_t result = tmp(1);
+                    out.ops.push_back(PcodeOp{operation, result, lhs, rhs, 0, 80});
+                    return result;
+                };
+                const uint64_t unordered = compare(POp::FLOAT_NAN);
+                const uint64_t less = compare(POp::FLOAT_LESS);
+                const uint64_t equal = compare(POp::FLOAT_EQUAL);
+                const uint64_t c0 = emit2(POp::INT_OR, unordered, less, 1);
+                const uint64_t c3 = emit2(POp::INT_OR, unordered, equal, 1);
+                auto statusBit = [&](uint64_t value, unsigned bit) {
+                    const uint64_t wide = resized(value, 2, false);
+                    return emit2(POp::INT_LEFT, wide,
+                                 constVarnode(out, bit, 2), 2);
+                };
+                uint64_t updated = emit2(POp::INT_AND, statusWord,
+                                         constVarnode(out, 0xb8ff, 2), 2);
+                updated = emit2(POp::INT_OR, updated, statusBit(c0, 8), 2);
+                updated = emit2(POp::INT_OR, updated,
+                                statusBit(unordered, 10), 2);
+                updated = emit2(POp::INT_OR, updated, statusBit(c3, 14), 2);
+                out.ops.push_back(PcodeOp{POp::COPY, statusWord, updated, 0, 0});
+            };
+            const uint8_t primary = readByte(0);
+            const int memoryFloatBits = (primary == 0xD8 || primary == 0xD9) ? 32
+                                        : (primary == 0xDC || primary == 0xDD) ? 64
+                                        : 80;
+
+            if (name == "fld" && out.named.count("dst") && isMemory("dst")) {
+                uint64_t value = loadValue(out.named["dst"], memoryFloatBits / 8);
+                value = convertFloat(value, memoryFloatBits, 80);
+                pushX87(value);
+                x86Handled = true;
+            } else if (name == "fld1" || name == "fldz" ||
+                       name == "fldl2t" || name == "fldl2e" ||
+                       name == "fldpi" || name == "fldlg2" ||
+                       name == "fldln2") {
+                const uint16_t constant = name == "fld1" ? 0
+                                          : name == "fldz" ? 1
+                                          : name == "fldl2t" ? 2
+                                          : name == "fldl2e" ? 3
+                                          : name == "fldpi" ? 4
+                                          : name == "fldlg2" ? 5 : 6;
+                const uint64_t value = tmp(10);
+                out.ops.push_back(PcodeOp{POp::X87_CONSTANT, value,
+                                          0, 0, 0, constant});
+                pushX87(value);
+                x86Handled = true;
+            } else if (name == "fld" && out.named.count("src")) {
+                requireX87(xc.rm & 7);
+                pushX87(st[xc.rm & 7]);
+                x86Handled = true;
+            } else if (name == "fldcw" && out.named.count("dst") &&
+                       isMemory("dst")) {
+                out.ops.push_back(PcodeOp{POp::COPY, controlWord,
+                                          loadValue(out.named["dst"], 2), 0, 0});
+                x86Handled = true;
+            } else if (name == "fnstcw" && out.named.count("dst") &&
+                       isMemory("dst")) {
+                out.ops.push_back(PcodeOp{POp::STORE, 0, out.named["dst"], 0,
+                                          controlWord});
+                x86Handled = true;
+            } else if (name == "fnstsw") {
+                if (out.named.count("dst") && isMemory("dst"))
+                    out.ops.push_back(PcodeOp{POp::STORE, 0, out.named["dst"], 0,
+                                              statusWord});
+                else
+                    out.ops.push_back(PcodeOp{POp::COPY, x86RegVarnode(0, 2),
+                                              statusWord, 0, 0});
+                x86Handled = true;
+            } else if (name == "fninit") {
+                out.ops.push_back(PcodeOp{POp::COPY, controlWord,
+                                          constVarnode(out, 0x037f, 2), 0, 0});
+                out.ops.push_back(PcodeOp{POp::COPY, statusWord,
+                                          constVarnode(out, 0, 2), 0, 0});
+                out.ops.push_back(PcodeOp{POp::COPY, tagWord,
+                                          constVarnode(out, 0xffff, 2), 0, 0});
+                x86Handled = true;
+            } else if (name == "fnclex") {
+                out.ops.push_back(PcodeOp{
+                    POp::COPY, statusWord,
+                    emit2(POp::INT_AND, statusWord,
+                          constVarnode(out, 0x7f00, 2), 2), 0, 0});
+                x86Handled = true;
+            } else if (name == "fchs" || name == "fabs") {
+                requireX87(0);
+                const uint64_t result = tmp(10);
+                out.ops.push_back(PcodeOp{
+                    name == "fchs" ? POp::FLOAT_NEG : POp::FLOAT_ABS,
+                    result, st[0], 0, 0, 80});
+                out.ops.push_back(PcodeOp{POp::COPY, st[0], result, 0, 0});
+                tagX87(0, result);
+                x86Handled = true;
+            } else if (name == "fxam") {
+                out.ops.push_back(PcodeOp{POp::X87_EXAMINE, 0, 0, 0, 0});
+                x86Handled = true;
+            } else if (name == "fdecstp" || name == "fincstp") {
+                out.ops.push_back(PcodeOp{POp::X87_ROTATE, 0, 0, 0, 0,
+                                          static_cast<uint16_t>(name == "fincstp")});
+                x86Handled = true;
+            } else if (name == "ftst") {
+                requireX87(0);
+                const uint64_t zero = tmp(10);
+                out.ops.push_back(PcodeOp{POp::X87_CONSTANT, zero,
+                                          0, 0, 0, 1});
+                setX87Conditions(st[0], zero);
+                x86Handled = true;
+            } else if (name == "frndint" || name == "fsin" ||
+                       name == "fcos" || name == "fsqrt" ||
+                       name == "f2xm1") {
+                requireX87(0);
+                POp unary = name == "frndint" ? POp::FLOAT_ROUND
+                            : name == "fsin" ? POp::FLOAT_SIN
+                            : name == "fcos" ? POp::FLOAT_COS
+                            : name == "fsqrt" ? POp::FLOAT_SQRT
+                                               : POp::FLOAT_EXP2;
+                const uint64_t transformed = tmp(10);
+                out.ops.push_back(PcodeOp{unary, transformed, st[0],
+                                          name == "frndint" ? controlWord : 0,
+                                          0, 80});
+                uint64_t result = transformed;
+                if (name == "f2xm1") {
+                    const double one = 1.0;
+                    uint64_t bits = 0;
+                    std::memcpy(&bits, &one, sizeof(bits));
+                    const uint64_t one80 = convertFloat(
+                        constVarnode(out, bits, 8), 64, 80);
+                    result = tmp(10);
+                    out.ops.push_back(PcodeOp{POp::FLOAT_SUB, result,
+                                              transformed, one80, 0, 80});
+                }
+                out.ops.push_back(PcodeOp{POp::COPY, st[0], result, 0, 0});
+                tagX87(0, result);
+                x86Handled = true;
+            } else if (name == "fptan" || name == "fsincos") {
+                requireX87(0);
+                const POp firstOperation = name == "fptan" ? POp::FLOAT_TAN
+                                                            : POp::FLOAT_SIN;
+                const uint64_t firstResult = tmp(10);
+                out.ops.push_back(PcodeOp{firstOperation, firstResult, st[0],
+                                          0, 0, 80});
+                uint64_t pushed = 0;
+                if (name == "fptan") {
+                    const double one = 1.0;
+                    uint64_t bits = 0;
+                    std::memcpy(&bits, &one, sizeof(bits));
+                    pushed = convertFloat(constVarnode(out, bits, 8), 64, 80);
+                } else {
+                    pushed = tmp(10);
+                    out.ops.push_back(PcodeOp{POp::FLOAT_COS, pushed, st[0],
+                                              0, 0, 80});
+                }
+                out.ops.push_back(PcodeOp{POp::COPY, st[0], firstResult, 0, 0});
+                tagX87(0, firstResult);
+                pushX87(pushed);
+                x86Handled = true;
+            } else if (name == "fpatan" || name == "fyl2x" ||
+                       name == "fyl2xp1") {
+                requireX87(0);
+                requireX87(1);
+                uint64_t result = tmp(10);
+                if (name == "fpatan") {
+                    out.ops.push_back(PcodeOp{POp::FLOAT_ATAN2, result,
+                                              st[1], st[0], 0, 80});
+                } else {
+                    uint64_t logarithmInput = st[0];
+                    if (name == "fyl2xp1") {
+                        const double one = 1.0;
+                        uint64_t bits = 0;
+                        std::memcpy(&bits, &one, sizeof(bits));
+                        const uint64_t one80 = convertFloat(
+                            constVarnode(out, bits, 8), 64, 80);
+                        logarithmInput = tmp(10);
+                        out.ops.push_back(PcodeOp{POp::FLOAT_ADD,
+                                                  logarithmInput, st[0],
+                                                  one80, 0, 80});
+                    }
+                    const uint64_t logarithm = tmp(10);
+                    out.ops.push_back(PcodeOp{POp::FLOAT_LOG2, logarithm,
+                                              logarithmInput, 0, 0, 80});
+                    out.ops.push_back(PcodeOp{POp::FLOAT_MULT, result,
+                                              st[1], logarithm, 0, 80});
+                }
+                out.ops.push_back(PcodeOp{POp::COPY, st[1], result, 0, 0});
+                tagX87(1, result);
+                popX87();
+                x86Handled = true;
+            } else if (name == "fprem" || name == "fprem1" ||
+                       name == "fscale") {
+                requireX87(0);
+                requireX87(1);
+                const uint64_t result = tmp(10);
+                out.ops.push_back(PcodeOp{
+                    (name == "fprem" || name == "fprem1")
+                        ? POp::FLOAT_REMAINDER : POp::FLOAT_SCALE,
+                    result, st[0], st[1], 0,
+                    static_cast<uint16_t>(80 | (name == "fprem" ? 0x0100 : 0))});
+                out.ops.push_back(PcodeOp{POp::COPY, st[0], result, 0, 0});
+                tagX87(0, result);
+                x86Handled = true;
+            } else if (name == "fxch") {
+                requireX87(0);
+                requireX87(xc.rm & 7);
+                const uint64_t saved = tmp(10);
+                out.ops.push_back(PcodeOp{POp::COPY, saved, st[0], 0, 0});
+                out.ops.push_back(PcodeOp{POp::COPY, st[0], st[xc.rm & 7], 0, 0});
+                out.ops.push_back(PcodeOp{POp::COPY, st[xc.rm & 7], saved, 0, 0});
+                tagX87(0, st[0]);
+                tagX87(xc.rm & 7, st[xc.rm & 7]);
+                x86Handled = true;
+            } else if (name == "ffree") {
+                out.ops.push_back(PcodeOp{POp::X87_FREE, 0, 0, 0, 0,
+                                          static_cast<uint16_t>(xc.rm & 7)});
+                x86Handled = true;
+            } else if ((name == "fild" || name == "filds") &&
+                       out.named.count("dst") && isMemory("dst")) {
+                const int integerSize = name == "filds" ? 2 : 4;
+                const uint64_t integer = loadValue(out.named["dst"], integerSize);
+                const uint64_t converted = tmp(10);
+                out.ops.push_back(PcodeOp{POp::FLOAT_INT2FLOAT, converted,
+                                          integer, 0, 0, 80});
+                pushX87(converted);
+                x86Handled = true;
+            } else if ((name == "fst" || name == "fstp") &&
+                       out.named.count("dst") && isMemory("dst")) {
+                requireX87(0);
+                const uint64_t value = convertFloat(st[0], 80, memoryFloatBits);
+                out.ops.push_back(PcodeOp{POp::STORE, 0, out.named["dst"], 0, value});
+                if (name == "fstp") popX87();
+                x86Handled = true;
+            } else if ((name == "fst" || name == "fstp") &&
+                       out.named.count("dst")) {
+                requireX87(0);
+                out.ops.push_back(PcodeOp{POp::COPY, st[xc.rm & 7], st[0], 0, 0});
+                tagX87(xc.rm & 7, st[0]);
+                if (name == "fstp") popX87();
+                x86Handled = true;
+            } else if ((name == "fistp" || name == "fisttp") &&
+                       out.named.count("dst") && isMemory("dst")) {
+                requireX87(0);
+                const int integerSize = primary == 0xDF ? 2
+                                        : primary == 0xDB ? 4 : 8;
+                const uint64_t value = tmp(integerSize);
+                const uint16_t format = static_cast<uint16_t>(
+                    80 | (name == "fisttp" ? 0x8000 : 0));
+                out.ops.push_back(PcodeOp{POp::FLOAT_FLOAT2INT, value,
+                                          st[0], 0, 0, format});
+                out.ops.push_back(PcodeOp{POp::STORE, 0, out.named["dst"], 0, value});
+                popX87();
+                x86Handled = true;
+            } else if (name == "fcom" || name == "fcomp" ||
+                       name == "fucom" || name == "fucomp" ||
+                       name == "ficom" || name == "ficomp" ||
+                       name == "fcompp" || name == "fucompp") {
+                requireX87(0);
+                uint64_t rhs = st[xc.rm & 7];
+                if (!(out.named.count("dst") && isMemory("dst")))
+                    requireX87(xc.rm & 7);
+                if (out.named.count("dst") && isMemory("dst")) {
+                    if (name == "ficom" || name == "ficomp") {
+                        const int integerSize = primary == 0xDE ? 2 : 4;
+                        const uint64_t integer = loadValue(out.named["dst"],
+                                                           integerSize);
+                        rhs = tmp(10);
+                        out.ops.push_back(PcodeOp{POp::FLOAT_INT2FLOAT, rhs,
+                                                  integer, 0, 0, 80});
+                    } else {
+                        rhs = loadValue(out.named["dst"], memoryFloatBits / 8);
+                        rhs = convertFloat(rhs, memoryFloatBits, 80);
+                    }
+                }
+                out.ops.push_back(PcodeOp{
+                    POp::X87_COMPARE_CHECK, 0, st[0], rhs, 0,
+                    static_cast<uint16_t>(name.rfind("fu", 0) == 0
+                                              ? 0x0100 : 0)});
+                setX87Conditions(st[0], rhs);
+                if (name == "fcomp" || name == "fucomp" ||
+                    name == "ficomp" || name == "fcompp" ||
+                    name == "fucompp")
+                    popX87();
+                if (name == "fcompp" || name == "fucompp") popX87();
+                x86Handled = true;
+            } else if (name == "fcomi" || name == "fucomi" ||
+                       name == "fcomip" || name == "fucomip") {
+                requireX87(0);
+                requireX87(xc.rm & 7);
+                const uint64_t rhs = st[xc.rm & 7];
+                out.ops.push_back(PcodeOp{
+                    POp::X87_COMPARE_CHECK, 0, st[0], rhs, 0,
+                    static_cast<uint16_t>(name.rfind("fu", 0) == 0
+                                              ? 0x0100 : 0)});
+                auto compare = [&](POp operation) {
+                    const uint64_t result = tmp(1);
+                    out.ops.push_back(PcodeOp{operation, result, st[0], rhs,
+                                              0, 80});
+                    return result;
+                };
+                const uint64_t unordered = compare(POp::FLOAT_NAN);
+                const uint64_t less = compare(POp::FLOAT_LESS);
+                const uint64_t equal = compare(POp::FLOAT_EQUAL);
+                writeFlag("CF", emit2(POp::INT_OR, unordered, less, 1));
+                writeFlag("PF", unordered);
+                writeFlag("ZF", emit2(POp::INT_OR, unordered, equal, 1));
+                const uint64_t zero = constVarnode(out, 0, 1);
+                writeFlag("OF", zero); writeFlag("SF", zero);
+                writeFlag("AF", zero);
+                if (name == "fcomip" || name == "fucomip") popX87();
+                x86Handled = true;
+            } else {
+                POp operation = POp::UNIMPLEMENTED;
+                if (name == "fadd" || name == "fiadd" || name == "faddp")
+                    operation = POp::FLOAT_ADD;
+                else if (name == "fmul" || name == "fimul" || name == "fmulp")
+                    operation = POp::FLOAT_MULT;
+                else if (name == "fsub" || name == "fisub" ||
+                         name == "fsubp" || name == "fsubrp")
+                    operation = POp::FLOAT_SUB;
+                else if (name == "fsubr" || name == "fisubr")
+                    operation = POp::FLOAT_SUB;
+                else if (name == "fdiv" || name == "fidiv" ||
+                         name == "fdivp" || name == "fdivrp")
+                    operation = POp::FLOAT_DIV;
+                else if (name == "fdivr" || name == "fidivr")
+                    operation = POp::FLOAT_DIV;
+                if (operation != POp::UNIMPLEMENTED) {
+                    requireX87(0);
+                    uint64_t rhs = st[xc.rm & 7];
+                    if (!(out.named.count("dst") && isMemory("dst")))
+                        requireX87(xc.rm & 7);
+                    if (out.named.count("dst") && isMemory("dst")) {
+                        if (name.size() > 1 && name[1] == 'i') {
+                            const int integerSize = primary == 0xDE ? 2 : 4;
+                            const uint64_t integer = loadValue(out.named["dst"], integerSize);
+                            rhs = tmp(10);
+                            out.ops.push_back(PcodeOp{POp::FLOAT_INT2FLOAT, rhs,
+                                                      integer, 0, 0, 80});
+                        } else {
+                            rhs = loadValue(out.named["dst"], memoryFloatBits / 8);
+                            rhs = convertFloat(rhs, memoryFloatBits, 80);
+                        }
+                    }
+                    const bool reverse = name == "fsubr" || name == "fisubr" ||
+                                         name == "fdivr" || name == "fidivr" ||
+                                         name == "fsubrp" || name == "fdivrp";
+                    const bool popArithmetic = xc.mod == 3 && primary == 0xDE;
+                    const bool registerDestination = xc.mod == 3 &&
+                                                     (primary == 0xDC ||
+                                                      popArithmetic);
+                    const uint64_t destination = registerDestination
+                                                     ? st[xc.rm & 7] : st[0];
+                    const uint64_t lhs = registerDestination ? destination : st[0];
+                    const uint64_t other = registerDestination ? st[0] : rhs;
+                    const uint64_t result = tmp(10);
+                    out.ops.push_back(PcodeOp{operation, result,
+                                              reverse ? other : lhs,
+                                              reverse ? lhs : other, 0, 80});
+                    out.ops.push_back(PcodeOp{POp::COPY, destination, result, 0, 0});
+                    tagX87(registerDestination ? (xc.rm & 7) : 0, result);
+                    if (popArithmetic) popX87();
+                    x86Handled = true;
+                }
+            }
+        }
+
+        if (!x86Handled && (name == "pmovmskb" || name == "vpmovmskb" ||
+                            name == "movmskps" || name == "movmskpd") &&
+            out.named.count("dst") && out.named.count("src")) {
+            const int laneBits = (name == "movmskps") ? 32
+                                 : (name == "movmskpd") ? 64 : 8;
+            out.ops.push_back(PcodeOp{
+                POp::SIMD_MOVEMASK, out.named["dst"], out.named["src"],
+                0, 0, static_cast<uint16_t>(laneBits)});
+            x86Handled = true;
+        }
+
+        // Legacy MOVSS/MOVSD replace only the low scalar lane and preserve
+        // the remaining destination XMM bits. Store encodings use the
+        // opposite ModRM direction from loads.
+        if (!x86Handled && (name == "movss" || name == "movsd") &&
+            readByte(0) == 0x0F && out.named.count("dst") &&
+            out.named.count("src")) {
+            const int laneBits = name == "movss" ? 32 : 64;
+            const int laneBytes = laneBits / 8;
+            const uint64_t dstId = out.named["dst"];
+            const uint64_t srcId = out.named["src"];
+            const uint64_t zero = constVarnode(out, 0, 1);
+            if (isMemory("dst")) {
+                uint64_t low = tmp(laneBytes);
+                out.ops.push_back(PcodeOp{POp::SIMD_EXTRACT, low, srcId,
+                                          zero, 0,
+                                          static_cast<uint16_t>(laneBits)});
+                out.ops.push_back(PcodeOp{POp::STORE, 0, dstId, 0, low});
+            } else {
+                const uint64_t lane = isMemory("src")
+                                          ? loadValue(srcId, laneBytes) : srcId;
+                const uint64_t result = tmp(16);
+                out.ops.push_back(PcodeOp{POp::SIMD_INSERT, result, dstId,
+                                          lane, zero,
+                                          static_cast<uint16_t>(laneBits)});
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+            }
+            x86Handled = true;
+        }
+
+        // MOVQ transfers a low qword between scalar/memory and XMM forms.
+        // XMM destinations are zero-filled above bit 63, including VEX forms.
+        if (!x86Handled && (name == "movq" || name == "vmovq") &&
+            out.named.count("dst") && out.named.count("src")) {
+            const uint64_t dstId = out.named["dst"];
+            const uint64_t srcId = out.named["src"];
+            const Varnode* dstNode = out.find(dstId);
+            const Varnode* srcNode = out.find(srcId);
+            const bool vectorDestination = dstNode && dstNode->size > 8;
+            const bool vectorSource = srcNode && srcNode->size > 8;
+            uint64_t low = srcId;
+            if (isMemory("src")) {
+                low = loadValue(srcId, 8);
+            } else if (vectorSource) {
+                low = tmp(8);
+                out.ops.push_back(PcodeOp{
+                    POp::SIMD_EXTRACT, low, srcId,
+                    constVarnode(out, 0, 1), 0, 64});
+            }
+            if (vectorDestination) {
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, low, 0, 0});
+            } else if (isMemory("dst")) {
+                out.ops.push_back(PcodeOp{POp::STORE, 0, dstId, 0, low});
+            } else {
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, low, 0, 0});
+            }
+            x86Handled = true;
+        }
+
+        // MOVD transfers exactly one dword between a GPR/memory operand and
+        // the low XMM lane.  A vector destination is zero-filled above bit
+        // 31; a scalar destination receives only the extracted low dword.
+        if (!x86Handled && (name == "movd" || name == "vmovd") &&
+            out.named.count("dst") && out.named.count("src")) {
+            const uint64_t dstId = out.named["dst"];
+            const uint64_t srcId = out.named["src"];
+            const Varnode* dstNode = out.find(dstId);
+            const bool vectorDestination = dstNode && dstNode->size > 8;
+            if (vectorDestination) {
+                const uint64_t value = isMemory("src")
+                                           ? loadValue(srcId, 4) : srcId;
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, value, 0, 0});
+            } else {
+                const uint64_t low = tmp(4);
+                const uint64_t zero = constVarnode(out, 0, 1);
+                out.ops.push_back(PcodeOp{POp::SIMD_EXTRACT, low, srcId,
+                                          zero, 0, 32});
+                if (isMemory("dst"))
+                    out.ops.push_back(PcodeOp{POp::STORE, 0, dstId, 0, low});
+                else
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, low, 0, 0});
+            }
+            x86Handled = true;
+        }
+
+        if (!x86Handled && out.named.count("dst") && out.named.count("imm")) {
+            std::string insertName = name;
+            if (!insertName.empty() && insertName[0] == 'v')
+                insertName.erase(insertName.begin());
+            const int laneBits = insertName == "pinsrb" ? 8
+                               : insertName == "pinsrw" ? 16
+                               : insertName == "pinsrd" ? 32
+                               : insertName == "pinsrq" ? 64 : 0;
+            const std::string sourceOperand = name[0] == 'v' ? "src2" : "src";
+            if (laneBits && out.named.count(sourceOperand)) {
+                const uint64_t dstId = out.named["dst"];
+                const Varnode* dstNode = out.find(dstId);
+                const int size = dstNode && dstNode->size > 8
+                                     ? dstNode->size : 16;
+                const uint64_t base = name[0] == 'v' && out.named.count("src1")
+                                          ? out.named["src1"] : dstId;
+                const uint64_t lane = isMemory(sourceOperand)
+                                          ? loadValue(out.named[sourceOperand],
+                                                      laneBits / 8)
+                                          : out.named[sourceOperand];
+                const uint64_t result = tmp(size);
+                out.ops.push_back(PcodeOp{
+                    POp::SIMD_INSERT, result, base, lane, out.named["imm"],
+                    static_cast<uint16_t>(laneBits)});
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                x86Handled = true;
+            }
+        }
+
+        if (!x86Handled &&
+            (name == "movlps" || name == "movlpd" ||
+             name == "movhps" || name == "movhpd") &&
+            out.named.count("dst") && out.named.count("src")) {
+            const bool high = name[3] == 'h';
+            const uint64_t index = constVarnode(out, high ? 1 : 0, 1);
+            if (isMemory("src")) {
+                const uint64_t lane = loadValue(out.named["src"], 8);
+                const uint64_t result = tmp(16);
+                out.ops.push_back(PcodeOp{POp::SIMD_INSERT, result,
+                                          out.named["dst"], lane, index, 64});
+                out.ops.push_back(PcodeOp{POp::COPY, out.named["dst"],
+                                          result, 0, 0});
+            } else if (isMemory("dst")) {
+                const uint64_t lane = tmp(8);
+                out.ops.push_back(PcodeOp{POp::SIMD_EXTRACT, lane,
+                                          out.named["src"], index, 0, 64});
+                out.ops.push_back(PcodeOp{POp::STORE, 0, out.named["dst"],
+                                          0, lane});
+            }
+            x86Handled = true;
+        }
+
+        if (!x86Handled && (name == "movhlps" || name == "movlhps") &&
+            out.named.count("dst") && out.named.count("src")) {
+            const bool highToLow = name == "movhlps";
+            const uint64_t sourceIndex = constVarnode(out, highToLow ? 1 : 0, 1);
+            const uint64_t destinationIndex = constVarnode(out, highToLow ? 0 : 1, 1);
+            const uint64_t lane = tmp(8);
+            out.ops.push_back(PcodeOp{POp::SIMD_EXTRACT, lane,
+                                      out.named["src"], sourceIndex, 0, 64});
+            const uint64_t result = tmp(16);
+            out.ops.push_back(PcodeOp{POp::SIMD_INSERT, result,
+                                      out.named["dst"], lane,
+                                      destinationIndex, 64});
+            out.ops.push_back(PcodeOp{POp::COPY, out.named["dst"], result, 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled &&
+            (name == "movntdq" || name == "movntps" ||
+             name == "movntpd" || name == "movnti") &&
+            out.named.count("dst") && out.named.count("src") &&
+            isMemory("dst")) {
+            const Varnode* sourceNode = out.find(out.named["src"]);
+            const int size = name == "movnti"
+                                 ? (sourceNode ? sourceNode->size : xc.opsz)
+                                 : (sourceNode && sourceNode->size > 8
+                                        ? sourceNode->size : 16);
+            const uint64_t value = resized(out.named["src"], size, false);
+            out.ops.push_back(PcodeOp{POp::STORE, 0, out.named["dst"], 0, value});
+            x86Handled = true;
+        }
+
+        if (!x86Handled && (name == "vzeroupper" || name == "vzeroall")) {
+            const int size = 32;
+            const uint64_t zero = constVarnode(out, 0, size);
+            for (int index = 0; index < 16; ++index) {
+                const uint64_t reg = x86RegVarnode(index, size);
+                out.ops.push_back(PcodeOp{
+                    name == "vzeroall" ? POp::COPY : POp::SIMD_ZERO_UPPER,
+                    reg, name == "vzeroall" ? zero : reg, 0, 0});
+            }
+            x86Handled = true;
+        }
+
+        if (!x86Handled && name == "vinsertf128" &&
+            out.named.count("dst") && out.named.count("src1") &&
+            out.named.count("src2") && out.named.count("imm")) {
+            const uint64_t lane = isMemory("src2")
+                                      ? loadValue(out.named["src2"], 16)
+                                      : out.named["src2"];
+            const uint64_t result = tmp(32);
+            out.ops.push_back(PcodeOp{POp::SIMD_INSERT, result,
+                                      out.named["src1"], lane,
+                                      out.named["imm"], 128});
+            out.ops.push_back(PcodeOp{POp::COPY, out.named["dst"], result, 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled && name == "vperm2f128" &&
+            out.named.count("dst") && out.named.count("src1") &&
+            out.named.count("src2") && out.named.count("imm")) {
+            const uint64_t source2 = isMemory("src2")
+                                         ? loadValue(out.named["src2"], 32)
+                                         : out.named["src2"];
+            const uint64_t result = tmp(32);
+            out.ops.push_back(PcodeOp{POp::SIMD_PERMUTE128, result,
+                                      out.named["src1"], source2,
+                                      out.named["imm"]});
+            out.ops.push_back(PcodeOp{POp::COPY, out.named["dst"], result, 0, 0});
+            x86Handled = true;
+        }
+
         // Full-width aligned/unaligned SIMD moves.  Store encodings reverse
         // the ModRM roles relative to load encodings, so use the opcode rather
         // than the constructor's display operand names.
+        if (!x86Handled && out.named.count("dst") && out.named.count("src") &&
+            out.named.count("imm")) {
+            std::string extractName = name;
+            if (!extractName.empty() && extractName[0] == 'v')
+                extractName.erase(extractName.begin());
+            int laneBits = extractName == "pextrb" ? 8
+                           : extractName == "pextrw" ? 16
+                           : (extractName == "pextrd" || extractName == "extractps") ? 32
+                           : extractName == "pextrq" ? 64
+                           : (extractName == "extractf128" ||
+                              extractName == "extracti32x4") ? 128 : 0;
+            if (laneBits) {
+                const int laneSize = laneBits / 8;
+                const uint64_t extracted = tmp(laneSize);
+                out.ops.push_back(PcodeOp{
+                    POp::SIMD_EXTRACT, extracted, out.named["src"],
+                    out.named["imm"], 0, static_cast<uint16_t>(laneBits)});
+                if (isMemory("dst"))
+                    out.ops.push_back(PcodeOp{POp::STORE, 0, out.named["dst"],
+                                              0, extracted});
+                else
+                    out.ops.push_back(PcodeOp{POp::COPY, out.named["dst"],
+                                              extracted, 0, 0});
+                x86Handled = true;
+            }
+        }
+
         if (!x86Handled && out.named.count("dst") && out.named.count("src")) {
             std::string moveName = name;
             if (!moveName.empty() && moveName[0] == 'v') moveName.erase(moveName.begin());
             const std::set<std::string> vectorMoves = {
-                "movups", "movupd", "movaps", "movapd", "movdqa", "movdqu"
+                "movups", "movupd", "movaps", "movapd", "movdqa", "movdqu",
+                "movdqa32", "movdqa64", "movdqu32", "movdqu64"
             };
             if (vectorMoves.count(moveName)) {
                 const int actualOpcode = (xc.vex || xc.evex) ? readByte(0) : readByte(1);
@@ -2375,17 +3596,93 @@ bool SleighEngine::disassemble(
                 const Varnode* srcNode = out.find(srcId);
                 const int size = dstNode && dstNode->size > 8 ? dstNode->size
                                  : srcNode && srcNode->size > 8 ? srcNode->size : 16;
+                const int laneBits = moveName.size() >= 2 &&
+                                             moveName.substr(moveName.size() - 2) == "64"
+                                         ? 64 : 32;
                 if (storeEncoding) {
-                    if (isMemory("src"))
-                        out.ops.push_back(PcodeOp{POp::STORE, 0, srcId, 0, dstId});
-                    else
+                    if (isMemory("dst") || isMemory("src")) {
+                        const uint64_t address = isMemory("dst") ? dstId : srcId;
+                        uint64_t value = isMemory("dst") ? srcId : dstId;
+                        if (xc.evex && xc.evexAaa != 0) {
+                            const uint64_t previous = loadValue(address, size);
+                            value = applyEvexStoreMask(value, previous, size, laneBits);
+                        }
+                        out.ops.push_back(PcodeOp{POp::STORE, 0, address, 0, value});
+                    } else {
                         out.ops.push_back(PcodeOp{POp::COPY, srcId, dstId, 0, 0});
+                    }
                 } else {
-                    const uint64_t value = isMemory("src") ? loadValue(srcId, size) : srcId;
+                    uint64_t value = isMemory("src") ? loadValue(srcId, size) : srcId;
+                    value = applyEvexMask(value, dstId, size, laneBits);
                     out.ops.push_back(PcodeOp{POp::COPY, dstId, value, 0, 0});
                 }
                 x86Handled = true;
             }
+        }
+
+        if (!x86Handled && (name == "haddps" || name == "haddpd" ||
+                            name == "hsubps" || name == "hsubpd") &&
+            out.named.count("dst") && out.named.count("src")) {
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int size = dstNode && dstNode->size > 8 ? dstNode->size : 16;
+            const bool f64 = name.size() >= 2 &&
+                             name.substr(name.size() - 2) == "pd";
+            const bool subtract = name.rfind("hsub", 0) == 0;
+            const uint64_t source = isMemory("src")
+                                        ? loadValue(out.named["src"], size)
+                                        : out.named["src"];
+            const uint64_t result = tmp(size);
+            out.ops.push_back(PcodeOp{
+                POp::SIMD_HORIZONTAL, result, dstId, source, 0,
+                static_cast<uint16_t>((f64 ? 64 : 32) |
+                                      (subtract ? 0x0100 : 0))});
+            out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled && (name == "cmpps" || name == "cmppd" ||
+                            name == "cmpss" || name == "cmpsd") &&
+            readByte(0) == 0x0F && out.named.count("dst") &&
+            out.named.count("src") && out.named.count("imm")) {
+            const bool f32 = name == "cmpps" || name == "cmpss";
+            const bool scalar = name == "cmpss" || name == "cmpsd";
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int size = dstNode && dstNode->size > 8 ? dstNode->size : 16;
+            const uint64_t source = isMemory("src")
+                                        ? loadValue(out.named["src"],
+                                                    scalar ? (f32 ? 4 : 8) : size)
+                                        : out.named["src"];
+            const uint64_t result = tmp(size);
+            out.ops.push_back(PcodeOp{
+                POp::SIMD_FP_COMPARE, result, dstId, source, out.named["imm"],
+                static_cast<uint16_t>((f32 ? 32 : 64) |
+                                      (scalar ? 0x8000 : 0))});
+            out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled && (name == "addsubps" || name == "addsubpd" ||
+                            name == "blendps" || name == "blendpd") &&
+            out.named.count("dst") && out.named.count("src")) {
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int size = dstNode && dstNode->size > 8 ? dstNode->size : 16;
+            const int laneBits = (name.size() >= 2 &&
+                                  name.substr(name.size() - 2) == "pd") ? 64 : 32;
+            const uint64_t source = isMemory("src")
+                                        ? loadValue(out.named["src"], size)
+                                        : out.named["src"];
+            const uint64_t result = tmp(size);
+            const bool blend = name.rfind("blend", 0) == 0;
+            out.ops.push_back(PcodeOp{
+                blend ? POp::SIMD_BLEND : POp::SIMD_ADDSUB,
+                result, dstId, source,
+                blend && out.named.count("imm") ? out.named["imm"] : 0,
+                static_cast<uint16_t>(laneBits)});
+            out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+            x86Handled = true;
         }
 
         // Packed bitwise and wrapping integer lane operations.
@@ -2395,14 +3692,23 @@ bool SleighEngine::disassemble(
             if (vexVector) vectorName.erase(vectorName.begin());
             POp vectorOp = POp::UNIMPLEMENTED;
             int laneBits = 0;
+            bool invertLeft = false;
             if (vectorName == "andps" || vectorName == "andpd" ||
-                vectorName == "pand" || vectorName == "pandd" || vectorName == "pandq")
+                vectorName == "pand" || vectorName == "pandd" ||
+                vectorName == "pandq")
                 vectorOp = POp::INT_AND;
+            else if (vectorName == "andnps" || vectorName == "andnpd" ||
+                     vectorName == "pandn") {
+                vectorOp = POp::INT_AND;
+                invertLeft = true;
+            }
             else if (vectorName == "orps" || vectorName == "orpd" ||
-                     vectorName == "por")
+                     vectorName == "por" || vectorName == "pord" ||
+                     vectorName == "porq")
                 vectorOp = POp::INT_OR;
             else if (vectorName == "xorps" || vectorName == "xorpd" ||
-                     vectorName == "pxor")
+                     vectorName == "pxor" || vectorName == "pxord" ||
+                     vectorName == "pxorq")
                 vectorOp = POp::INT_XOR;
             else if (vectorName == "paddb") { vectorOp = POp::INT_ADD; laneBits = 8; }
             else if (vectorName == "paddw") { vectorOp = POp::INT_ADD; laneBits = 16; }
@@ -2428,9 +3734,327 @@ bool SleighEngine::disassemble(
                                          : out.named["src"];
                 }
                 if (b) {
-                    const uint64_t result = tmp(size);
+                    if (invertLeft) {
+                        const uint64_t inverted = tmp(size);
+                        out.ops.push_back(PcodeOp{POp::INT_NOT, inverted,
+                                                  a, 0, 0});
+                        a = inverted;
+                    }
+                    uint64_t result = tmp(size);
                     out.ops.push_back(PcodeOp{vectorOp, result, a, b, 0,
                                               static_cast<uint16_t>(laneBits)});
+                    result = applyEvexMask(result, dstId, size,
+                                           laneBits ? laneBits : 8);
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+        }
+
+        if (!x86Handled && out.named.count("dst")) {
+            std::string operationName = name;
+            const bool vectorForm = !operationName.empty() &&
+                                    operationName[0] == 'v';
+            if (vectorForm) operationName.erase(operationName.begin());
+            const bool average = operationName == "pavgb" ||
+                                 operationName == "pavgw";
+            const bool minmax = operationName == "pminub" ||
+                                operationName == "pminsw" ||
+                                operationName == "pmaxub" ||
+                                operationName == "pmaxsw";
+            const bool sad = operationName == "psadbw";
+            if (average || minmax || sad) {
+                const uint64_t dstId = out.named["dst"];
+                const Varnode* dstNode = out.find(dstId);
+                const int size = dstNode && dstNode->size > 8
+                                     ? dstNode->size : 16;
+                uint64_t left = dstId, right = 0;
+                if (vectorForm && out.named.count("src1") &&
+                    out.named.count("src2")) {
+                    left = out.named["src1"];
+                    right = isMemory("src2")
+                                ? loadValue(out.named["src2"], size)
+                                : out.named["src2"];
+                } else if (out.named.count("src")) {
+                    right = isMemory("src")
+                                ? loadValue(out.named["src"], size)
+                                : out.named["src"];
+                }
+                if (right) {
+                    const int laneBits = operationName.back() == 'w' ? 16 : 8;
+                    const bool signedValues = operationName == "pminsw" ||
+                                              operationName == "pmaxsw";
+                    const bool maximum = operationName == "pmaxub" ||
+                                         operationName == "pmaxsw";
+                    const uint16_t aux = static_cast<uint16_t>(
+                        laneBits | (signedValues ? 0x0100 : 0) |
+                        (maximum ? 0x0200 : 0));
+                    const POp operation = average ? POp::SIMD_AVERAGE
+                                          : minmax ? POp::SIMD_MINMAX
+                                                   : POp::SIMD_SAD;
+                    uint64_t result = tmp(size);
+                    out.ops.push_back(PcodeOp{operation, result, left, right,
+                                              0, aux});
+                    result = applyEvexMask(result, dstId, size,
+                                           sad ? 64 : laneBits);
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+        }
+
+        // AVX2/AVX-512 VSIB gather/scatter.  The SIB index names a vector
+        // register rather than a GPR; base/displacement remain scalar and
+        // every active k-mask lane performs an independently faultable access.
+        const bool gather = name == "vpgatherdd" || name == "vpgatherdq" ||
+                            name == "vpgatherqd" || name == "vpgatherqq";
+        const bool scatter = name == "vpscatterdd" || name == "vpscatterdq" ||
+                             name == "vpscatterqd" || name == "vpscatterqq";
+        if (!x86Handled && (gather || scatter) && xc.index >= 0) {
+            const std::string suffix = name.substr(name.size() - 2);
+            const int laneBits = suffix[1] == 'q' ? 64 : 32;
+            const bool index64 = suffix[0] == 'q';
+            const std::string vectorOperand = gather ? "dst" : "src";
+            if (out.named.count(vectorOperand)) {
+                const uint64_t vectorId = out.named[vectorOperand];
+                const Varnode* vectorNode = out.find(vectorId);
+                const int vectorSize = vectorNode && vectorNode->size
+                                           ? vectorNode->size : 64;
+                uint64_t base = 0;
+                if (xc.ripRel) {
+                    base = constVarnode(out,
+                                        addr + insnSize +
+                                            static_cast<uint64_t>(xc.disp), 8);
+                } else {
+                    base = xc.base >= 0 ? x86RegVarnode(xc.base, 8)
+                                        : constVarnode(out, 0, 8);
+                    if (xc.disp) {
+                        const uint64_t adjusted = tmp(8);
+                        out.ops.push_back(PcodeOp{
+                            POp::INT_ADD, adjusted, base,
+                            constVarnode(out, static_cast<uint64_t>(xc.disp), 8),
+                            0});
+                        base = adjusted;
+                    }
+                }
+                const int vectorIndex = xc.index | xc.evexVprime;
+                const uint64_t indices = x86RegVarnode(vectorIndex, vectorSize);
+                unsigned scaleShift = 0;
+                while ((1U << scaleShift) < static_cast<unsigned>(xc.scale))
+                    ++scaleShift;
+                const uint16_t aux = static_cast<uint16_t>(
+                    laneBits | (index64 ? 0x0100 : 0) |
+                    (scaleShift << 9) | (xc.evexAaa << 11) |
+                    (xc.evexZ ? 0x4000 : 0));
+                if (gather)
+                    out.ops.push_back(PcodeOp{POp::SIMD_GATHER, vectorId,
+                                              base, indices, 0, aux});
+                else
+                    out.ops.push_back(PcodeOp{POp::SIMD_SCATTER, 0, base,
+                                              indices, vectorId, aux});
+                x86Handled = true;
+            }
+        }
+
+        // AVX-512 comparisons produce compact k-register results.  The imm8
+        // predicate implements EQ/LT/LE/FALSE/NE/NLT/NLE/TRUE, and an EVEX
+        // writemask clears disabled result bits as required for k outputs.
+        if (!x86Handled && (name == "vpcmpd" || name == "vpcmpq" ||
+                            name == "vpcmpud" || name == "vpcmpuq") &&
+            out.named.count("dst") && out.named.count("src1") &&
+            out.named.count("src2") && out.named.count("imm")) {
+            const int laneBits = (name == "vpcmpq" || name == "vpcmpuq")
+                                     ? 64 : 32;
+            const Varnode* sourceNode = out.find(out.named["src1"]);
+            const int size = sourceNode && sourceNode->size
+                                 ? sourceNode->size : 64;
+            const uint64_t rhs = isMemory("src2")
+                                     ? loadValue(out.named["src2"], size)
+                                     : out.named["src2"];
+            uint64_t result = tmp(8);
+            const bool signedCompare = name == "vpcmpd" || name == "vpcmpq";
+            out.ops.push_back(PcodeOp{
+                POp::SIMD_COMPARE_MASK, result, out.named["src1"], rhs,
+                out.named["imm"],
+                static_cast<uint16_t>(laneBits |
+                                      (signedCompare ? 0x0100 : 0))});
+            if (xc.evexAaa != 0) {
+                Varnode* writemask = makeVarnode(
+                    out, Varnode::REGISTER,
+                    8192 + static_cast<uint64_t>(xc.evexAaa) * 8, 8,
+                    "k" + std::to_string(xc.evexAaa));
+                result = emit2(POp::INT_AND, result, writemask->id, 8);
+            }
+            out.ops.push_back(PcodeOp{POp::COPY, out.named["dst"], result, 0, 0});
+            x86Handled = true;
+        }
+
+        if (!x86Handled && (name == "gf2p8mulb" || name == "vgf2p8mulb") &&
+            out.named.count("dst")) {
+            const bool vectorForm = name[0] == 'v';
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int size = dstNode && dstNode->size > 8 ? dstNode->size : 16;
+            uint64_t lhs = dstId, rhs = 0;
+            if (vectorForm && out.named.count("src1") &&
+                out.named.count("src2")) {
+                lhs = out.named["src1"];
+                rhs = isMemory("src2") ? loadValue(out.named["src2"], size)
+                                        : out.named["src2"];
+            } else if (out.named.count("src")) {
+                rhs = isMemory("src") ? loadValue(out.named["src"], size)
+                                       : out.named["src"];
+            }
+            if (rhs) {
+                uint64_t result = tmp(size);
+                out.ops.push_back(PcodeOp{POp::GF2P8_MUL, result, lhs, rhs, 0});
+                if (vectorForm) result = applyEvexMask(result, dstId, size, 8);
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                x86Handled = true;
+            }
+        }
+
+        // GFNI affine transformations select one 8x8 matrix per qword.  The
+        // inverse form first computes multiplicative inverse in GF(2^8),
+        // including the architecturally defined inverse(0) == 0 case.
+        if (!x86Handled &&
+            (name == "gf2p8affineqb" || name == "vgf2p8affineqb" ||
+             name == "gf2p8affineinvqb" || name == "vgf2p8affineinvqb") &&
+            out.named.count("dst") && out.named.count("imm")) {
+            const bool vectorForm = name[0] == 'v';
+            const bool inverse = name.find("affineinv") != std::string::npos;
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int size = dstNode && dstNode->size > 8 ? dstNode->size : 16;
+            uint64_t source = dstId, matrix = 0;
+            if (vectorForm && out.named.count("src1") &&
+                out.named.count("src2")) {
+                source = out.named["src1"];
+                matrix = isMemory("src2")
+                             ? loadValue(out.named["src2"], size)
+                             : out.named["src2"];
+            } else if (out.named.count("src")) {
+                matrix = isMemory("src") ? loadValue(out.named["src"], size)
+                                           : out.named["src"];
+            }
+            if (matrix) {
+                uint64_t result = tmp(size);
+                out.ops.push_back(PcodeOp{
+                    inverse ? POp::GF2P8_AFFINE_INV : POp::GF2P8_AFFINE,
+                    result, source, matrix, out.named["imm"]});
+                if (vectorForm) result = applyEvexMask(result, dstId, size, 8);
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                x86Handled = true;
+            }
+        }
+
+        // PCLMULQDQ/VPCLMULQDQ perform independent 64x64 carry-less
+        // products in each 128-bit lane; imm8 bits 0 and 4 select operands.
+        if (!x86Handled &&
+            (name == "pclmulqdq" || name == "vpclmulqdq" ||
+             name == "vclmulqdq" || name == "vclmulhqhqdq" ||
+             name == "vclmullqlqdq") && out.named.count("dst")) {
+            const bool vectorForm = name[0] == 'v';
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int size = dstNode && dstNode->size > 8 ? dstNode->size : 16;
+            uint64_t lhs = dstId, rhs = 0;
+            if (vectorForm && out.named.count("src1") &&
+                out.named.count("src2")) {
+                lhs = out.named["src1"];
+                rhs = isMemory("src2") ? loadValue(out.named["src2"], size)
+                                        : out.named["src2"];
+            } else if (out.named.count("src")) {
+                rhs = isMemory("src") ? loadValue(out.named["src"], size)
+                                       : out.named["src"];
+            }
+            uint64_t immediate = out.named.count("imm") ? out.named["imm"] : 0;
+            if (!immediate)
+                immediate = constVarnode(out,
+                    name == "vclmulhqhqdq" ? 0x11 : 0x00, 1);
+            if (rhs) {
+                uint64_t result = tmp(size);
+                out.ops.push_back(PcodeOp{POp::CARRYLESS_MULT, result,
+                                          lhs, rhs, immediate});
+                if (xc.evex) result = applyEvexMask(result, dstId, size, 128);
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                x86Handled = true;
+            }
+        }
+
+        // Intel SHA extensions are 128-bit non-SIMD operations.  RNDS2 has
+        // an architecturally implicit third source in XMM0.
+        if (!x86Handled && name.rfind("sha", 0) == 0 &&
+            out.named.count("dst") && out.named.count("src")) {
+            POp operation = name == "sha1msg1" ? POp::SHA1_MSG1
+                              : name == "sha1msg2" ? POp::SHA1_MSG2
+                              : name == "sha1nexte" ? POp::SHA1_NEXTE
+                              : name == "sha1rnds4" ? POp::SHA1_RNDS4
+                              : name == "sha256msg1" ? POp::SHA256_MSG1
+                              : name == "sha256msg2" ? POp::SHA256_MSG2
+                              : name == "sha256rnds2" ? POp::SHA256_RNDS2
+                                                       : POp::UNIMPLEMENTED;
+            if (operation != POp::UNIMPLEMENTED) {
+                const uint64_t dstId = out.named["dst"];
+                const uint64_t source = isMemory("src")
+                    ? loadValue(out.named["src"], 16) : out.named["src"];
+                uint64_t third = 0;
+                if (operation == POp::SHA1_RNDS4)
+                    third = out.named.count("imm") ? out.named["imm"] : 0;
+                else if (operation == POp::SHA256_RNDS2)
+                    third = x86RegVarnode(0, 16);
+                uint64_t result = tmp(16);
+                out.ops.push_back(PcodeOp{operation, result, dstId, source, third});
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                x86Handled = true;
+            }
+        }
+
+        // AES-NI and VAES use the same exact 128-bit round primitive; VAES
+        // simply applies it independently to every 128-bit vector lane.
+        if (!x86Handled && out.named.count("dst")) {
+            std::string cryptoName = name;
+            const bool vectorForm = !cryptoName.empty() && cryptoName[0] == 'v';
+            if (vectorForm) cryptoName.erase(cryptoName.begin());
+            const bool encrypt = cryptoName == "aesenc" ||
+                                 cryptoName == "aesenclast";
+            const bool decrypt = cryptoName == "aesdec" ||
+                                 cryptoName == "aesdeclast";
+            const bool inverseMix = cryptoName == "aesimc";
+            const bool keygen = cryptoName == "aeskeygenassist";
+            if (encrypt || decrypt || inverseMix || keygen) {
+                const uint64_t dstId = out.named["dst"];
+                const Varnode* dstNode = out.find(dstId);
+                const int size = dstNode && dstNode->size > 8
+                                     ? dstNode->size : 16;
+                uint64_t first = dstId, second = 0;
+                POp operation = encrypt ? POp::AES_ENC
+                                   : decrypt ? POp::AES_DEC
+                                   : inverseMix ? POp::AES_IMC
+                                                : POp::AES_KEYGEN;
+                if (vectorForm && out.named.count("src1") &&
+                    out.named.count("src2")) {
+                    first = out.named["src1"];
+                    second = isMemory("src2")
+                                 ? loadValue(out.named["src2"], size)
+                                 : out.named["src2"];
+                } else if (out.named.count("src")) {
+                    const uint64_t source = isMemory("src")
+                                                ? loadValue(out.named["src"], size)
+                                                : out.named["src"];
+                    if (inverseMix || keygen) first = source;
+                    else second = source;
+                }
+                if (keygen && out.named.count("imm")) second = out.named["imm"];
+                if (first && (second || inverseMix)) {
+                    uint64_t result = tmp(size);
+                    const bool last = cryptoName == "aesenclast" ||
+                                      cryptoName == "aesdeclast";
+                    out.ops.push_back(PcodeOp{operation, result, first, second,
+                                              0,
+                                              static_cast<uint16_t>(last ? 1 : 0)});
+                    if (vectorForm)
+                        result = applyEvexMask(result, dstId, size, 128);
                     out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
                     x86Handled = true;
                 }
@@ -2440,6 +4064,601 @@ bool SleighEngine::disassemble(
         // Common scalar SSE conversion families.  Keeping these as typed
         // p-code operations preserves their signedness, IEEE width, rounding
         // mode (rounded vs CVTT truncation), and legacy upper-lane behavior.
+        if (!x86Handled && out.named.count("dst")) {
+            std::string laneName = name;
+            const bool vexVector = !laneName.empty() && laneName[0] == 'v';
+            if (vexVector) laneName.erase(laneName.begin());
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int vectorSize = dstNode && dstNode->size > 8
+                                       ? dstNode->size : 16;
+            auto binaryInputs = [&](uint64_t& lhs, uint64_t& rhs) {
+                lhs = dstId;
+                rhs = 0;
+                if (vexVector && out.named.count("src1") &&
+                    out.named.count("src2")) {
+                    lhs = out.named["src1"];
+                    rhs = isMemory("src2")
+                              ? loadValue(out.named["src2"], vectorSize)
+                              : out.named["src2"];
+                } else if (out.named.count("src")) {
+                    rhs = isMemory("src")
+                              ? loadValue(out.named["src"], vectorSize)
+                              : out.named["src"];
+                }
+                return rhs != 0;
+            };
+            if (!x86Handled && (laneName == "pabsb" ||
+                                laneName == "pabsw" ||
+                                laneName == "pabsd") &&
+                out.named.count("src")) {
+                const int absoluteBits = laneName.back() == 'b' ? 8
+                                         : laneName.back() == 'w' ? 16 : 32;
+                const uint64_t source = isMemory("src")
+                                            ? loadValue(out.named["src"], vectorSize)
+                                            : out.named["src"];
+                uint64_t result = tmp(vectorSize);
+                out.ops.push_back(PcodeOp{POp::SIMD_ABS, result, source, 0, 0,
+                                          static_cast<uint16_t>(absoluteBits)});
+                result = applyEvexMask(result, dstId, vectorSize, absoluteBits);
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                x86Handled = true;
+            }
+
+            if (!x86Handled &&
+                (laneName == "phaddw" || laneName == "phaddd" ||
+                 laneName == "phaddsw" || laneName == "phsubw" ||
+                 laneName == "phsubd" || laneName == "phsubsw")) {
+                const bool dword = laneName.back() == 'd';
+                const bool subtract = laneName.rfind("phsub", 0) == 0;
+                const bool saturate = laneName.find("sw") != std::string::npos;
+                const int horizontalBits = dword ? 32 : 16;
+                uint64_t lhs = 0, rhs = 0;
+                if (binaryInputs(lhs, rhs)) {
+                    uint64_t result = tmp(vectorSize);
+                    out.ops.push_back(PcodeOp{
+                        POp::SIMD_INT_HORIZONTAL, result, lhs, rhs, 0,
+                        static_cast<uint16_t>(horizontalBits |
+                                              (subtract ? 0x0100 : 0) |
+                                              (saturate ? 0x0200 : 0))});
+                    result = applyEvexMask(result, dstId, vectorSize,
+                                           horizontalBits);
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+
+            if (!x86Handled &&
+                (laneName == "pmaddwd" || laneName == "pmaddubsw" ||
+                 laneName == "pmuldq" || laneName == "pmulhrsw")) {
+                const unsigned mode = laneName == "pmaddwd" ? 1
+                                      : laneName == "pmaddubsw" ? 2
+                                      : laneName == "pmuldq" ? 3 : 4;
+                uint64_t lhs = 0, rhs = 0;
+                if (binaryInputs(lhs, rhs)) {
+                    uint64_t result = tmp(vectorSize);
+                    out.ops.push_back(PcodeOp{
+                        POp::SIMD_MULTIPLY, result, lhs, rhs, 0,
+                        static_cast<uint16_t>(mode << 8)});
+                    result = applyEvexMask(result, dstId, vectorSize,
+                                           mode == 3 ? 64 : mode <= 2 ?
+                                           (mode == 1 ? 32 : 16) : 16);
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+
+            if (!x86Handled && (laneName == "psignb" ||
+                                laneName == "psignw" ||
+                                laneName == "psignd")) {
+                const int signBits = laneName.back() == 'b' ? 8
+                                     : laneName.back() == 'w' ? 16 : 32;
+                uint64_t lhs = 0, rhs = 0;
+                if (binaryInputs(lhs, rhs)) {
+                    uint64_t result = tmp(vectorSize);
+                    out.ops.push_back(PcodeOp{POp::SIMD_SIGN, result,
+                                              lhs, rhs, 0,
+                                              static_cast<uint16_t>(signBits)});
+                    result = applyEvexMask(result, dstId, vectorSize, signBits);
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+
+            if (!x86Handled && laneName == "ptest") {
+                uint64_t lhs = 0, rhs = 0;
+                if (binaryInputs(lhs, rhs)) {
+                    const uint64_t zf = tmp(1), cf = tmp(1);
+                    out.ops.push_back(PcodeOp{POp::SIMD_TEST, zf, lhs, rhs, 0, 0});
+                    out.ops.push_back(PcodeOp{POp::SIMD_TEST, cf, lhs, rhs, 0, 1});
+                    writeFlag("ZF", zf);
+                    writeFlag("CF", cf);
+                    const uint64_t zero = constVarnode(out, 0, 1);
+                    writeFlag("OF", zero);
+                    writeFlag("SF", zero);
+                    writeFlag("AF", zero);
+                    writeFlag("PF", zero);
+                    x86Handled = true;
+                }
+            }
+
+            if (!x86Handled && (laneName == "movsldup" ||
+                                laneName == "movshdup" ||
+                                laneName == "movddup") &&
+                out.named.count("src")) {
+                const int duplicateBits = laneName == "movddup" ? 64 : 32;
+                const unsigned mode = laneName == "movsldup" ? 8
+                                      : laneName == "movshdup" ? 9 : 10;
+                const int memorySize = laneName == "movddup" ? 8 : vectorSize;
+                const uint64_t source = isMemory("src")
+                                            ? loadValue(out.named["src"], memorySize)
+                                            : out.named["src"];
+                uint64_t result = tmp(vectorSize);
+                out.ops.push_back(PcodeOp{
+                    POp::SIMD_SHUFFLE, result, source, 0, 0,
+                    static_cast<uint16_t>(duplicateBits | (mode << 8))});
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                x86Handled = true;
+            }
+
+            if (!x86Handled && (laneName == "pblendw" ||
+                                laneName == "palignr") &&
+                out.named.count("imm")) {
+                uint64_t lhs = 0, rhs = 0;
+                if (binaryInputs(lhs, rhs)) {
+                    uint64_t result = tmp(vectorSize);
+                    if (laneName == "pblendw") {
+                        out.ops.push_back(PcodeOp{POp::SIMD_BLEND, result,
+                                                  lhs, rhs, out.named["imm"], 16});
+                    } else {
+                        out.ops.push_back(PcodeOp{
+                            POp::SIMD_SHUFFLE, result, lhs, rhs,
+                            out.named["imm"],
+                            static_cast<uint16_t>(8 | (7 << 8))});
+                    }
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+            int laneBits = 0;
+            bool greater = false;
+            if (laneName.rfind("pcmpeq", 0) == 0 ||
+                laneName.rfind("pcmpgt", 0) == 0) {
+                greater = laneName.rfind("pcmpgt", 0) == 0;
+                const char suffix = laneName.back();
+                laneBits = suffix == 'b' ? 8 : suffix == 'w' ? 16
+                           : suffix == 'd' ? 32 : suffix == 'q' ? 64 : 0;
+            }
+            if (laneBits) {
+                uint64_t lhs = 0, rhs = 0;
+                if (binaryInputs(lhs, rhs)) {
+                    uint64_t result = tmp(vectorSize);
+                    const uint16_t aux = static_cast<uint16_t>(
+                        laneBits | (greater ? 0x0100 : 0) |
+                        (greater ? 0x0200 : 0));
+                    out.ops.push_back(PcodeOp{POp::SIMD_COMPARE, result,
+                                              lhs, rhs, 0, aux});
+                    result = applyEvexMask(result, dstId, vectorSize, laneBits);
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+
+            if (!x86Handled) {
+                const bool saturating = laneName == "paddsb" || laneName == "paddsw" ||
+                                        laneName == "paddusb" || laneName == "paddusw" ||
+                                        laneName == "psubsb" || laneName == "psubsw" ||
+                                        laneName == "psubusb" || laneName == "psubusw";
+                if (saturating) {
+                    const bool word = laneName.back() == 'w';
+                    const bool signedArithmetic = laneName.find("us") == std::string::npos;
+                    const bool subtract = laneName.rfind("psub", 0) == 0;
+                    laneBits = word ? 16 : 8;
+                    uint64_t lhs = 0, rhs = 0;
+                    if (binaryInputs(lhs, rhs)) {
+                        uint64_t result = tmp(vectorSize);
+                        const uint16_t aux = static_cast<uint16_t>(
+                            laneBits | (signedArithmetic ? 0x0100 : 0) |
+                            (subtract ? 0x0200 : 0));
+                        out.ops.push_back(PcodeOp{POp::SIMD_SATURATE, result,
+                                                  lhs, rhs, 0, aux});
+                        result = applyEvexMask(result, dstId, vectorSize, laneBits);
+                        out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                        x86Handled = true;
+                    }
+                }
+            }
+
+            if (!x86Handled && laneName.rfind("punpck", 0) == 0) {
+                const bool high = laneName.find("punpckh") == 0;
+                const std::string suffix = laneName.substr(7);
+                laneBits = suffix == "bw" ? 8 : suffix == "wd" ? 16
+                           : suffix == "dq" ? 32 : suffix == "qdq" ? 64 : 0;
+                uint64_t lhs = 0, rhs = 0;
+                if (laneBits && binaryInputs(lhs, rhs)) {
+                    uint64_t result = tmp(vectorSize);
+                    out.ops.push_back(PcodeOp{
+                        POp::SIMD_UNPACK, result, lhs, rhs, 0,
+                        static_cast<uint16_t>(laneBits | (high ? 0x8000 : 0))});
+                    result = applyEvexMask(result, dstId, vectorSize, laneBits);
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+
+            if (!x86Handled &&
+                (laneName == "unpcklps" || laneName == "unpckhps" ||
+                 laneName == "unpcklpd" || laneName == "unpckhpd")) {
+                const bool high = laneName.find("unpckh") == 0;
+                laneBits = laneName.size() >= 2 &&
+                           laneName.substr(laneName.size() - 2) == "pd" ? 64 : 32;
+                uint64_t lhs = 0, rhs = 0;
+                if (binaryInputs(lhs, rhs)) {
+                    uint64_t result = tmp(vectorSize);
+                    out.ops.push_back(PcodeOp{
+                        POp::SIMD_UNPACK, result, lhs, rhs, 0,
+                        static_cast<uint16_t>(laneBits |
+                                              (high ? 0x8000 : 0))});
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+
+            if (!x86Handled && (laneName == "packsswb" ||
+                                laneName == "packssdw" ||
+                                laneName == "packuswb" ||
+                                laneName == "packusdw")) {
+                laneBits = (laneName == "packssdw" || laneName == "packusdw")
+                               ? 32 : 16;
+                const bool unsignedDestination = laneName.rfind("packus", 0) == 0;
+                uint64_t lhs = 0, rhs = 0;
+                if (binaryInputs(lhs, rhs)) {
+                    uint64_t result = tmp(vectorSize);
+                    out.ops.push_back(PcodeOp{
+                        POp::SIMD_PACK, result, lhs, rhs, 0,
+                        static_cast<uint16_t>(laneBits |
+                                              (unsignedDestination ? 0x0100 : 0))});
+                    result = applyEvexMask(result, dstId, vectorSize, laneBits / 2);
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+
+            if (!x86Handled && laneName == "pshufb") {
+                uint64_t lhs = 0, selector = 0;
+                if (binaryInputs(lhs, selector)) {
+                    uint64_t result = tmp(vectorSize);
+                    out.ops.push_back(PcodeOp{POp::SIMD_SHUFFLE, result,
+                                              lhs, selector, 0, 0x0108});
+                    result = applyEvexMask(result, dstId, vectorSize, 8);
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+
+            if (!x86Handled && out.named.count("imm") &&
+                (laneName == "pshufd" || laneName == "pshuflw" ||
+                 laneName == "pshufhw" || laneName == "shufps" ||
+                 laneName == "shufpd")) {
+                const bool binary = laneName == "shufps" || laneName == "shufpd";
+                laneBits = laneName == "pshufd" ? 32
+                           : laneName == "shufps" ? 32
+                           : laneName == "shufpd" ? 64 : 16;
+                const unsigned mode = laneName == "pshufd" ? 2
+                                      : laneName == "pshuflw" ? 3
+                                      : laneName == "pshufhw" ? 4
+                                      : laneName == "shufps" ? 5 : 6;
+                uint64_t lhs = dstId;
+                uint64_t rhsOrImmediate = out.named["imm"];
+                uint64_t immediate = 0;
+                if (binary) {
+                    uint64_t rhs = 0;
+                    if (!binaryInputs(lhs, rhs)) rhs = 0;
+                    rhsOrImmediate = rhs;
+                    immediate = out.named["imm"];
+                } else if (out.named.count("src")) {
+                    lhs = isMemory("src")
+                              ? loadValue(out.named["src"], vectorSize)
+                              : out.named["src"];
+                } else if (vexVector && out.named.count("src1")) {
+                    lhs = out.named["src1"];
+                }
+                if (lhs && rhsOrImmediate) {
+                    uint64_t result = tmp(vectorSize);
+                    out.ops.push_back(PcodeOp{
+                        POp::SIMD_SHUFFLE, result, lhs, rhsOrImmediate,
+                        immediate,
+                        static_cast<uint16_t>(laneBits | (mode << 8))});
+                    result = applyEvexMask(result, dstId, vectorSize, laneBits);
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+
+            if (!x86Handled && out.named.count("imm")) {
+                if (laneName == "pslldq" || laneName == "psrldq") {
+                    const uint64_t source = vexVector && out.named.count("src")
+                                                ? out.named["src"] : dstId;
+                    uint64_t result = tmp(vectorSize);
+                    out.ops.push_back(PcodeOp{
+                        POp::SIMD_BYTE_SHIFT, result, source,
+                        out.named["imm"], 0,
+                        static_cast<uint16_t>(laneName == "psrldq" ? 1 : 0)});
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+                bool shift = false, right = false, arithmetic = false;
+                if (laneName == "psllw" || laneName == "pslld" ||
+                    laneName == "psllq") shift = true;
+                else if (laneName == "psrlw" || laneName == "psrld" ||
+                         laneName == "psrlq") { shift = true; right = true; }
+                else if (laneName == "psraw" || laneName == "psrad") {
+                    shift = true; right = true; arithmetic = true;
+                }
+                if (shift) {
+                    laneBits = laneName.back() == 'w' ? 16
+                               : laneName.back() == 'd' ? 32 : 64;
+                    const uint64_t source = vexVector && out.named.count("src1")
+                                                ? out.named["src1"] : dstId;
+                    uint64_t result = tmp(vectorSize);
+                    out.ops.push_back(PcodeOp{
+                        POp::SIMD_SHIFT, result, source, out.named["imm"], 0,
+                        static_cast<uint16_t>(laneBits | (right ? 0x0100 : 0) |
+                                              (arithmetic ? 0x0200 : 0))});
+                    result = applyEvexMask(result, dstId, vectorSize, laneBits);
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+
+            if (!x86Handled && out.named.count("src")) {
+                bool shift = false, right = false, arithmetic = false;
+                if (laneName == "psllw" || laneName == "pslld" ||
+                    laneName == "psllq") shift = true;
+                else if (laneName == "psrlw" || laneName == "psrld" ||
+                         laneName == "psrlq") { shift = true; right = true; }
+                else if (laneName == "psraw" || laneName == "psrad") {
+                    shift = true; right = true; arithmetic = true;
+                }
+                if (shift) {
+                    laneBits = laneName.back() == 'w' ? 16
+                               : laneName.back() == 'd' ? 32 : 64;
+                    const uint64_t count = isMemory("src")
+                                               ? loadValue(out.named["src"], 16)
+                                               : out.named["src"];
+                    uint64_t result = tmp(vectorSize);
+                    out.ops.push_back(PcodeOp{
+                        POp::SIMD_SHIFT, result, dstId, count, 0,
+                        static_cast<uint16_t>(laneBits | (right ? 0x0100 : 0) |
+                                              (arithmetic ? 0x0200 : 0))});
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+
+        }
+
+        if (!x86Handled &&
+            (name == "pcmpistri" || name == "pcmpistrm" ||
+             name == "pcmpestri" || name == "pcmpestrm") &&
+            out.named.count("dst") && out.named.count("src") &&
+            out.named.count("imm")) {
+            const bool explicitLengths = name.find("estr") != std::string::npos;
+            const bool maskResult = name.back() == 'm';
+            const Varnode* immediateNode = out.find(out.named["imm"]);
+            const unsigned control = immediateNode
+                ? static_cast<unsigned>(immediateNode->offset & 0xffU) : 0;
+            const uint64_t left = out.named["dst"];
+            const uint64_t right = isMemory("src")
+                                       ? loadValue(out.named["src"], 16)
+                                       : out.named["src"];
+            uint64_t lengths = 0;
+            if (explicitLengths) {
+                lengths = tmp(8);
+                out.ops.push_back(PcodeOp{POp::PIECE, lengths,
+                                          x86RegVarnode(2, 4),
+                                          x86RegVarnode(0, 4), 0});
+            }
+            auto compareQuery = [&](unsigned query, int size) {
+                const uint64_t result = tmp(size);
+                const uint16_t aux = static_cast<uint16_t>(
+                    control | (query << 8) | (explicitLengths ? 0x0800 : 0));
+                out.ops.push_back(PcodeOp{POp::SIMD_STRING_COMPARE, result,
+                                          left, right, lengths, aux});
+                return result;
+            };
+            if (maskResult) {
+                const uint64_t bits = compareQuery(0, 8);
+                const uint64_t mask = tmp(16);
+                out.ops.push_back(PcodeOp{POp::SIMD_STRING_MASK, mask,
+                                          bits, 0, 0,
+                                          static_cast<uint16_t>(control)});
+                out.ops.push_back(PcodeOp{POp::COPY, x86RegVarnode(0, 16),
+                                          mask, 0, 0});
+            } else {
+                out.ops.push_back(PcodeOp{POp::COPY, x86RegVarnode(1, 4),
+                                          compareQuery(1, 4), 0, 0});
+            }
+            writeFlag("CF", compareQuery(2, 1));
+            writeFlag("ZF", compareQuery(3, 1));
+            writeFlag("SF", compareQuery(4, 1));
+            writeFlag("OF", compareQuery(5, 1));
+            const uint64_t zero = constVarnode(out, 0, 1);
+            writeFlag("AF", zero);
+            writeFlag("PF", zero);
+            x86Handled = true;
+        }
+
+        if (!x86Handled && out.named.count("dst")) {
+            std::string approximateName = name;
+            if (!approximateName.empty() && approximateName[0] == 'v')
+                approximateName.erase(approximateName.begin());
+            const bool reciprocal = approximateName == "rcpps" ||
+                                    approximateName == "rcpss";
+            const bool reciprocalSqrt = approximateName == "rsqrtps" ||
+                                        approximateName == "rsqrtss";
+            if (reciprocal || reciprocalSqrt) {
+                const bool scalar = approximateName.size() >= 2 &&
+                                    approximateName.substr(
+                                        approximateName.size() - 2) == "ss";
+                const bool vexForm = name[0] == 'v';
+                const std::string sourceOperand = vexForm && out.named.count("src2")
+                                                      ? "src2" : "src";
+                if (out.named.count(sourceOperand)) {
+                    const uint64_t dstId = out.named["dst"];
+                    const Varnode* dstNode = out.find(dstId);
+                    const int size = dstNode && dstNode->size > 8
+                                         ? dstNode->size : 16;
+                    const uint64_t source = isMemory(sourceOperand)
+                        ? loadValue(out.named[sourceOperand], scalar ? 4 : size)
+                        : out.named[sourceOperand];
+                    const uint64_t base = vexForm && out.named.count("src1")
+                                              ? out.named["src1"] : dstId;
+                    const uint64_t result = tmp(size);
+                    out.ops.push_back(PcodeOp{
+                        POp::SIMD_APPROX, result, source, base, 0,
+                        static_cast<uint16_t>(32 |
+                            (reciprocalSqrt ? 0x0100 : 0) |
+                            (scalar ? 0x8000 : 0))});
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+        }
+
+        if (!x86Handled && name.rfind("pmov", 0) == 0 &&
+            (name.rfind("pmovsx", 0) == 0 || name.rfind("pmovzx", 0) == 0) &&
+            out.named.count("dst") && out.named.count("src")) {
+            const bool signedExtend = name.rfind("pmovsx", 0) == 0;
+            const std::string widths = name.substr(6);
+            auto width = [](char suffix) {
+                return suffix == 'b' ? 8 : suffix == 'w' ? 16
+                       : suffix == 'd' ? 32 : suffix == 'q' ? 64 : 0;
+            };
+            const int sourceBits = widths.size() == 2 ? width(widths[0]) : 0;
+            const int destinationBits = widths.size() == 2 ? width(widths[1]) : 0;
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int size = dstNode && dstNode->size > 8 ? dstNode->size : 16;
+            if (sourceBits && destinationBits > sourceBits) {
+                const int sourceSize = size / (destinationBits / 8) *
+                                       (sourceBits / 8);
+                const uint64_t source = isMemory("src")
+                                            ? loadValue(out.named["src"], sourceSize)
+                                            : out.named["src"];
+                const uint64_t result = tmp(size);
+                const uint16_t aux = static_cast<uint16_t>(
+                    sourceBits | (destinationBits << 8) |
+                    (signedExtend ? 0x8000 : 0));
+                out.ops.push_back(PcodeOp{POp::SIMD_EXTEND, result,
+                                          source, 0, 0, aux});
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                x86Handled = true;
+            }
+        }
+
+        if (!x86Handled && out.named.count("dst") && out.named.count("imm")) {
+            std::string roundName = name;
+            if (!roundName.empty() && roundName[0] == 'v')
+                roundName.erase(roundName.begin());
+            const bool round32 = roundName == "roundps" || roundName == "roundss";
+            const bool round64 = roundName == "roundpd" || roundName == "roundsd";
+            if (round32 || round64) {
+                const bool scalar = roundName == "roundss" || roundName == "roundsd";
+                const bool vexForm = name[0] == 'v';
+                const std::string sourceOperand = vexForm && out.named.count("src2")
+                                                      ? "src2" : "src";
+                if (out.named.count(sourceOperand)) {
+                    const uint64_t dstId = out.named["dst"];
+                    const Varnode* dstNode = out.find(dstId);
+                    const int size = dstNode && dstNode->size > 8
+                                         ? dstNode->size : 16;
+                    const int laneBits = round32 ? 32 : 64;
+                    const uint64_t source = isMemory(sourceOperand)
+                        ? loadValue(out.named[sourceOperand],
+                                    scalar ? laneBits / 8 : size)
+                        : out.named[sourceOperand];
+                    const uint64_t base = vexForm && out.named.count("src1")
+                                              ? out.named["src1"] : dstId;
+                    const uint64_t result = tmp(size);
+                    out.ops.push_back(PcodeOp{
+                        POp::SIMD_ROUND, result, source, base,
+                        out.named["imm"],
+                        static_cast<uint16_t>(laneBits |
+                                              (scalar ? 0x8000 : 0))});
+                    out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                    x86Handled = true;
+                }
+            }
+        }
+
+        if (!x86Handled && out.named.count("dst") && out.named.count("src")) {
+            const bool packedIntToFloat = name == "cvtdq2ps" ||
+                                          name == "cvtdq2pd";
+            const bool packedFloatToInt = name == "cvtps2dq" ||
+                                          name == "cvttps2dq" ||
+                                          name == "cvtpd2dq" ||
+                                          name == "cvttpd2dq";
+            const bool packedFloatToFloat = name == "cvtps2pd" ||
+                                            name == "cvtpd2ps";
+            if (packedIntToFloat || packedFloatToInt || packedFloatToFloat) {
+                const uint64_t dstId = out.named["dst"];
+                const Varnode* dstNode = out.find(dstId);
+                const int destinationSize = dstNode && dstNode->size > 8
+                                                ? dstNode->size : 16;
+                int sourceBits = 32, destinationBits = 32, memorySize = 16;
+                POp conversion = POp::SIMD_INT2FLOAT;
+                bool truncate = false;
+                if (name == "cvtdq2pd") {
+                    destinationBits = 64;
+                    memorySize = 8;
+                } else if (name == "cvtpd2dq" || name == "cvttpd2dq") {
+                    conversion = POp::SIMD_FLOAT2INT;
+                    sourceBits = 64;
+                    memorySize = 16;
+                    truncate = name == "cvttpd2dq";
+                } else if (name == "cvtps2dq" || name == "cvttps2dq") {
+                    conversion = POp::SIMD_FLOAT2INT;
+                    truncate = name == "cvttps2dq";
+                } else if (name == "cvtps2pd") {
+                    conversion = POp::SIMD_FLOAT2FLOAT;
+                    destinationBits = 64;
+                    memorySize = 8;
+                } else if (name == "cvtpd2ps") {
+                    conversion = POp::SIMD_FLOAT2FLOAT;
+                    sourceBits = 64;
+                    memorySize = 16;
+                }
+                const uint64_t source = isMemory("src")
+                                            ? loadValue(out.named["src"], memorySize)
+                                            : out.named["src"];
+                const uint64_t result = tmp(destinationSize);
+                const uint16_t aux = static_cast<uint16_t>(
+                    sourceBits | (destinationBits << 8) |
+                    (truncate ? 0x8000 : 0));
+                out.ops.push_back(PcodeOp{conversion, result, source, 0, 0, aux});
+                out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+                x86Handled = true;
+            }
+        }
+
+        if (!x86Handled && (name == "dpps" || name == "dppd") &&
+            out.named.count("dst") && out.named.count("src") &&
+            out.named.count("imm")) {
+            const uint64_t dstId = out.named["dst"];
+            const Varnode* dstNode = out.find(dstId);
+            const int size = dstNode && dstNode->size > 8 ? dstNode->size : 16;
+            const uint64_t source = isMemory("src")
+                                        ? loadValue(out.named["src"], 16)
+                                        : out.named["src"];
+            const uint64_t result = tmp(size);
+            out.ops.push_back(PcodeOp{
+                POp::SIMD_DOT_PRODUCT, result, dstId, source,
+                out.named["imm"], static_cast<uint16_t>(name == "dpps" ? 32 : 64)});
+            out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
+            x86Handled = true;
+        }
+
         if (!x86Handled && out.named.count("dst") && out.named.count("src")) {
             const bool intToFloat = name == "cvtsi2ss" || name == "cvtsi2sd";
             const bool floatToInt = name == "cvtss2si" || name == "cvtsd2si" ||
@@ -2548,8 +4767,9 @@ bool SleighEngine::disassemble(
                     b = sourceValue("src", scalar ? laneBits / 8 : size);
                 }
                 if (a && (b || floatOp == POp::FLOAT_SQRT)) {
-                    const uint64_t result = tmp(size);
+                    uint64_t result = tmp(size);
                     out.ops.push_back(PcodeOp{floatOp, result, a, b, 0, aux});
+                    result = applyEvexMask(result, dstId, size, laneBits);
                     out.ops.push_back(PcodeOp{POp::COPY, dstId, result, 0, 0});
                     x86Handled = true;
                 }
@@ -2568,6 +4788,10 @@ bool SleighEngine::disassemble(
                     const uint64_t rhs = isMemory(rhsName)
                                              ? loadValue(rhsId, compare32 ? 4 : 8)
                                              : rhsId;
+                    out.ops.push_back(PcodeOp{
+                        POp::SIMD_COMPARE_CHECK, 0, lhs, rhs, 0,
+                        static_cast<uint16_t>(aux |
+                            ((floatName.rfind("ucom", 0) == 0) ? 0x0100 : 0))});
                     auto emitFloatCompare = [&](POp op) {
                         const uint64_t result = tmp(1);
                         out.ops.push_back(PcodeOp{op, result, lhs, rhs, 0, aux});
@@ -2626,7 +4850,10 @@ bool SleighEngine::disassemble(
         }
         case SpecCtor::SStmt::GOTO: {
             const uint64_t dest = evalExpr(out, *st.rhsE);
-            out.ops.push_back(PcodeOp{POp::BRANCH, 0, dest, 0, 0});
+            const Varnode* target = out.find(dest);
+            out.ops.push_back(PcodeOp{target && target->isConst()
+                                          ? POp::BRANCH : POp::BRANCHIND,
+                                      0, dest, 0, 0});
             break;
         }
         case SpecCtor::SStmt::CGOTO: {
@@ -2637,7 +4864,10 @@ bool SleighEngine::disassemble(
         }
         case SpecCtor::SStmt::CALL: {
             const uint64_t dest = evalExpr(out, *st.rhsE);
-            out.ops.push_back(PcodeOp{POp::CALL, 0, dest, 0, 0});
+            const Varnode* target = out.find(dest);
+            out.ops.push_back(PcodeOp{target && target->isConst()
+                                          ? POp::CALL : POp::CALLIND,
+                                      0, dest, 0, 0});
             break;
         }
         case SpecCtor::SStmt::RET:
@@ -2645,11 +4875,75 @@ bool SleighEngine::disassemble(
             break;
         case SpecCtor::SStmt::STORE: {
             const uint64_t addrId = evalExpr(out, *st.lhsE);
-            const uint64_t valId = evalExpr(out, *st.rhsE);
+            uint64_t valId = evalExpr(out, *st.rhsE);
+            if (archX86_) {
+                // A STORE has no output varnode from which later stages can
+                // recover its width.  In particular, sext(imm16, 16) is held
+                // in an eight-byte temporary, but `66 C7 /0 iw` still writes
+                // exactly two bytes.  Preserve the decoded memory operand
+                // width here so adjacent C++ object fields are not clobbered.
+                int width = 0;
+                if (st.lhsE && st.lhsE->kind == SpecCtor::SExpr::VAR) {
+                    for (auto it = magicExports.rbegin();
+                         it != magicExports.rend(); ++it) {
+                        if (it->first == st.lhsE->var &&
+                            it->second.rfind("rmmem", 0) == 0) {
+                            width = magicSize(it->second);
+                            break;
+                        }
+                    }
+                }
+                const Varnode* value = out.find(valId);
+                if (!width && value) width = value->size;
+                if (width > 0 && value && value->size != width) {
+                    if (value->isConst()) {
+                        valId = constVarnode(out, value->offset, width);
+                    } else {
+                        Varnode* resized = makeVarnode(
+                            out, Varnode::UNIQUE, nextId_++, width);
+                        out.ops.push_back(PcodeOp{
+                            value->size > width ? POp::SUBPIECE
+                                                : POp::INT_ZEXT,
+                            resized->id, valId, 0, 0});
+                        valId = resized->id;
+                    }
+                }
+            }
             out.ops.push_back(PcodeOp{POp::STORE, 0, addrId, 0, valId});
             break;
         }
         }
+    }
+
+    if (archX86_) {
+        const std::string& instruction = matched->name;
+        uint16_t gate = 0;
+        uint16_t feature = 0;
+        static const std::set<std::string> privileged = {
+            "hlt", "invlpg", "invpcid", "lgdt", "lidt",
+            "lldt", "ltr", "movcr", "rdmsr", "wrmsr", "xsetbv",
+            "clts", "swapgs", "invd", "wbinvd"
+        };
+        if (privileged.count(instruction)) gate = 1;
+        if (instruction == "cli" || instruction == "sti" ||
+            instruction == "in" || instruction == "out") gate = 7;
+        if (!instruction.empty() && instruction[0] == 'f')
+            gate = instruction.rfind("fn", 0) == 0 ? 5 : 2;
+        if (instruction == "wait") gate = 6;
+        if (instruction.rfind("sha", 0) == 0) { gate = 3; feature = 1; }
+        if (instruction.find("gf2p8") != std::string::npos) {
+            gate = xc.vex || xc.evex ? 4 : 3; feature = 2;
+        }
+        if (instruction.find("aes") != std::string::npos) {
+            gate = xc.vex || xc.evex ? 4 : 3; feature = 3;
+        }
+        if (instruction.find("clmul") != std::string::npos) {
+            gate = xc.vex || xc.evex ? 4 : 3; feature = 4;
+        }
+        if (gate || feature)
+            out.ops.insert(out.ops.begin(), PcodeOp{
+                POp::X86_GUARD, 0, 0, 0, 0,
+                static_cast<uint16_t>(gate | (feature << 8))});
     }
 
     // classify + resolve branch/call targets
@@ -2664,6 +4958,7 @@ bool SleighEngine::disassemble(
             out.kind = Insn::RET;
             break;
         case POp::CALL:
+        case POp::CALLIND:
             out.kind = Insn::CALL;
             if (constDest) {
                 out.target = vd->offset;
@@ -2671,6 +4966,7 @@ bool SleighEngine::disassemble(
             }
             break;
         case POp::BRANCH:
+        case POp::BRANCHIND:
             if (out.kind == Insn::OTHER) {
                 out.kind = Insn::JMP;
                 if (constDest) {
@@ -2756,6 +5052,7 @@ bool SleighEngine::disassemble(
             text = matched->name + std::string(" ") + hexAddr(out.target);
     }
     out.text = text;
+    cache_ = nullptr;
     return true;
 }
 

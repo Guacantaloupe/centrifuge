@@ -126,11 +126,14 @@ private:
     std::map<std::string, int> fieldIdx_;
     std::vector<SpecCtor> ctors_;
     bool archX86_ = false; // x86-style: prefix scan + ModRM magic terms
-    mutable int x86Opsz_ = 0; // current operand size during disassembly
+    static thread_local int x86Opsz_; // per-thread operand size during disassembly
 
     // per-instruction emission state
-    mutable uint64_t nextId_ = 1;
-    mutable std::map<uint64_t, Varnode> cache_; // register varnodes
+    static thread_local uint64_t nextId_;
+    // Points at the current instruction's stack-owned register cache.  Keeping
+    // only a trivial pointer in TLS avoids MinGW's fragile dynamic TLS
+    // destructor path for std::map when short-lived CFG workers exit.
+    static thread_local std::map<uint64_t, Varnode>* cache_;
 
     const SpecField* findField(const std::string& name) const;
     const SpecRegister* findReg(const std::string& name) const;

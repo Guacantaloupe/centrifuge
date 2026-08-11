@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <string>
 #include <vector>
 
 namespace centrifuge {
@@ -140,6 +142,274 @@ std::vector<SegGroup> groupSegments(std::vector<Seg> segs) {
         out.push_back(SegGroup{s.vaddr, segEnd, s.perm, {s}});
     }
     return out;
+}
+
+bool readUnsigned(const std::vector<uint8_t>& data, size_t& cursor, size_t end,
+                  size_t bytes, uint64_t& value) {
+    if (bytes > 8 || cursor > end || bytes > end - cursor || end > data.size())
+        return false;
+    value = 0;
+    for (size_t i = 0; i < bytes; ++i)
+        value |= static_cast<uint64_t>(data[cursor + i]) << (i * 8);
+    cursor += bytes;
+    return true;
+}
+
+bool readUleb(const std::vector<uint8_t>& data, size_t& cursor, size_t end,
+              uint64_t& value) {
+    value = 0;
+    for (unsigned shift = 0; cursor < end && shift < 64; shift += 7) {
+        const uint8_t byte = data[cursor++];
+        value |= static_cast<uint64_t>(byte & 0x7f) << shift;
+        if (!(byte & 0x80)) return true;
+    }
+    return false;
+}
+
+bool readSleb(const std::vector<uint8_t>& data, size_t& cursor, size_t end,
+              int64_t& value) {
+    uint64_t raw = 0;
+    unsigned shift = 0;
+    uint8_t byte = 0;
+    do {
+        if (cursor >= end || shift >= 64) return false;
+        byte = data[cursor++];
+        raw |= static_cast<uint64_t>(byte & 0x7f) << shift;
+        shift += 7;
+    } while (byte & 0x80);
+    if (shift < 64 && (byte & 0x40)) raw |= (~0ULL) << shift;
+    value = static_cast<int64_t>(raw);
+    return true;
+}
+
+bool decodeDwarfPointer(const std::vector<uint8_t>& data, size_t& cursor,
+                        size_t end, uint8_t encoding, size_t pointerSize,
+                        uint64_t sectionAddress, size_t sectionFileOffset,
+                        uint64_t& result) {
+    if (encoding == 0xff) return false;
+    const size_t encodedAt = cursor;
+    const uint8_t format = encoding & 0x0f;
+    uint64_t raw = 0;
+    int64_t signedRaw = 0;
+    bool signedValue = false;
+    if (format == 0x00) {
+        if (!readUnsigned(data, cursor, end, pointerSize, raw)) return false;
+    } else if (format == 0x01) {
+        if (!readUleb(data, cursor, end, raw)) return false;
+    } else if (format == 0x02 || format == 0x03 || format == 0x04) {
+        const size_t bytes = format == 0x02 ? 2 : format == 0x03 ? 4 : 8;
+        if (!readUnsigned(data, cursor, end, bytes, raw)) return false;
+    } else if (format == 0x09) {
+        if (!readSleb(data, cursor, end, signedRaw)) return false;
+        signedValue = true;
+    } else if (format == 0x0a || format == 0x0b || format == 0x0c) {
+        const size_t bytes = format == 0x0a ? 2 : format == 0x0b ? 4 : 8;
+        if (!readUnsigned(data, cursor, end, bytes, raw)) return false;
+        const unsigned bits = static_cast<unsigned>(bytes * 8);
+        signedRaw = static_cast<int64_t>((raw ^ (1ULL << (bits - 1))) -
+                                         (1ULL << (bits - 1)));
+        signedValue = true;
+    } else {
+        return false;
+    }
+    uint64_t base = 0;
+    switch (encoding & 0x70) {
+    case 0x00: break;
+    case 0x10:
+        base = sectionAddress + (encodedAt - sectionFileOffset);
+        break;
+    case 0x30:
+        base = sectionAddress;
+        break;
+    default: return false;
+    }
+    if (signedValue) {
+        if (signedRaw < 0 && static_cast<uint64_t>(-signedRaw) > base) return false;
+        result = signedRaw < 0 ? base - static_cast<uint64_t>(-signedRaw)
+                               : base + static_cast<uint64_t>(signedRaw);
+    } else {
+        if (raw > std::numeric_limits<uint64_t>::max() - base) return false;
+        result = base + raw;
+    }
+    return true;
+}
+
+struct DwarfCieInfo {
+    std::string augmentation;
+    uint8_t fdeEncoding = 0;
+    uint8_t lsdaEncoding = 0xff;
+    uint64_t personality = 0;
+};
+
+std::vector<ExceptionRegion> parseDwarfFrames(const std::vector<uint8_t>& data,
+                                               uint64_t fileOffset,
+                                               uint64_t sectionSize,
+                                               uint64_t sectionAddress,
+                                               bool isEhFrame,
+                                               size_t pointerSize) {
+    std::vector<ExceptionRegion> regions;
+    if (!rangeInFile(fileOffset, sectionSize, data.size())) return regions;
+    const size_t sectionStart = static_cast<size_t>(fileOffset);
+    const size_t sectionEnd = sectionStart + static_cast<size_t>(sectionSize);
+    std::map<size_t, DwarfCieInfo> cies;
+    size_t cursor = sectionStart;
+    while (cursor + 4 <= sectionEnd) {
+        const size_t entryStart = cursor;
+        uint64_t length = 0;
+        if (!readUnsigned(data, cursor, sectionEnd, 4, length)) break;
+        if (length == 0) break;
+        size_t idSize = 4;
+        if (length == 0xffffffff) {
+            if (!readUnsigned(data, cursor, sectionEnd, 8, length)) break;
+            idSize = 8;
+        }
+        if (length > sectionEnd - cursor) break;
+        const size_t entryEnd = cursor + static_cast<size_t>(length);
+        const size_t idField = cursor;
+        uint64_t identifier = 0;
+        if (!readUnsigned(data, cursor, entryEnd, idSize, identifier)) break;
+        const bool cie = isEhFrame ? identifier == 0
+                                   : identifier == (idSize == 4 ? 0xffffffffULL
+                                                                : ~0ULL);
+        if (cie) {
+            DwarfCieInfo info;
+            if (cursor >= entryEnd) { cursor = entryEnd; continue; }
+            const uint8_t version = data[cursor++];
+            while (cursor < entryEnd && data[cursor])
+                info.augmentation.push_back(static_cast<char>(data[cursor++]));
+            if (cursor >= entryEnd) { cursor = entryEnd; continue; }
+            ++cursor;
+            uint64_t codeAlignment = 0, returnRegister = 0;
+            int64_t dataAlignment = 0;
+            if (!readUleb(data, cursor, entryEnd, codeAlignment) ||
+                !readSleb(data, cursor, entryEnd, dataAlignment)) {
+                cursor = entryEnd; continue;
+            }
+            if (version == 1) {
+                if (cursor >= entryEnd) { cursor = entryEnd; continue; }
+                returnRegister = data[cursor++];
+            } else if (!readUleb(data, cursor, entryEnd, returnRegister)) {
+                cursor = entryEnd; continue;
+            }
+            (void)codeAlignment; (void)dataAlignment; (void)returnRegister;
+            if (!info.augmentation.empty() && info.augmentation[0] == 'z') {
+                uint64_t augmentationLength = 0;
+                if (!readUleb(data, cursor, entryEnd, augmentationLength) ||
+                    augmentationLength > entryEnd - cursor) {
+                    cursor = entryEnd; continue;
+                }
+                const size_t augmentationEnd = cursor +
+                    static_cast<size_t>(augmentationLength);
+                for (size_t i = 1; i < info.augmentation.size() &&
+                                   cursor < augmentationEnd; ++i) {
+                    const char kind = info.augmentation[i];
+                    if (kind == 'R') info.fdeEncoding = data[cursor++];
+                    else if (kind == 'L') info.lsdaEncoding = data[cursor++];
+                    else if (kind == 'P') {
+                        const uint8_t encoding = data[cursor++];
+                        decodeDwarfPointer(data, cursor, augmentationEnd, encoding,
+                                           pointerSize, sectionAddress,
+                                           sectionStart, info.personality);
+                    }
+                }
+                cursor = augmentationEnd;
+            }
+            cies[entryStart] = info;
+        } else {
+            const size_t cieStart = isEhFrame
+                ? (identifier <= idField ? idField - static_cast<size_t>(identifier)
+                                         : sectionEnd)
+                : sectionStart + static_cast<size_t>(identifier);
+            const auto found = cies.find(cieStart);
+            if (found != cies.end()) {
+                const DwarfCieInfo& info = found->second;
+                uint64_t start = 0, range = 0;
+                const uint8_t locationEncoding = info.fdeEncoding;
+                if (decodeDwarfPointer(data, cursor, entryEnd, locationEncoding,
+                                       pointerSize, sectionAddress, sectionStart,
+                                       start) &&
+                    decodeDwarfPointer(data, cursor, entryEnd,
+                                       locationEncoding & 0x0f, pointerSize,
+                                       sectionAddress, sectionStart, range) &&
+                    range <= std::numeric_limits<uint64_t>::max() - start) {
+                    uint64_t lsda = 0;
+                    if (!info.augmentation.empty() && info.augmentation[0] == 'z') {
+                        uint64_t augmentationLength = 0;
+                        if (readUleb(data, cursor, entryEnd, augmentationLength) &&
+                            augmentationLength <= entryEnd - cursor) {
+                            const size_t augmentationEnd = cursor +
+                                static_cast<size_t>(augmentationLength);
+                            if (info.lsdaEncoding != 0xff)
+                                decodeDwarfPointer(data, cursor, augmentationEnd,
+                                                   info.lsdaEncoding, pointerSize,
+                                                   sectionAddress, sectionStart, lsda);
+                            cursor = augmentationEnd;
+                        }
+                    }
+                    ExceptionRegion region;
+                    region.kind = ExceptionRegion::DWARF_CFI;
+                    region.start = start;
+                    region.end = start + range;
+                    region.unwindInfo = sectionAddress + (entryStart - sectionStart);
+                    region.handler = info.personality;
+                    region.languageData = lsda;
+                    regions.push_back(region);
+                }
+            }
+        }
+        cursor = entryEnd;
+    }
+    return regions;
+}
+
+void parseLsda(const std::vector<uint8_t>& data, size_t fileOffset, size_t end,
+               uint64_t sectionAddress, size_t sectionFileOffset,
+               ExceptionRegion& region, size_t pointerSize) {
+    if (fileOffset >= end || end > data.size()) return;
+    size_t cursor = fileOffset;
+    const uint8_t lpEncoding = data[cursor++];
+    uint64_t landingPadBase = region.start;
+    if (lpEncoding != 0xff &&
+        !decodeDwarfPointer(data, cursor, end, lpEncoding, pointerSize,
+                            sectionAddress, sectionFileOffset, landingPadBase))
+        return;
+    if (cursor >= end) return;
+    const uint8_t typeEncoding = data[cursor++];
+    if (typeEncoding != 0xff) {
+        uint64_t typeOffset = 0;
+        if (!readUleb(data, cursor, end, typeOffset)) return;
+        (void)typeOffset;
+    }
+    if (cursor >= end) return;
+    const uint8_t callSiteEncoding = data[cursor++];
+    uint64_t tableLength = 0;
+    if (!readUleb(data, cursor, end, tableLength) || tableLength > end - cursor)
+        return;
+    const size_t tableEnd = cursor + static_cast<size_t>(tableLength);
+    while (cursor < tableEnd) {
+        uint64_t start = 0, length = 0, landing = 0, action = 0;
+        const uint8_t valueEncoding = callSiteEncoding & 0x0f;
+        if (!decodeDwarfPointer(data, cursor, tableEnd, valueEncoding,
+                                pointerSize, sectionAddress, sectionFileOffset,
+                                start) ||
+            !decodeDwarfPointer(data, cursor, tableEnd, valueEncoding,
+                                pointerSize, sectionAddress, sectionFileOffset,
+                                length) ||
+            !decodeDwarfPointer(data, cursor, tableEnd, valueEncoding,
+                                pointerSize, sectionAddress, sectionFileOffset,
+                                landing) ||
+            !readUleb(data, cursor, tableEnd, action))
+            break;
+        if (!landing || start > std::numeric_limits<uint64_t>::max() -
+                                  landingPadBase ||
+            length > std::numeric_limits<uint64_t>::max() -
+                         (landingPadBase + start))
+            continue;
+        region.handlers.push_back({landingPadBase + start,
+                                   landingPadBase + start + length,
+                                   landingPadBase + landing,
+                                   static_cast<int64_t>(action)});
+    }
 }
 
 std::optional<Program> loadElfImpl(const std::vector<uint8_t>& d,
@@ -330,11 +600,36 @@ std::optional<Program> loadElfImpl(const std::vector<uint8_t>& d,
             Section{secNames[i], s.addr, s.size, s.offset,
                     s.type == SHT_NOBITS ? 0 : s.size, perm});
         if (secNames[i] == ".eh_frame" || secNames[i] == ".debug_frame") {
-            ExceptionRegion region;
-            region.kind = ExceptionRegion::DWARF_CFI;
-            region.unwindInfo = s.addr;
-            region.languageData = s.size;
-            p.exceptionRegions.push_back(region);
+            std::vector<ExceptionRegion> decoded = parseDwarfFrames(
+                d, s.offset, s.size, s.addr, secNames[i] == ".eh_frame",
+                is64 ? 8 : 4);
+            if (decoded.empty()) {
+                ExceptionRegion region;
+                region.kind = ExceptionRegion::DWARF_CFI;
+                region.unwindInfo = s.addr;
+                p.exceptionRegions.push_back(region);
+            } else {
+                p.exceptionRegions.insert(p.exceptionRegions.end(),
+                                          decoded.begin(), decoded.end());
+            }
+        }
+    }
+
+    for (ExceptionRegion& region : p.exceptionRegions) {
+        if (region.kind != ExceptionRegion::DWARF_CFI || !region.languageData)
+            continue;
+        for (const ShRaw& section : shdrs) {
+            if (region.languageData < section.addr ||
+                region.languageData - section.addr >= section.size)
+                continue;
+            const uint64_t relative = region.languageData - section.addr;
+            if (relative > std::numeric_limits<size_t>::max() - section.offset)
+                break;
+            const size_t lsdaOffset = static_cast<size_t>(section.offset + relative);
+            const size_t sectionEnd = static_cast<size_t>(section.offset + section.size);
+            parseLsda(d, lsdaOffset, sectionEnd, section.addr,
+                      static_cast<size_t>(section.offset), region, is64 ? 8 : 4);
+            break;
         }
     }
 

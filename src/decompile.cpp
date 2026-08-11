@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -15,9 +16,6 @@ namespace centrifuge {
 
 namespace {
 
-constexpr uint64_t SP_OFF = 2 * 8;
-constexpr uint64_t A0_OFF = 10 * 8;
-
 // name for a stack slot relative to the frame (signed offset)
 std::string localName(int64_t off) {
     if (off < 0) return "local_m" + std::to_string(-off);
@@ -25,7 +23,8 @@ std::string localName(int64_t off) {
 }
 
 // parse "sp - 272" / "sp + 272" / "sp" -> optional bias
-bool parseSpExpr(const std::string& t, int64_t& bias) {
+bool parseSpExpr(const std::string& t, const std::string& stackName,
+                 int64_t& bias) {
     std::string s = t;
     if (s.size() >= 2 && s.front() == '(' && s.back() == ')') {
         int d = 0;
@@ -39,12 +38,13 @@ bool parseSpExpr(const std::string& t, int64_t& bias) {
         }
         if (full) s = s.substr(1, s.size() - 2);
     }
-    if (s == "sp") {
+    if (s == stackName) {
         bias = 0;
         return true;
     }
-    if (s.rfind("sp ", 0) != 0) return false;
-    const char* p = s.c_str() + 3;
+    const std::string prefix = stackName + " ";
+    if (s.rfind(prefix, 0) != 0) return false;
+    const char* p = s.c_str() + prefix.size();
     char op = 0;
     while (*p == ' ') p++;
     if (*p == '+' || *p == '-') {
@@ -68,6 +68,108 @@ const char* regName64(uint64_t offset) {
         "s8",   "s9", "s10", "s11", "t3", "t4", "t5", "t6"};
     const size_t i = offset / 8;
     return (i < 32) ? n[i] : "?";
+}
+
+std::string registerName(const std::string& architecture, uint64_t offset,
+                         int size = 8) {
+    if (architecture.rfind("riscv", 0) == 0) return regName64(offset);
+    if (architecture.rfind("x86", 0) == 0) {
+        if (size == 16) return "xmm" + std::to_string(offset / 8);
+        if (size == 32) return "ymm" + std::to_string(offset / 8);
+        if (size == 64) return "zmm" + std::to_string(offset / 8);
+        if (offset >= 16384 && offset < 16384 + 8 * 8)
+            return "mm" + std::to_string((offset - 16384) / 8);
+        if (offset >= 8192 && offset < 8192 + 8 * 8)
+            return "k" + std::to_string((offset - 8192) / 8);
+        static const char* names[16] = {
+            "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
+        };
+        const size_t index = static_cast<size_t>(offset / 8);
+        if (index < 16) return names[index];
+        if (offset == X86_FS_BASE_OFFSET) return "fsbase";
+        if (offset == X86_GS_BASE_OFFSET) return "gsbase";
+        // Flag and system registers use byte-granular offsets.  Dividing the
+        // offset by eight aliases CF/PF/AF/ZF/SF/OF to one C variable and
+        // changes every conditional branch after a multi-flag instruction.
+        return "r" + std::to_string(offset);
+    }
+    if (architecture == "aarch64" || architecture == "arm64")
+        return "x" + std::to_string(offset / 8);
+    return "r" + std::to_string(offset / 8);
+}
+
+bool x86GprSlice(const std::string& architecture, uint64_t offset, int size,
+                 uint64_t& storageOffset, unsigned& shift) {
+    if (architecture.rfind("x86", 0) != 0 || size <= 0 || size > 8 ||
+        offset >= 16 * 8)
+        return false;
+    storageOffset = offset & ~uint64_t{7};
+    const uint64_t byteOffset = offset - storageOffset;
+    if (byteOffset + static_cast<uint64_t>(size) > 8) return false;
+    shift = static_cast<unsigned>(byteOffset * 8);
+    return true;
+}
+
+uint64_t registerStorageOffset(const std::string& architecture,
+                               uint64_t offset, int size) {
+    uint64_t storageOffset = offset;
+    unsigned shift = 0;
+    return x86GprSlice(architecture, offset, size, storageOffset, shift)
+               ? storageOffset : offset;
+}
+
+std::string x86RegisterWrite(const std::string& architecture, uint64_t offset,
+                             int size, const std::string& expression) {
+    uint64_t storageOffset = offset;
+    unsigned shift = 0;
+    if (!x86GprSlice(architecture, offset, size, storageOffset, shift))
+        return registerName(architecture, offset, size) + " = " + expression;
+    const std::string storage = registerName(architecture, storageOffset, 8);
+    if (size == 8 && shift == 0) return storage + " = " + expression;
+    // x86-64 writes to a 32-bit GPR zero the upper half.  Byte/word writes,
+    // including AH/BH/CH/DH, preserve all bits outside their slice.
+    if (size == 4 && shift == 0)
+        return storage + " = (uint32_t)(" + expression + ")";
+    const unsigned bits = static_cast<unsigned>(size * 8);
+    const uint64_t valueMask = bits == 64
+        ? std::numeric_limits<uint64_t>::max()
+        : ((uint64_t{1} << bits) - 1);
+    const uint64_t positionedMask = valueMask << shift;
+    const uint64_t preserveMask = ~positionedMask;
+    return storage + " = (" + storage + " & " +
+           std::to_string(preserveMask) + "ULL) | (((uint64_t)(" +
+           expression + ") & " + std::to_string(valueMask) + "ULL) << " +
+           std::to_string(shift) + ")";
+}
+
+uint64_t stackPointerOffset(const std::string& architecture) {
+    if (architecture.rfind("x86", 0) == 0) return 4 * 8;
+    if (architecture == "aarch64" || architecture == "arm64") return 31 * 8;
+    return 2 * 8;
+}
+
+uint64_t returnRegisterOffset(const std::string& architecture) {
+    return architecture.rfind("riscv", 0) == 0 ? 10 * 8 : 0;
+}
+
+uint64_t secondaryReturnRegisterOffset(const std::string& architecture) {
+    if (architecture.rfind("riscv", 0) == 0) return 11 * 8;
+    if (architecture.rfind("x86", 0) == 0) return 2 * 8;
+    return 8;
+}
+
+std::vector<uint64_t> defaultArgumentRegisters(const std::string& architecture) {
+    if (architecture.rfind("x86", 0) == 0 &&
+        architecture.find("win64") != std::string::npos)
+        return {1 * 8, 2 * 8, 8 * 8, 9 * 8};
+    if (architecture.rfind("x86", 0) == 0)
+        return {7 * 8, 6 * 8, 2 * 8, 1 * 8, 8 * 8, 9 * 8};
+    if (architecture == "aarch64" || architecture == "arm64")
+        return {0, 8, 16, 24, 32, 40, 48, 56};
+    std::vector<uint64_t> result;
+    for (int i = 0; i < 8; ++i) result.push_back((10 + i) * 8);
+    return result;
 }
 
 std::string hexAddr(uint64_t a) {
@@ -96,6 +198,9 @@ const char* uCast(int size) {
     case 1: return "uint8_t";
     case 2: return "uint16_t";
     case 4: return "uint32_t";
+    case 16: return "RecoveredVector128";
+    case 32: return "RecoveredVector256";
+    case 64: return "RecoveredVector512";
     default: return "uint64_t";
     }
 }
@@ -104,7 +209,42 @@ struct CExpr {
     std::string text;
     int size = 8;
     bool isConst = false;
+    bool floating = false;
+    // Architectural registers read while forming this expression.  Keeping
+    // both the storage offset and the textual register view lets the emitter
+    // preserve instruction-level parallel writes (for example RDX:RAX from
+    // one-operand MUL/IMUL) without confusing RAX with EAX.
+    std::map<uint64_t, std::set<std::string>> registerRefs;
 };
+
+std::string replaceIdentifier(std::string text, const std::string& from,
+                              const std::string& to) {
+    if (from.empty()) return text;
+    const auto isIdentifier = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+    };
+    size_t position = 0;
+    while ((position = text.find(from, position)) != std::string::npos) {
+        const bool leftBoundary = position == 0 ||
+            !isIdentifier(text[position - 1]);
+        const size_t end = position + from.size();
+        const bool rightBoundary = end == text.size() ||
+            !isIdentifier(text[end]);
+        if (leftBoundary && rightBoundary) {
+            text.replace(position, from.size(), to);
+            position += to.size();
+        } else {
+            position += from.size();
+        }
+    }
+    return text;
+}
+
+std::string safeIdentifier(std::string text) {
+    for (char& c : text)
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') c = '_';
+    return text;
+}
 
 std::string stripParens(const std::string& s) {
     if (s.size() >= 2 && s.front() == '(' && s.back() == ')') {
@@ -174,6 +314,9 @@ public:
 
     // resolves a call target address to a function name ("" = indirect)
     std::function<std::string(uint64_t)> nameOf;
+    std::function<std::optional<FunctionSignature>(uint64_t)> signatureOf;
+    std::string architecture = "riscv64";
+    bool useRecoveredRuntime = false;
 
     explicit BlockEmitter(const CfgBlock& blk) : blk_(blk) {}
 
@@ -186,9 +329,22 @@ public:
             return true;
         }
         if (v->kind == Varnode::REGISTER) {
-            auto it = regConst.find(v->offset);
+            const uint64_t storage =
+                registerStorageOffset(architecture, v->offset, v->size);
+            auto it = regConst.find(storage);
             if (it == regConst.end()) return false;
             out = it->second;
+            uint64_t base = v->offset;
+            unsigned shift = 0;
+            if (x86GprSlice(architecture, v->offset, v->size, base, shift) &&
+                (v->size < 8 || shift)) {
+                const unsigned bits = static_cast<unsigned>(v->size * 8);
+                const uint64_t mask = bits == 64
+                    ? std::numeric_limits<uint64_t>::max()
+                    : ((uint64_t{1} << bits) - 1);
+                out = static_cast<int64_t>(
+                    (static_cast<uint64_t>(out) >> shift) & mask);
+            }
             return true;
         }
         // UNIQUE temp: find its defining op
@@ -215,10 +371,62 @@ public:
         std::string fname = nameOf(static_cast<uint64_t>(target));
         if (fname.empty()) return false;
         std::string args;
-        for (int i = 0; i < 8; ++i)
-            args += (i ? ", " : "") + std::string(regName64((10 + i) * 8));
-        pending.emplace_back(A0_OFF,
-                             CExpr{fname + "(" + args + ")", 8, false});
+        const auto signature = signatureOf
+                                   ? signatureOf(static_cast<uint64_t>(target))
+                                   : std::optional<FunctionSignature>{};
+        const size_t argumentCount = signature ? signature->parameters.size() : 8;
+        for (size_t i = 0; i < argumentCount; ++i) {
+            const std::vector<uint64_t> fallback =
+                defaultArgumentRegisters(architecture);
+            const bool fallbackStackArgument =
+                !signature && i >= fallback.size();
+            const uint64_t offset = signature
+                ? signature->parameters[i].registerOffset
+                : fallbackStackArgument ? 0 : fallback[i];
+            const bool stackArgument =
+                (signature && signature->parameters[i].onStack) ||
+                fallbackStackArgument;
+            std::string argument;
+            if (stackArgument) {
+                // A machine CALL pushes its return address before the callee
+                // observes SP.  The recovered C++ call does not, so convert
+                // the callee-entry stack offset back to the caller's current
+                // stack coordinate when reading an outgoing argument.
+                int64_t callerStackOffset = 0;
+                if (signature) {
+                    callerStackOffset = signature->parameters[i].stackOffset;
+                } else if (architecture.rfind("x86", 0) == 0) {
+                    const bool win64 = architecture.find("win64") !=
+                                       std::string::npos;
+                    const int64_t word = architecture == "x86" ? 4 : 8;
+                    const int64_t firstStackAtEntry = win64 ? 5 * word : word;
+                    callerStackOffset = firstStackAtEntry +
+                        static_cast<int64_t>(i - fallback.size()) * word;
+                } else {
+                    callerStackOffset = static_cast<int64_t>(
+                        i - fallback.size()) * 8;
+                }
+                if (architecture.rfind("x86", 0) == 0)
+                    callerStackOffset -= architecture == "x86" ? 4 : 8;
+                const std::string address =
+                    registerName(architecture, stackPointerOffset(architecture)) +
+                    " + " + std::to_string(callerStackOffset);
+                argument = useRecoveredRuntime
+                    ? "recovered_load<std::uint64_t>(" + address + ")"
+                    : "*((uint64_t *)(uintptr_t)(" + address + "))";
+            } else {
+                argument = registerName(architecture, offset);
+            }
+            if (signature && signature->parameters[i].type.kind == TypeKind::POINTER)
+                argument = "(void *)(uintptr_t)" + argument;
+            args += (i ? ", " : "") + argument;
+        }
+        const std::string call = fname + "(" + args + ")";
+        if (signature && signature->returnType.kind == TypeKind::VOID_TYPE)
+            line(call + ";");
+        else
+            pending.emplace_back(returnRegisterOffset(architecture),
+                                 CExpr{call, 8, false});
         return true;
     }
 
@@ -226,7 +434,8 @@ public:
     bool slotOf(const PcodeInsn& pi, uint64_t addrId, int64_t& off) const {
         const Varnode* v = pi.find(addrId);
         if (!v) return false;
-        if (v->kind == Varnode::REGISTER && v->offset == SP_OFF) {
+        const uint64_t spOffset = stackPointerOffset(architecture);
+        if (v->kind == Varnode::REGISTER && v->offset == spOffset) {
             off = spBias;
             return true;
         }
@@ -239,11 +448,11 @@ public:
             const Varnode* b = pi.find(op.in1);
             const Varnode* spv = nullptr;
             const Varnode* cv = nullptr;
-            if (a && a->kind == Varnode::REGISTER && a->offset == SP_OFF) {
+            if (a && a->kind == Varnode::REGISTER && a->offset == spOffset) {
                 spv = a;
                 cv = b;
             } else if (b && b->kind == Varnode::REGISTER &&
-                       b->offset == SP_OFF) {
+                       b->offset == spOffset) {
                 spv = b;
                 cv = a;
             }
@@ -266,12 +475,159 @@ public:
             if (v->kind == Varnode::CONST)
                 return CExpr{fmtConst(v->offset, v->size), v->size, true};
             if (v->kind == Varnode::REGISTER) {
-                if (v->offset == 0) return CExpr{"0", v->size, true}; // zero
-                return CExpr{regName64(v->offset), v->size, false};
+                if (architecture.rfind("riscv", 0) == 0 && v->offset == 0)
+                    return CExpr{"0", v->size, true}; // architectural zero
+                uint64_t storageOffset = v->offset;
+                unsigned shift = 0;
+                std::string name =
+                    registerName(architecture, v->offset, v->size);
+                std::string text = name;
+                if (x86GprSlice(architecture, v->offset, v->size,
+                                storageOffset, shift)) {
+                    name = registerName(architecture, storageOffset, 8);
+                    if (v->size < 8 || shift) {
+                        const std::string shifted = shift
+                            ? name + " >> " + std::to_string(shift) : name;
+                        text = "((" + std::string(uCast(v->size)) + ")(" +
+                               shifted + "))";
+                    } else {
+                        text = name;
+                    }
+                }
+                CExpr expression{text, v->size, false};
+                expression.registerRefs[storageOffset].insert(name);
+                return expression;
             }
             auto it = temps.find(v);
             if (it != temps.end()) return it->second;
-            return CExpr{"?", v->size, false};
+            return CExpr{"0 /* unknown */", v->size, false};
+        };
+        auto scalarFloat = [&](const CExpr& expression, const Varnode* node,
+                               int bits) {
+            const std::string type = bits == 32 ? "float" : "double";
+            const bool vector = node &&
+                (node->size == 16 || node->size == 32 || node->size == 64);
+            if (vector)
+                return "recovered_vector_scalar<" + type + ">(" +
+                       stripParens(expression.text) + ")";
+            if (expression.floating) return stripParens(expression.text);
+            return "recovered_float_from_bits<" + type + ">(" +
+                   stripParens(expression.text) + ")";
+        };
+
+        auto emitX86String = [&](const PcodeInsn& pi, const PcodeOp& op) {
+            // X86_STRING has several architectural outputs and therefore is
+            // intentionally represented as one side-effecting p-code op.
+            // Materialize all of those effects here instead of silently
+            // dropping REP MOVS/STOS/CMPS/LODS/SCAS during C++ emission.
+            const unsigned operation = op.aux & 0x0fU;
+            const unsigned width = (op.aux >> 4) & 0x0fU;
+            const unsigned repeat = (op.aux >> 8) & 0x03U;
+            if (architecture.rfind("x86", 0) != 0 || operation < 1 ||
+                operation > 5 ||
+                (width != 1 && width != 2 && width != 4 && width != 8)) {
+                line("/* unsupported string instruction */");
+                return;
+            }
+
+            const std::string suffix = std::to_string(pi.addr);
+            const std::string count = "recovered_string_count_" + suffix;
+            const std::string lhs = "recovered_string_lhs_" + suffix;
+            const std::string rhs = "recovered_string_rhs_" + suffix;
+            const std::string result = "recovered_string_result_" + suffix;
+            const std::string type = uCast(static_cast<int>(width));
+            const std::string mask = width == 8
+                ? "UINT64_MAX"
+                : std::to_string((uint64_t{1} << (width * 8)) - 1) + "ULL";
+            auto load = [&](const std::string& address) {
+                if (useRecoveredRuntime)
+                    return "recovered_load<" + type + ">(" + address + ")";
+                return "*((" + type + " *)(uintptr_t)(" + address + "))";
+            };
+            auto store = [&](const std::string& address,
+                             const std::string& value) {
+                if (useRecoveredRuntime)
+                    return "recovered_store<" + type + ">(" + address + ", " +
+                           value + ");";
+                return "*((" + type + " *)(uintptr_t)(" + address + ")) = " +
+                       value + ";";
+            };
+            auto advance = [&](const char* reg) {
+                line(std::string(reg) + " = " + reg +
+                     " + (r4102 != 0 ? static_cast<uint64_t>(-" +
+                     std::to_string(width) + "LL) : " +
+                     std::to_string(width) + "ULL);");
+            };
+
+            line("{");
+            ++indent;
+            line("uint64_t " + count + " = " +
+                 (repeat ? "rcx" : "1ULL") + ";");
+            line("while (" + count + " != 0) {");
+            ++indent;
+            if (operation == 1) { // MOVS
+                line("const uint64_t " + lhs + " = " + load("rsi") + ";");
+                line(store("rdi", lhs));
+            } else if (operation == 2) { // CMPS
+                line("const uint64_t " + lhs + " = " + load("rsi") + ";");
+                line("const uint64_t " + rhs + " = " + load("rdi") + ";");
+            } else if (operation == 3) { // STOS
+                line(store("rdi", "static_cast<" + type + ">(rax)"));
+            } else if (operation == 4) { // LODS
+                line("const uint64_t " + lhs + " = " + load("rsi") + ";");
+                line(x86RegisterWrite(architecture, 0, static_cast<int>(width),
+                                      lhs) + ";");
+            } else { // SCAS
+                line("const uint64_t " + lhs + " = static_cast<" + type +
+                     ">(rax);");
+                line("const uint64_t " + rhs + " = " + load("rdi") + ";");
+            }
+
+            if (operation == 2 || operation == 5) {
+                line("const uint64_t " + result + " = (" + lhs + " - " + rhs +
+                     ") & " + mask + ";");
+                line("r4096 = " + lhs + " < " + rhs + ";");
+                line("r4097 = (__builtin_parity((unsigned)(" + result +
+                     ") & 0xffU) == 0);");
+                line("r4098 = ((" + lhs + " ^ " + rhs + " ^ " + result +
+                     ") >> 4) & 1U;");
+                line("r4099 = " + result + " == 0;");
+                line("r4100 = (" + result + " >> " +
+                     std::to_string(width * 8 - 1) + ") & 1U;");
+                line("r4101 = (((" + lhs + " ^ " + rhs + ") & (" + lhs +
+                     " ^ " + result + ")) >> " +
+                     std::to_string(width * 8 - 1) + ") & 1U;");
+            }
+
+            if (operation == 1 || operation == 2 || operation == 4)
+                advance("rsi");
+            if (operation == 1 || operation == 2 || operation == 3 ||
+                operation == 5)
+                advance("rdi");
+            if (repeat) {
+                line("--" + count + ";");
+                line("rcx = " + count + ";");
+            } else {
+                line(count + " = 0;");
+            }
+            if ((operation == 2 || operation == 5) && repeat == 2)
+                line("if (r4099 == 0) break;");
+            if ((operation == 2 || operation == 5) && repeat == 3)
+                line("if (r4099 != 0) break;");
+            --indent;
+            line("}");
+            --indent;
+            line("}");
+
+            // The instruction invalidates any constants learned for its
+            // implicit register outputs before the next instruction.
+            if (repeat) regConst.erase(8); // RCX
+            if (operation == 1 || operation == 2 || operation == 4)
+                regConst.erase(48); // RSI
+            if (operation == 1 || operation == 2 || operation == 3 ||
+                operation == 5)
+                regConst.erase(56); // RDI
+            if (operation == 4) regConst.erase(0); // RAX
         };
 
         for (const auto& pi : blk_.insns) {
@@ -293,10 +649,27 @@ public:
                     continue;
                 }
                 if (op.op == POp::RETURN) continue;
-                if (op.op == POp::CALL) {
+                if (op.op == POp::TRAP) {
+                    line("__builtin_trap();");
+                    continue;
+                }
+                if (op.op == POp::SYSCALL) {
+                    line("/* system call: ABI-specific clobbers */");
+                    continue;
+                }
+                if (op.op == POp::X86_STRING) {
+                    emitX86String(pi, op);
+                    continue;
+                }
+                if (op.op == POp::CALL || op.op == POp::CALLIND) {
                     if (!emitCall(pi, op.in0)) {
-                        line("/* call " + exprOfV(pi.find(op.in0)).text +
-                             " */");
+                        const std::string target = exprOfV(pi.find(op.in0)).text;
+                        line(op.op == POp::CALLIND
+                                 ? (registerName(architecture,
+                                                 returnRegisterOffset(architecture)) +
+                                    " = ((uint64_t (*)(void))(uintptr_t)" +
+                                    target + ")();")
+                                 : ("/* call " + target + " */"));
                     }
                     continue;
                 }
@@ -305,15 +678,25 @@ public:
                     if (op.op == POp::STORE) {
                         int64_t slot = 0;
                         const Varnode* vs = pi.find(op.in2);
-                        if (slotOf(pi, op.in0, slot)) {
+                        if (slotOf(pi, op.in0, slot) && !useRecoveredRuntime) {
                             line(localName(slot) + " = " +
                                  stripParens(exprOfV(pi.find(op.in2)).text) +
                                  ";");
                         } else {
                             const CExpr a = exprOfV(pi.find(op.in0));
                             const CExpr v = exprOfV(pi.find(op.in2));
-                            line("*((uint64_t *)(" + stripParens(a.text) +
-                                 ")) = " + stripParens(v.text) + ";");
+                            if (useRecoveredRuntime) {
+                                const Varnode* stored = pi.find(op.in2);
+                                line("recovered_store<" +
+                                     std::string(uCast(stored ? stored->size : 8)) +
+                                     ">(" + stripParens(a.text) + ", " +
+                                     stripParens(v.text) + ");");
+                            } else {
+                                line("*((" +
+                                     std::string(uCast(vs ? vs->size : 8)) +
+                                     " *)(" + stripParens(a.text) + ")) = " +
+                                     stripParens(v.text) + ";");
+                            }
                         }
                         (void)vs;
                     }
@@ -350,11 +733,7 @@ public:
                             b.text = std::to_string(-n);
                         }
                     }
-                    if (a.isConst && a.text == "0") {
-                        r = b;
-                    } else if (b.isConst && b.text == "0") {
-                        r = a;
-                    } else if (a.isConst && b.isConst) {
+                    if (a.isConst && b.isConst) {
                         const int64_t x = static_cast<int64_t>(
                             std::strtoll(a.text.c_str(), nullptr, 10));
                         const int64_t y = static_cast<int64_t>(
@@ -372,6 +751,22 @@ public:
                         r.text = std::to_string(z);
                         r.size = vo->size;
                         r.isConst = true;
+                    } else if (b.isConst && b.text == "0") {
+                        if (op.op == POp::INT_MULT ||
+                            op.op == POp::INT_AND)
+                            r = b;
+                        else
+                            r = a;
+                    } else if (a.isConst && a.text == "0") {
+                        if (op.op == POp::INT_MULT ||
+                            op.op == POp::INT_AND) {
+                            r = a;
+                        } else if (op.op == POp::INT_SUB) {
+                            r.text = "-(" + stripParens(b.text) + ")";
+                            r.size = vo->size;
+                        } else {
+                            r = b;
+                        }
                     } else {
                         r.text = "(" + a.text + " " + c + " " + b.text + ")";
                         r.size = vo->size;
@@ -385,6 +780,49 @@ public:
                     const CExpr b = exprOfV(pi.find(op.in1));
                     const char* c = op.op == POp::INT_LEFT ? "<<" : ">>";
                     r.text = "(" + a.text + " " + c + " " + b.text + ")";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::INT_DIV:
+                case POp::INT_SDIV:
+                case POp::INT_REM:
+                case POp::INT_SREM: {
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const CExpr b = exprOfV(pi.find(op.in1));
+                    const bool signedOperation = op.op == POp::INT_SDIV ||
+                                                 op.op == POp::INT_SREM;
+                    const bool remainder = op.op == POp::INT_REM ||
+                                           op.op == POp::INT_SREM;
+                    if (a.isConst && b.isConst) {
+                        const uint64_t x = std::strtoull(a.text.c_str(), nullptr, 10);
+                        const uint64_t y = std::strtoull(b.text.c_str(), nullptr, 10);
+                        if (!y) {
+                            r.text = "0";
+                        } else if (signedOperation) {
+                            const int64_t sx = static_cast<int64_t>(x);
+                            const int64_t sy = static_cast<int64_t>(y);
+                            // Avoid C++'s sole signed division overflow case;
+                            // the architecture raises a fault and therefore
+                            // has no ordinary result to materialize here.
+                            if (sx == std::numeric_limits<int64_t>::min() && sy == -1)
+                                r.text = "0";
+                            else
+                                r.text = std::to_string(remainder ? sx % sy : sx / sy);
+                        } else {
+                            r.text = std::to_string(remainder ? x % y : x / y);
+                        }
+                        r.isConst = true;
+                    } else {
+                        const Varnode* input = pi.find(op.in0);
+                        const std::string cast = signedOperation
+                            ? std::string(cCast(input ? input->size : vo->size))
+                            : std::string(uCast(input ? input->size : vo->size));
+                        const std::string x = stripParens(a.text);
+                        const std::string y = stripParens(b.text);
+                        r.text = "((" + y + ") != 0 ? ((" + cast + ")(" + x +
+                                 ") " + (remainder ? "%" : "/") + " ((" + cast +
+                                 ")(" + y + "))) : 0)";
+                    }
                     r.size = vo->size;
                     break;
                 }
@@ -506,19 +944,24 @@ public:
                 case POp::FLOAT_LESS: case POp::FLOAT_LESSEQUAL: {
                     const CExpr a = exprOfV(pi.find(op.in0));
                     const CExpr b = exprOfV(pi.find(op.in1));
+                    const int bits = (op.aux & 0x7fff) == 32 ? 32 : 64;
+                    const std::string x = scalarFloat(a, pi.find(op.in0), bits);
+                    const std::string y = scalarFloat(b, pi.find(op.in1), bits);
                     const char* relation = op.op == POp::FLOAT_EQUAL ? "=="
                                            : op.op == POp::FLOAT_NOTEQUAL ? "!="
                                            : op.op == POp::FLOAT_LESS ? "<" : "<=";
-                    r.text = "(" + stripParens(a.text) + " " + relation + " " +
-                             stripParens(b.text) + ")";
+                    r.text = "(" + x + " " + relation + " " + y + ")";
                     r.size = 1;
                     break;
                 }
                 case POp::FLOAT_NAN: {
                     const CExpr a = exprOfV(pi.find(op.in0));
                     const CExpr b = exprOfV(pi.find(op.in1));
-                    r.text = "(isnan(" + stripParens(a.text) + ") || isnan(" +
-                             stripParens(b.text) + "))";
+                    const int bits = (op.aux & 0x7fff) == 32 ? 32 : 64;
+                    r.text = "(std::isnan(" +
+                             scalarFloat(a, pi.find(op.in0), bits) +
+                             ") || std::isnan(" +
+                             scalarFloat(b, pi.find(op.in1), bits) + "))";
                     r.size = 1;
                     break;
                 }
@@ -527,11 +970,22 @@ public:
                 case POp::FLOAT_MIN: case POp::FLOAT_MAX: {
                     const CExpr a = exprOfV(pi.find(op.in0));
                     const CExpr b = exprOfV(pi.find(op.in1));
+                    const int laneBits = (op.aux & 0x7fff) == 64 ? 64 : 32;
+                    const std::string scalarType = laneBits == 64 ? "double" : "float";
                     const char* symbol = op.op == POp::FLOAT_ADD ? "+"
                                          : op.op == POp::FLOAT_SUB ? "-"
                                          : op.op == POp::FLOAT_MULT ? "*"
                                          : op.op == POp::FLOAT_DIV ? "/" : "";
-                    if (vo->size > 8 && !(op.aux & 0x8000)) {
+                    if (vo->size > 8 && (op.aux & 0x8000)) {
+                        const std::string x = scalarFloat(a, pi.find(op.in0), laneBits);
+                        const std::string y = scalarFloat(b, pi.find(op.in1), laneBits);
+                        const std::string computed =
+                            op.op == POp::FLOAT_MIN ? "std::fmin(" + x + ", " + y + ")"
+                            : op.op == POp::FLOAT_MAX ? "std::fmax(" + x + ", " + y + ")"
+                            : "(" + x + " " + symbol + " " + y + ")";
+                        r.text = "recovered_vector_replace_scalar<" + scalarType +
+                                 ">(" + stripParens(a.text) + ", " + computed + ")";
+                    } else if (vo->size > 8) {
                         const std::string suffix = (op.aux & 0x7fff) == 64 ? "f64" : "f32";
                         r.text = "simd_" + std::string(op.op == POp::FLOAT_ADD ? "add_"
                                                       : op.op == POp::FLOAT_SUB ? "sub_"
@@ -541,46 +995,248 @@ public:
                                  suffix + "(" + stripParens(a.text) + ", " +
                                  stripParens(b.text) + ")";
                     } else {
+                        const std::string x = scalarFloat(a, pi.find(op.in0), laneBits);
+                        const std::string y = scalarFloat(b, pi.find(op.in1), laneBits);
                         if (op.op == POp::FLOAT_MIN || op.op == POp::FLOAT_MAX)
-                            r.text = std::string(op.op == POp::FLOAT_MIN ? "fmin(" : "fmax(") +
-                                     stripParens(a.text) + ", " + stripParens(b.text) + ")";
+                            r.text = std::string(op.op == POp::FLOAT_MIN ? "std::fmin(" : "std::fmax(") +
+                                     x + ", " + y + ")";
                         else
-                            r.text = "(" + stripParens(a.text) + " " + symbol + " " +
-                                     stripParens(b.text) + ")";
+                            r.text = "(" + x + " " + symbol + " " + y + ")";
+                        r.floating = true;
                     }
                     r.size = vo->size;
                     break;
                 }
                 case POp::FLOAT_NEG: case POp::FLOAT_ABS: case POp::FLOAT_SQRT: {
                     const CExpr a = exprOfV(pi.find(op.in0));
-                    const std::string x = stripParens(a.text);
-                    r.text = op.op == POp::FLOAT_NEG ? "(-(" + x + "))"
-                             : op.op == POp::FLOAT_ABS ? "fabs(" + x + ")"
-                                                       : "sqrt(" + x + ")";
+                    const int laneBits = (op.aux & 0x7fff) == 64 ? 64 : 32;
+                    const std::string scalarType = laneBits == 64 ? "double" : "float";
+                    const std::string x = scalarFloat(a, pi.find(op.in0), laneBits);
+                    const std::string computed = op.op == POp::FLOAT_NEG
+                        ? "(-(" + x + "))"
+                        : op.op == POp::FLOAT_ABS ? "std::fabs(" + x + ")"
+                                                  : "std::sqrt(" + x + ")";
+                    if (vo->size > 8 && (op.aux & 0x8000)) {
+                        const CExpr base = op.in1 ? exprOfV(pi.find(op.in1)) : a;
+                        r.text = "recovered_vector_replace_scalar<" + scalarType +
+                                 ">(" + stripParens(base.text) + ", " + computed + ")";
+                    } else {
+                        r.text = computed;
+                        r.floating = true;
+                    }
                     r.size = vo->size;
                     break;
                 }
                 case POp::FLOAT_INT2FLOAT: {
                     const CExpr a = exprOfV(pi.find(op.in0));
-                    r.text = std::string((op.aux & 0x7fff) == 32 ? "(float)(int64_t)("
-                                                                 : "(double)(int64_t)(") +
-                             stripParens(a.text) + ")";
+                    const bool single = (op.aux & 0x7fff) == 32;
+                    const std::string type = single ? "float" : "double";
+                    const std::string converted = "(" + type + ")(int64_t)(" +
+                                                  stripParens(a.text) + ")";
+                    if (vo->size > 8 && op.in1) {
+                        const CExpr base = exprOfV(pi.find(op.in1));
+                        r.text = "recovered_vector_replace_scalar<" + type + 
+                                 ">(" + stripParens(base.text) + ", " + converted + ")";
+                    } else {
+                        r.text = converted;
+                        r.floating = true;
+                    }
                     r.size = vo->size;
                     break;
                 }
                 case POp::FLOAT_FLOAT2INT: {
                     const CExpr a = exprOfV(pi.find(op.in0));
-                    const std::string x = stripParens(a.text);
-                    r.text = (op.aux & 0x8000) ? "(int64_t)trunc(" + x + ")"
-                                               : "(int64_t)nearbyint(" + x + ")";
+                    const int sourceBits = (op.aux & 0x7fff) == 32 ? 32 : 64;
+                    const std::string x = scalarFloat(a, pi.find(op.in0), sourceBits);
+                    r.text = (op.aux & 0x8000) ? "(int64_t)std::trunc(" + x + ")"
+                                               : "(int64_t)std::nearbyint(" + x + ")";
                     r.size = vo->size;
                     break;
                 }
                 case POp::FLOAT_FLOAT2FLOAT: {
                     const CExpr a = exprOfV(pi.find(op.in0));
+                    const int sourceBits = (op.aux & 0xff) == 32 ? 32 : 64;
                     const int destinationBits = (op.aux >> 8) & 0x7f;
-                    r.text = std::string(destinationBits == 32 ? "(float)(" : "(double)(") +
-                             stripParens(a.text) + ")";
+                    const std::string destinationType = destinationBits == 32
+                        ? "float" : "double";
+                    const std::string converted = "(" + destinationType + ")(" +
+                        scalarFloat(a, pi.find(op.in0), sourceBits) + ")";
+                    if (vo->size > 8 && op.in1) {
+                        const CExpr base = exprOfV(pi.find(op.in1));
+                        r.text = "recovered_vector_replace_scalar<" +
+                                 destinationType + ">(" + stripParens(base.text) +
+                                 ", " + converted + ")";
+                    } else {
+                        r.text = converted;
+                        r.floating = true;
+                    }
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_MASK: {
+                    const CExpr computed = exprOfV(pi.find(op.in0));
+                    const CExpr previous = exprOfV(pi.find(op.in1));
+                    const CExpr mask = exprOfV(pi.find(op.in2));
+                    r.text = std::string((op.aux & 0x8000)
+                                             ? "simd_mask_zero("
+                                             : "simd_mask_merge(") +
+                             stripParens(computed.text) + ", " +
+                             stripParens(previous.text) + ", " +
+                             stripParens(mask.text) + ")";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_EXTRACT: {
+                    const CExpr vector = exprOfV(pi.find(op.in0));
+                    const CExpr lane = exprOfV(pi.find(op.in1));
+                    const Varnode* vectorNode = pi.find(op.in0);
+                    const unsigned bits = static_cast<unsigned>(
+                        std::max(1, vo->size) * 8);
+                    if (vectorNode && vectorNode->size > 8) {
+                        r.text = "recovered_vector_extract<" +
+                                 std::string(uCast(vo->size)) + ">(" +
+                                 stripParens(vector.text) + ", " +
+                                 stripParens(lane.text) + ")";
+                    } else {
+                        r.text = "((" + std::string(uCast(vo->size)) + ")((" +
+                                 stripParens(lane.text) + " * " +
+                                 std::to_string(bits) + " < 64) ? ((" +
+                                 stripParens(vector.text) + ") >> (" +
+                                 stripParens(lane.text) + " * " +
+                                 std::to_string(bits) + ")) : 0))";
+                    }
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_INSERT: {
+                    const CExpr previous = exprOfV(pi.find(op.in0));
+                    const CExpr inserted = exprOfV(pi.find(op.in1));
+                    const CExpr lane = exprOfV(pi.find(op.in2));
+                    const Varnode* insertedNode = pi.find(op.in1);
+                    const unsigned bits = static_cast<unsigned>(
+                        std::max(1, insertedNode ? insertedNode->size : 8) * 8);
+                    if (vo->size > 8) {
+                        const std::string laneType = uCast(
+                            insertedNode ? insertedNode->size : 8);
+                        r.text = "recovered_vector_insert<" + laneType + ">(" +
+                                 stripParens(previous.text) + ", (" + laneType +
+                                 ")(" + stripParens(inserted.text) + "), " +
+                                 stripParens(lane.text) + ")";
+                        r.size = vo->size;
+                        break;
+                    }
+                    const std::string mask = bits >= 64
+                        ? "UINT64_MAX"
+                        : "((UINT64_C(1) << " + std::to_string(bits) + ") - 1)";
+                    const std::string shift = "(" + stripParens(lane.text) +
+                                              " * " + std::to_string(bits) + ")";
+                    r.text = "((" + shift + " < 64) ? (((" +
+                             stripParens(previous.text) + ") & ~((" + mask +
+                             ") << " + shift + ")) | (((" +
+                             stripParens(inserted.text) + ") & (" + mask +
+                             ")) << " + shift + ")) : (" +
+                             stripParens(previous.text) + "))";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_SHUFFLE: {
+                    // SHUFPS is the form currently reaching the project
+                    // emitter in the Blender corpus.  Its low two result
+                    // lanes are selected from the first input by imm[3:0].
+                    const CExpr left = exprOfV(pi.find(op.in0));
+                    const CExpr control = exprOfV(pi.find(op.in2));
+                    const std::string source = stripParens(left.text);
+                    const std::string immediate = stripParens(control.text);
+                    const std::string first = "((" + immediate + " & 3) < 2 ? ((" +
+                        source + ") >> ((" + immediate + " & 3) * 32)) : 0)";
+                    const std::string second = "(((" + immediate + " >> 2) & 3) < 2 ? ((" +
+                        source + ") >> (((" + immediate + " >> 2) & 3) * 32)) : 0)";
+                    r.text = "((" + first + " & UINT64_C(0xffffffff)) | ((" +
+                             second + " & UINT64_C(0xffffffff)) << 32))";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_BYTE_SHIFT: {
+                    // Project C currently carries the observable low 64-bit
+                    // window of an XMM/YMM/ZMM value.  Preserve byte shifts
+                    // within that window and explicitly zero it when the
+                    // selected 128-bit source bytes lie above the window.
+                    const CExpr source = exprOfV(pi.find(op.in0));
+                    const CExpr count = exprOfV(pi.find(op.in1));
+                    const std::string x = stripParens(source.text);
+                    const std::string n = stripParens(count.text);
+                    const bool right = (op.aux & 1U) != 0;
+                    r.text = "((" + n + ") < 8 ? ((" + x + ") " +
+                             (right ? ">>" : "<<") + " ((" + n +
+                             ") * 8)) : 0)";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::INT_BSWAP: {
+                    // Byte-swap a GPR-sized value.  vo->size is the operand
+                    // width (4 or 8 for the x86 BSWAP family).
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const std::string x = stripParens(a.text);
+                    r.text = vo->size >= 8
+                        ? "__builtin_bswap64(" + x + ")"
+                        : "__builtin_bswap32((uint32_t)(" + x + "))";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_INT2FLOAT:
+                case POp::SIMD_FLOAT2FLOAT: {
+                    // Packed lane-wise conversion (cvtdq2pd, cvtps2pd,
+                    // cvtpd2ps, ...).  aux = sourceBits | (destBits << 8).
+                    // Each source lane is extracted, converted, and inserted
+                    // into the destination vector; lanes beyond the source
+                    // width stay zero (recovered_vector_extract returns 0
+                    // out of range), matching x86 zero-fill semantics.
+                    const CExpr source = exprOfV(pi.find(op.in0));
+                    const Varnode* sourceNode = pi.find(op.in0);
+                    const int sourceBits = (op.aux & 0xff) ? (op.aux & 0xff) : 32;
+                    const int destinationBits =
+                        ((op.aux >> 8) & 0x7f) ? ((op.aux >> 8) & 0x7f) : 32;
+                    const int destinationBytes = destinationBits / 8;
+                    const int lanes =
+                        std::max(1, vo->size / destinationBytes);
+                    const std::string sourceType =
+                        op.op == POp::SIMD_INT2FLOAT
+                            ? (sourceBits == 32 ? "int32_t" : "int64_t")
+                            : (sourceBits == 32 ? "float" : "double");
+                    const std::string destinationType =
+                        destinationBits == 32 ? "float" : "double";
+                    const bool vectorSource =
+                        sourceNode && sourceNode->size > 8;
+                    const std::string srcText = stripParens(source.text);
+                    std::string result = "RecoveredVector<" +
+                        std::to_string(vo->size) + ">{}";
+                    for (int lane = lanes - 1; lane >= 0; --lane) {
+                        std::string laneValue;
+                        if (vectorSource) {
+                            laneValue = "recovered_vector_extract<" +
+                                sourceType + ">(" + srcText + ", " +
+                                std::to_string(lane) + ")";
+                        } else if (op.op == POp::SIMD_INT2FLOAT) {
+                            laneValue = "(" + sourceType +
+                                ")((uint64_t)(" + srcText + ") >> " +
+                                std::to_string(lane * sourceBits) + ")";
+                        } else {
+                            laneValue = "recovered_float_from_bits<" +
+                                sourceType + ">((uint64_t)(" + srcText +
+                                ") >> " + std::to_string(lane * sourceBits) +
+                                ")";
+                        }
+                        std::string converted =
+                            op.op == POp::SIMD_INT2FLOAT
+                                ? "(" + destinationType + ")(int64_t)(" +
+                                      laneValue + ")"
+                                : "(" + destinationType + ")(" + laneValue +
+                                      ")";
+                        result = "recovered_vector_insert<" +
+                            destinationType + ">(" + result + ", " +
+                            converted + ", " + std::to_string(lane) + ")";
+                    }
+                    r.text = result;
                     r.size = vo->size;
                     break;
                 }
@@ -595,51 +1251,127 @@ public:
                 }
                 case POp::LOAD: {
                     int64_t slot = 0;
-                    if (slotOf(pi, op.in0, slot)) {
+                    if (slotOf(pi, op.in0, slot) && !useRecoveredRuntime) {
                         r = CExpr{localName(slot), vo->size, false};
                     } else {
                         const CExpr a = exprOfV(pi.find(op.in0));
-                        r.text = "(*(" + std::string(uCast(vo->size)) +
-                                 " *)(" + stripParens(a.text) + "))";
+                        r.text = useRecoveredRuntime
+                            ? "recovered_load<" + std::string(uCast(vo->size)) +
+                                  ">(" + stripParens(a.text) + ")"
+                            : "(*(" + std::string(uCast(vo->size)) +
+                                  " *)(" + stripParens(a.text) + "))";
                         r.size = vo->size;
                     }
                     break;
                 }
                 default:
-                    r.text = "?";
+                    r.text = "0 /* unknown */";
                     r.size = vo->size;
                     break;
                 }
+                // Propagate register dependencies through UNIQUE expression
+                // trees.  Text alone is insufficient here: an instruction
+                // can write one architectural result before another result's
+                // generated C expression has been evaluated.
+                for (uint64_t input : {op.in0, op.in1, op.in2}) {
+                    const CExpr inputExpression = exprOfV(pi.find(input));
+                    for (const auto& reference : inputExpression.registerRefs)
+                        r.registerRefs[reference.first].insert(
+                            reference.second.begin(), reference.second.end());
+                }
+                // The destination varnode, not the right-hand expression,
+                // defines the architectural write width.  In particular,
+                // COPY of an untyped integer constant into AL/AH/EAX must not
+                // silently become a full-width RAX assignment.
+                r.size = vo->size;
                 if (vo->kind == Varnode::REGISTER) {
-                    if (vo->offset != 0) pending.emplace_back(vo->offset, r);
+                    if (architecture.rfind("riscv", 0) != 0 || vo->offset != 0)
+                        pending.emplace_back(vo->offset, r);
                 } else {
                     temps[vo] = r;
                 }
             }
+            std::map<uint64_t, size_t> firstWrite;
+            for (size_t index = 0; index < pending.size(); ++index) {
+                const uint64_t storage = registerStorageOffset(
+                    architecture, pending[index].first,
+                    pending[index].second.size);
+                firstWrite.emplace(storage, index);
+            }
+
+            std::map<std::string, std::string> snapshots;
+            for (size_t index = 0; index < pending.size(); ++index) {
+                for (const auto& reference : pending[index].second.registerRefs) {
+                    const auto write = firstWrite.find(reference.first);
+                    if (write == firstWrite.end() || write->second >= index)
+                        continue;
+                    for (const std::string& name : reference.second) {
+                        snapshots.emplace(
+                            name, "recovered_old_" + std::to_string(pi.addr) +
+                                      "_" + safeIdentifier(name));
+                    }
+                }
+            }
+            if (!snapshots.empty()) {
+                line("{");
+                ++indent;
+                for (const auto& snapshot : snapshots)
+                    line("const auto " + snapshot.second + " = " +
+                         snapshot.first + ";");
+            }
+
             for (const auto& kv : pending) {
+                const uint64_t storage = registerStorageOffset(
+                    architecture, kv.first, kv.second.size);
                 // track sp adjustment (prologue/frame): sp = sp +/- K
-                if (kv.first == SP_OFF) {
+                if (storage == stackPointerOffset(architecture) &&
+                    kv.second.size == 8) {
                     int64_t bias = 0;
-                    if (parseSpExpr(kv.second.text, bias)) spBias += bias;
+                    if (parseSpExpr(kv.second.text,
+                                    registerName(architecture, storage, 8),
+                                    bias))
+                        spBias += bias;
                 }
                 // track constant-valued registers (for jalr resolution)
                 {
                     int64_t k = 0;
                     std::string reg;
                     if (parseRegConstExpr(kv.second.text, reg, k) &&
-                        reg.empty())
-                        regConst[kv.first] = k;
-                    else
-                        regConst.erase(kv.first);
+                        reg.empty()) {
+                        uint64_t base = kv.first;
+                        unsigned shift = 0;
+                        if (!x86GprSlice(architecture, kv.first,
+                                         kv.second.size, base, shift) ||
+                            kv.second.size == 8 ||
+                            (kv.second.size == 4 && shift == 0)) {
+                            if (kv.second.size == 4)
+                                k = static_cast<uint32_t>(k);
+                            regConst[storage] = k;
+                        } else {
+                            regConst.erase(storage);
+                        }
+                    } else {
+                        regConst.erase(storage);
+                    }
                 }
-                line(std::string(regName64(kv.first)) + " = " +
-                     stripParens(kv.second.text) + ";");
+                std::string expression = kv.second.text;
+                for (const auto& snapshot : snapshots)
+                    expression = replaceIdentifier(expression, snapshot.first,
+                                                   snapshot.second);
+                line(x86RegisterWrite(architecture, kv.first, kv.second.size,
+                                      stripParens(expression)) + ";");
+            }
+            if (!snapshots.empty()) {
+                --indent;
+                line("}");
             }
             pending.clear();
         }
     }
 
-    std::string retValue() const { return "a0"; }
+    std::string retValue() const {
+        return registerName(architecture, returnRegisterOffset(architecture));
+    }
 
 private:
     const CfgBlock& blk_;
@@ -655,7 +1387,9 @@ std::string decompile(
     const SleighEngine& eng,
     const std::function<bool(uint64_t, void*, size_t)>& read, uint64_t start,
     uint64_t end,
-    const std::function<std::string(uint64_t)>& nameOf) {
+    const std::function<std::string(uint64_t)>& nameOf,
+    const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf,
+    const std::string& architecture, bool useRecoveredRuntime) {
     CfgBuilder cfg;
     if (!cfg.build(eng, read, start, end)) return "// failed to build CFG\n";
 
@@ -695,6 +1429,9 @@ std::string decompile(
                     BlockEmitter body(*b);
                     body.indent = depth + 2;
                     body.nameOf = nameOf;
+                    body.signatureOf = signatureOf;
+                    body.architecture = architecture;
+                    body.useRecoveredRuntime = useRecoveredRuntime;
                     body.spBias = frameBias;
                     body.emit();
                     if (body.hasCond && !body.cond.empty()) {
@@ -716,6 +1453,9 @@ std::string decompile(
                 BlockEmitter body(*b);
                 body.indent = depth + 2;
                 body.nameOf = nameOf;
+                body.signatureOf = signatureOf;
+                body.architecture = architecture;
+                body.useRecoveredRuntime = useRecoveredRuntime;
                 body.spBias = frameBias;
                 body.emit();
                 for (int i = 0; i <= depth; ++i) out << "    ";
@@ -744,6 +1484,9 @@ std::string decompile(
                 BlockEmitter header(*b);
                 header.indent = depth + 1;
                 header.nameOf = nameOf;
+                header.signatureOf = signatureOf;
+                header.architecture = architecture;
+                header.useRecoveredRuntime = useRecoveredRuntime;
                 header.spBias = frameBias;
                 header.emit();
                 if (header.out.str().empty() && header.hasCond &&
@@ -754,6 +1497,9 @@ std::string decompile(
                         BlockEmitter body(*bodyBlock);
                         body.indent = depth + 2;
                         body.nameOf = nameOf;
+                        body.signatureOf = signatureOf;
+                        body.architecture = architecture;
+                        body.useRecoveredRuntime = useRecoveredRuntime;
                         body.spBias = frameBias;
                         body.emit();
                         const std::string condition =
@@ -776,6 +1522,9 @@ std::string decompile(
         BlockEmitter be(*b);
         be.indent = depth + 1;
         be.nameOf = nameOf;
+        be.signatureOf = signatureOf;
+        be.architecture = architecture;
+        be.useRecoveredRuntime = useRecoveredRuntime;
         be.spBias = frameBias;
         be.emit();
         out << be.out.str(); // flush block body
@@ -793,12 +1542,51 @@ std::string decompile(
             const uint64_t target = term->target;
             const uint64_t fall = b->succs[0];
             const CfgBlock* tb = cfg.blockAt(target);
+            const CfgBlock* fb = cfg.blockAt(fall);
+            if (tb && fb && target != fall && !tb->isRet() && !fb->isRet() &&
+                tb->succs.size() == 1 && fb->succs.size() == 1 &&
+                tb->succs[0] == fb->succs[0] &&
+                cfg.predecessors(target).size() == 1 &&
+                cfg.predecessors(fall).size() == 1 &&
+                !emitted.count(target) && !emitted.count(fall)) {
+                BlockEmitter thenBody(*tb);
+                thenBody.indent = depth + 2;
+                thenBody.nameOf = nameOf;
+                thenBody.signatureOf = signatureOf;
+                thenBody.architecture = architecture;
+                thenBody.useRecoveredRuntime = useRecoveredRuntime;
+                thenBody.spBias = frameBias;
+                thenBody.emit();
+                BlockEmitter elseBody(*fb);
+                elseBody.indent = depth + 2;
+                elseBody.nameOf = nameOf;
+                elseBody.signatureOf = signatureOf;
+                elseBody.architecture = architecture;
+                elseBody.useRecoveredRuntime = useRecoveredRuntime;
+                elseBody.spBias = frameBias;
+                elseBody.emit();
+                for (int i = 0; i <= depth; ++i) out << "    ";
+                out << "if (" << be.cond << ") {\n" << thenBody.out.str();
+                for (int i = 0; i <= depth; ++i) out << "    ";
+                out << "} else {\n" << elseBody.out.str();
+                for (int i = 0; i <= depth; ++i) out << "    ";
+                out << "}\n";
+                emitted.insert(target);
+                emitted.insert(fall);
+                frameBias = std::min({frameBias, thenBody.spBias,
+                                      elseBody.spBias});
+                emitBlock(tb->succs[0], depth);
+                return;
+            }
             if (tb && tb->isRet() && cfg.predecessors(target).size() == 1) {
                 for (int i = 0; i <= depth; ++i) out << "    ";
                 out << "if (" << be.cond << ") {\n";
                 BlockEmitter te(*tb);
                 te.indent = depth + 2;
                 te.nameOf = nameOf;
+                te.signatureOf = signatureOf;
+                te.architecture = architecture;
+                te.useRecoveredRuntime = useRecoveredRuntime;
                 te.spBias = frameBias;
                 te.emit();
                 out << te.out.str(); // flush if-body
@@ -818,12 +1606,47 @@ std::string decompile(
         }
         if (b->tailCallTarget) {
             std::string args;
-            for (int i = 0; i < 8; ++i)
-                args += (i ? ", " : "") +
-                        std::string(regName64((10 + i) * 8));
+            const auto targetSignature = signatureOf
+                                             ? signatureOf(*b->tailCallTarget)
+                                             : std::optional<FunctionSignature>{};
+            const size_t argumentCount = targetSignature
+                                             ? targetSignature->parameters.size() : 8;
+            const std::vector<uint64_t> fallback =
+                defaultArgumentRegisters(architecture);
+            for (size_t i = 0; i < argumentCount; ++i) {
+                const uint64_t offset = targetSignature
+                                            ? targetSignature->parameters[i].registerOffset
+                                            : fallback[std::min(i, fallback.size() - 1)];
+                const bool stackArgument = targetSignature &&
+                                           targetSignature->parameters[i].onStack;
+                std::string argument;
+                if (stackArgument) {
+                    const std::string address =
+                        registerName(architecture,
+                                     stackPointerOffset(architecture)) +
+                        " + " +
+                        std::to_string(targetSignature->parameters[i].stackOffset);
+                    argument = useRecoveredRuntime
+                        ? "recovered_load<std::uint64_t>(" + address + ")"
+                        : "*((uint64_t *)(uintptr_t)(" + address + "))";
+                } else {
+                    argument = registerName(architecture, offset);
+                }
+                args += (i ? ", " : "") + argument;
+            }
             for (int i = 0; i <= depth; ++i) out << "    ";
-            out << "return " << nameOf(*b->tailCallTarget) << "(" << args
-                << ");\n";
+            if (targetSignature &&
+                targetSignature->returnType.kind == TypeKind::VOID_TYPE) {
+                out << nameOf(*b->tailCallTarget) << "(" << args << ");\n";
+                for (int i = 0; i <= depth; ++i) out << "    ";
+                out << "return "
+                    << registerName(architecture,
+                                    returnRegisterOffset(architecture))
+                    << ";\n";
+            } else {
+                out << "return " << nameOf(*b->tailCallTarget) << "(" << args
+                    << ");\n";
+            }
             return;
         }
         if (term->kind == Insn::JMP && term->targetKnown) {
@@ -845,6 +1668,219 @@ std::string decompile(
     // path), so every label is defined
     for (const auto& b : cfg.blocks())
         if (!emitted.count(b.start)) emitBlock(b.start, 0);
+    return out.str();
+}
+
+std::string decompileTyped(
+    const SleighEngine& eng,
+    const std::function<bool(uint64_t, void*, size_t)>& read, uint64_t start,
+    uint64_t end, const std::string& architecture, const std::string& functionName,
+    const FunctionSignature& signature,
+    const std::function<std::string(uint64_t)>& nameOf,
+    const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf) {
+    return decompileTyped(eng, read, start, end, architecture, functionName,
+                          signature, nameOf, signatureOf, false);
+}
+
+std::string decompileTyped(
+    const SleighEngine& eng,
+    const std::function<bool(uint64_t, void*, size_t)>& read, uint64_t start,
+    uint64_t end, const std::string& architecture, const std::string& functionName,
+    const FunctionSignature& signature,
+    const std::function<std::string(uint64_t)>& nameOf,
+    const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf,
+    bool useRecoveredRuntime) {
+    const std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
+                                       architecture, useRecoveredRuntime);
+    std::set<std::string> locals;
+    for (size_t at = 0; (at = body.find("local_", at)) != std::string::npos;) {
+        size_t finish = at + 6;
+        while (finish < body.size() &&
+               (std::isalnum(static_cast<unsigned char>(body[finish])) ||
+                body[finish] == '_'))
+            ++finish;
+        locals.insert(body.substr(at, finish - at));
+        at = finish;
+    }
+    for (const FunctionParameter& parameter : signature.parameters)
+        if (parameter.onStack && !useRecoveredRuntime)
+            locals.insert(localName(parameter.stackOffset));
+    auto identifierUsed = [&](const std::string& identifier) {
+        for (size_t at = 0; (at = body.find(identifier, at)) != std::string::npos;
+             at += identifier.size()) {
+            const bool left = at == 0 ||
+                !(std::isalnum(static_cast<unsigned char>(body[at - 1])) ||
+                  body[at - 1] == '_');
+            const size_t after = at + identifier.size();
+            const bool right = after == body.size() ||
+                !(std::isalnum(static_cast<unsigned char>(body[after])) ||
+                  body[after] == '_');
+            if (left && right) return true;
+        }
+        return false;
+    };
+    std::ostringstream out;
+    out << signature.declaration(functionName) << " {\n";
+    {
+        const int registerCount = architecture.rfind("x86", 0) == 0 ? 16 : 32;
+        std::vector<std::string> usedRegisters;
+        for (int index = 0; index < registerCount; ++index) {
+            const std::string name = registerName(architecture, index * 8);
+            bool parameterRegister = false;
+            for (const FunctionParameter& parameter : signature.parameters)
+                parameterRegister |= parameter.registerOffset ==
+                                     static_cast<uint64_t>(index * 8);
+            if (signature.returnComponents.size() > 1)
+                parameterRegister |= secondaryReturnRegisterOffset(architecture) ==
+                                     static_cast<uint64_t>(index * 8);
+            if (name != "zero" && (identifierUsed(name) || parameterRegister))
+                usedRegisters.push_back(name);
+        }
+        // Architecture specifications may expose status, mask, or virtual
+        // registers outside the conventional integer-register bank.  Their
+        // fallback names are r<offset>; discover every such identifier used
+        // by the emitted body so generated C/C++ never references an
+        // undeclared architectural register (for example x86 flag r512).
+        for (size_t at = 0; at < body.size();) {
+            if (body[at] != 'r' || at + 1 >= body.size() ||
+                !std::isdigit(static_cast<unsigned char>(body[at + 1]))) {
+                ++at;
+                continue;
+            }
+            const bool leftBoundary = at == 0 ||
+                !(std::isalnum(static_cast<unsigned char>(body[at - 1])) ||
+                  body[at - 1] == '_');
+            size_t finish = at + 1;
+            while (finish < body.size() &&
+                   std::isdigit(static_cast<unsigned char>(body[finish])))
+                ++finish;
+            const bool rightBoundary = finish == body.size() ||
+                !(std::isalnum(static_cast<unsigned char>(body[finish])) ||
+                  body[finish] == '_');
+            if (leftBoundary && rightBoundary) {
+                const std::string name = body.substr(at, finish - at);
+                if (std::find(usedRegisters.begin(), usedRegisters.end(), name) ==
+                    usedRegisters.end())
+                    usedRegisters.push_back(name);
+            }
+            at = finish;
+        }
+        if (architecture.rfind("x86", 0) == 0) {
+            for (const char* segmentBase : {"fsbase", "gsbase"})
+                if (identifierUsed(segmentBase) &&
+                    std::find(usedRegisters.begin(), usedRegisters.end(),
+                              segmentBase) == usedRegisters.end())
+                    usedRegisters.push_back(segmentBase);
+        }
+        if (!usedRegisters.empty()) {
+            out << "    uint64_t ";
+            for (size_t index = 0; index < usedRegisters.size(); ++index)
+                out << (index ? ", " : "") << usedRegisters[index] << " = 0";
+            out << ";\n";
+        }
+        const struct {
+            const char* prefix;
+            const char* type;
+            int count;
+        } vectorBanks[] = {
+            {"xmm", "RecoveredVector128", 32},
+            {"ymm", "RecoveredVector256", 32},
+            {"zmm", "RecoveredVector512", 32},
+        };
+        for (const auto& bank : vectorBanks) {
+            std::vector<std::string> used;
+            for (int index = 0; index < bank.count; ++index) {
+                const std::string name = std::string(bank.prefix) +
+                                         std::to_string(index);
+                if (identifierUsed(name)) used.push_back(name);
+            }
+            if (used.empty()) continue;
+            out << "    " << bank.type << " ";
+            for (size_t index = 0; index < used.size(); ++index)
+                out << (index ? ", " : "") << used[index] << "{}";
+            out << ";\n";
+        }
+        if (useRecoveredRuntime && architecture.rfind("x86", 0) == 0 &&
+            identifierUsed("rsp")) {
+            out << "    RecoveredStackFrame recovered_stack_frame;\n"
+                << "    rsp = recovered_stack_frame.pointer();\n";
+        }
+        if (useRecoveredRuntime && architecture.rfind("x86", 0) == 0) {
+            if (identifierUsed("fsbase"))
+                out << "    fsbase = recovered_fs_base();\n";
+            if (identifierUsed("gsbase"))
+                out << "    gsbase = recovered_gs_base();\n";
+        }
+        for (const FunctionParameter& parameter : signature.parameters) {
+            if (parameter.onStack) continue;
+            const std::string name = registerName(architecture,
+                                                  parameter.registerOffset);
+            out << "    " << name << " = (uint64_t)(uintptr_t)"
+                << parameter.name << ";\n";
+        }
+    }
+    if (!locals.empty()) {
+        out << "    uint64_t ";
+        size_t index = 0;
+        for (const std::string& local : locals)
+            out << (index++ ? ", " : "") << local << " = 0";
+        out << ";\n";
+    }
+    for (const FunctionParameter& parameter : signature.parameters)
+        if (parameter.onStack) {
+            if (useRecoveredRuntime)
+                out << "    recovered_store<std::uint64_t>(rsp + "
+                    << parameter.stackOffset << ", " << parameter.name
+                    << ");\n";
+            else
+                out << "    " << localName(parameter.stackOffset)
+                    << " = (uint64_t)(uintptr_t)" << parameter.name << ";\n";
+        }
+    std::istringstream lines(body);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (line.rfind("// decompiled", 0) == 0) continue;
+        const size_t first = line.find_first_not_of(' ');
+        const std::string machineReturn = "return " +
+            registerName(architecture, returnRegisterOffset(architecture)) + ";";
+        if (signature.returnType.kind == TypeKind::VOID_TYPE &&
+            first != std::string::npos && line.substr(first) == machineReturn)
+            line = line.substr(0, first) + "return;";
+        else if (signature.returnType.kind == TypeKind::VOID_TYPE &&
+                 first != std::string::npos &&
+                 line.compare(first, 7, "return ") == 0) {
+            const std::string indentation = line.substr(0, first);
+            line = indentation + line.substr(first + 7) + "\n" +
+                   indentation + "return;";
+        }
+        else if (signature.returnType.kind == TypeKind::POINTER &&
+                 first != std::string::npos && line.substr(first) == machineReturn)
+            line = line.substr(0, first) + "return (void *)(uintptr_t)" +
+                   registerName(architecture,
+                                returnRegisterOffset(architecture)) + ";";
+        else if (signature.returnComponents.size() > 1 &&
+                 signature.returnType.kind == TypeKind::STRUCT &&
+                 signature.returnType.detail &&
+                 first != std::string::npos && line.substr(first) == machineReturn)
+            line = line.substr(0, first) + "return (struct " +
+                   signature.returnType.detail->name + "){ " +
+                   registerName(architecture, returnRegisterOffset(architecture)) +
+                   ", " + registerName(architecture,
+                                        secondaryReturnRegisterOffset(architecture)) +
+                   " };";
+        out << line << "\n";
+    }
+    if (signature.returnType.kind == TypeKind::VOID_TYPE)
+        out << "    return;\n";
+    else if (signature.returnType.kind == TypeKind::FLOAT)
+        out << "    return 0.0;\n";
+    else if ((signature.returnType.kind == TypeKind::STRUCT ||
+              signature.returnType.kind == TypeKind::UNION) &&
+             signature.returnType.detail)
+        out << "    return (" << signature.returnType.name() << "){0};\n";
+    else
+        out << "    return 0;\n";
+    out << "}\n";
     return out.str();
 }
 

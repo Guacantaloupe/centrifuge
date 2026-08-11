@@ -6,6 +6,7 @@
 //   centrifuge <file> disasm <addr> [count]
 //   centrifuge <file> dump <addr> <size>
 #include <cctype>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,8 +21,12 @@
 #include "centrifuge/disasm.hpp"
 #include "centrifuge/loader.hpp"
 #include "centrifuge/ir.hpp"
+#include "centrifuge/highir.hpp"
 #include "centrifuge/pcode.hpp"
+#include "centrifuge/program_graph.hpp"
+#include "centrifuge/project_recovery.hpp"
 #include "centrifuge/sleigh.hpp"
+#include "centrifuge/semantic_coverage.hpp"
 
 using namespace centrifuge;
 
@@ -36,6 +41,53 @@ std::string hexAddr(uint64_t a) {
         std::snprintf(buf, sizeof(buf), "0x%016llX",
                       static_cast<unsigned long long>(a));
     return buf;
+}
+
+const char* modRefName(ModRefInfo info) {
+    switch (info) {
+    case ModRefInfo::NO_ACCESS: return "none";
+    case ModRefInfo::REF: return "ref";
+    case ModRefInfo::MOD: return "mod";
+    case ModRefInfo::MOD_REF: return "mod/ref";
+    case ModRefInfo::UNKNOWN: return "unknown";
+    }
+    return "unknown";
+}
+
+const char* cppMethodRoleName(CppMethodRole role) {
+    switch (role) {
+    case CppMethodRole::UNKNOWN: return "unknown";
+    case CppMethodRole::METHOD: return "method";
+    case CppMethodRole::CONSTRUCTOR: return "constructor";
+    case CppMethodRole::COPY_CONSTRUCTOR: return "copy-constructor";
+    case CppMethodRole::MOVE_CONSTRUCTOR: return "move-constructor";
+    case CppMethodRole::BASE_DESTRUCTOR: return "base-destructor";
+    case CppMethodRole::COMPLETE_DESTRUCTOR: return "complete-destructor";
+    case CppMethodRole::DELETING_DESTRUCTOR: return "deleting-destructor";
+    case CppMethodRole::COPY_ASSIGNMENT: return "copy-assignment";
+    case CppMethodRole::MOVE_ASSIGNMENT: return "move-assignment";
+    case CppMethodRole::VIRTUAL_METHOD: return "virtual-method";
+    case CppMethodRole::PURE_VIRTUAL: return "pure-virtual";
+    case CppMethodRole::ADJUSTOR_THUNK: return "adjustor-thunk";
+    case CppMethodRole::COVARIANT_RETURN_THUNK: return "covariant-return-thunk";
+    case CppMethodRole::FACTORY: return "factory";
+    case CppMethodRole::ALLOCATOR: return "allocator";
+    case CppMethodRole::DEALLOCATOR: return "deallocator";
+    }
+    return "unknown";
+}
+
+const char* cppRuntimeOperationName(CppRuntimeOperationKind kind) {
+    switch (kind) {
+    case CppRuntimeOperationKind::DYNAMIC_CAST: return "dynamic_cast";
+    case CppRuntimeOperationKind::TYPEID: return "typeid";
+    case CppRuntimeOperationKind::THROW_EXCEPTION: return "throw";
+    case CppRuntimeOperationKind::BEGIN_CATCH: return "begin-catch";
+    case CppRuntimeOperationKind::END_CATCH: return "end-catch";
+    case CppRuntimeOperationKind::RETHROW: return "rethrow";
+    case CppRuntimeOperationKind::PLACEMENT_NEW: return "placement-new";
+    }
+    return "runtime-operation";
 }
 
 bool parseAddr(const char* s, uint64_t& out) {
@@ -63,6 +115,7 @@ const char* srcName(Function::Src s) {
     case Function::SYMBOL: return "sym";
     case Function::EXPORT: return "export";
     case Function::ENTRY:  return "entry";
+    case Function::UNWIND: return "unwind";
     case Function::SCAN:   return "scan";
     }
     return "?";
@@ -82,6 +135,10 @@ int cmdInfo(const Program& p) {
                     static_cast<unsigned long long>(s.size),
                     permsStr(s.perm).c_str());
     std::printf("symbols:   %zu\n", p.symbols.size());
+    std::printf("imports:   %zu symbols from %zu DLLs\n", p.imports.size(),
+                p.importedLibraries.size());
+    std::printf("data:      %zu non-executable regions\n", p.dataRegions.size());
+    std::printf("resources: %zu leaves\n", p.resources.size());
     return 0;
 }
 
@@ -167,6 +224,19 @@ void usage(const char* argv0) {
                 argv0);
     std::printf("  %s spec <spec.slaspec> <file> cfg <addr> [end]\n", argv0);
     std::printf("  %s spec <spec.slaspec> <file> analyze <addr> [end] [abi]\n",
+                argv0);
+    std::printf("  %s spec <spec.slaspec> <file> midir <addr> [end] [abi]\n",
+                argv0);
+    std::printf("  %s spec <spec.slaspec> <file> highir <addr> [end]\n",
+                argv0);
+    std::printf("  %s spec <spec.slaspec> <file> analyze-all [abi]\n", argv0);
+    std::printf("  %s spec <spec.slaspec> <file> cpp-types\n", argv0);
+    std::printf("  %s spec <spec.slaspec> <file> knowledge-graph [output.json] [abi]\n",
+                argv0);
+    std::printf("  %s spec <spec.slaspec> <file> recover-project <output-dir> "
+                "[abi] [max-functions]\n", argv0);
+    std::printf("  %s spec <spec.slaspec> <file> semantic-coverage\n", argv0);
+    std::printf("  %s spec <spec.slaspec> <file> decompile-typed <addr> [abi]\n",
                 argv0);
     std::printf("  %s spec <spec.slaspec> <file> decompile <addr> [end]\n",
                 argv0);
@@ -324,7 +394,33 @@ int cmdSpec(int argc, char** argv) {
         std::printf("\n");
         return 0;
     }
-    if (cmd == "analyze") {
+    if (cmd == "highir") {
+        if (argc < 6) { usage(argv[0]); return 1; }
+        uint64_t addr = 0, end = 0;
+        if (!parseAddr(argv[5], addr) ||
+            (argc >= 7 && !parseAddr(argv[6], end))) {
+            std::fprintf(stderr, "centrifuge: bad HighIR address range\n");
+            return 1;
+        }
+        CfgBuilder cfg;
+        auto executable = [&](uint64_t target) {
+            return prog->memory.isExecutable(target);
+        };
+        if (!cfg.build(*eng, reader, addr, end, executable)) {
+            std::fprintf(stderr, "centrifuge: CFG construction failed\n");
+            return 1;
+        }
+        cfg.applyExceptionRegions(prog->exceptionRegions);
+        const int pointerSize = prog->arch == "x86" ? 4 : 8;
+        const std::vector<JumpTable> tables =
+            recoverJumpTables(cfg, prog->memory, pointerSize);
+        const HighFunction high = HighIRBuilder().build(cfg, tables);
+        std::printf("highir: %zu structured nodes, %zu irreducible regions\n",
+                    high.structuredNodes, high.irreducibleRegions.size());
+        std::printf("%s", high.dump().c_str());
+        return 0;
+    }
+    if (cmd == "analyze" || cmd == "midir") {
         if (argc < 6) { usage(argv[0]); return 1; }
         uint64_t addr = 0;
         if (!parseAddr(argv[5], addr)) {
@@ -348,7 +444,7 @@ int cmdSpec(int argc, char** argv) {
         cfg.applyExceptionRegions(prog->exceptionRegions);
         FunctionIR ir;
         if (!ir.build(cfg, prog->arch, abi)) {
-            std::fprintf(stderr, "centrifuge: SSA construction failed\n");
+            std::fprintf(stderr, "centrifuge: MidIR construction failed\n");
             return 1;
         }
         ir.inferTypes();
@@ -361,8 +457,12 @@ int cmdSpec(int argc, char** argv) {
                 break;
             }
         std::printf("signature: %s\n", signature.declaration(functionName).c_str());
-        std::printf("ssa: %zu blocks, %zu phi nodes, %zu live operations\n",
-                    ir.blocks().size(), ir.phiCount(), ir.liveOpCount());
+        const MidIRVerification verification = ir.verify();
+        std::printf("midir: %zu blocks, %zu phi nodes, %zu live operations, "
+                    "%zu memory partitions, %s\n",
+                    ir.blocks().size(), ir.phiCount(), ir.liveOpCount(),
+                    ir.memoryPartitions().size(),
+                    verification.valid() ? "verified" : "invalid");
         const int pointerSize = prog->arch == "x86" ? 4 : 8;
         for (const JumpTable& table : recoverJumpTables(cfg, prog->memory,
                                                         pointerSize)) {
@@ -372,6 +472,242 @@ int cmdSpec(int argc, char** argv) {
                         table.targets.size(), table.relative ? ", relative" : "");
         }
         std::printf("%s", ir.dump().c_str());
+        return 0;
+    }
+    if (cmd == "analyze-all") {
+        const std::string abi = argc >= 6 ? argv[5] : std::string();
+        ProgramAnalysis analysis;
+        if (!analysis.build(*prog, *eng, abi)) {
+            std::fprintf(stderr, "centrifuge: program analysis failed\n");
+            return 1;
+        }
+        for (const auto& entry : analysis.functions()) {
+            const AnalyzedFunction& function = entry.second;
+            std::printf("%s @ %s%s%s\n",
+                        function.signature.declaration(function.function.name).c_str(),
+                        hexAddr(function.function.addr).c_str(),
+                        function.complete ? "" : " [incomplete]",
+                        function.complexityLimited ? " [complexity-limited]" : "");
+            std::printf("  cfg=%zu phi=%zu ops=%zu callers=%zu callees=%zu "
+                        "modref=%s%s%s\n",
+                        function.blocks, function.phiNodes,
+                        function.liveOperations, function.callers.size(),
+                        function.callees.size(),
+                        modRefName(function.effects.modRef()),
+                        function.effects.allocates ? " allocates" : "",
+                        function.effects.frees ? " frees" : "");
+            for (uint64_t target : function.callees)
+                std::printf("  -> %s\n", hexAddr(target).c_str());
+        }
+        return 0;
+    }
+    if (cmd == "knowledge-graph") {
+        const std::string abi = argc >= 7 ? argv[6] : std::string();
+        ProgramAnalysis analysis;
+        if (!analysis.build(*prog, *eng, abi)) {
+            std::fprintf(stderr, "centrifuge: program analysis failed\n");
+            return 1;
+        }
+        const ProgramKnowledgeGraph graph =
+            buildProgramKnowledgeGraph(*prog, analysis);
+        const std::string json = graph.toJson();
+        if (argc >= 6) {
+            std::ofstream output(argv[5], std::ios::binary | std::ios::trunc);
+            if (!output) {
+                std::fprintf(stderr, "centrifuge: cannot create graph: %s\n",
+                             argv[5]);
+                return 1;
+            }
+            output << json;
+            if (!output) {
+                std::fprintf(stderr, "centrifuge: cannot write graph: %s\n",
+                             argv[5]);
+                return 1;
+            }
+            std::printf("knowledge graph: %zu nodes, %zu edges -> %s\n",
+                        graph.nodes().size(), graph.edges().size(), argv[5]);
+        } else {
+            std::printf("%s", json.c_str());
+        }
+        return 0;
+    }
+    if (cmd == "recover-project") {
+        if (argc < 6) { usage(argv[0]); return 1; }
+        ProjectRecoveryOptions options;
+        options.outputDirectory = argv[5];
+        options.callingConvention = argc >= 7 ? argv[6] : std::string();
+        if (argc >= 8)
+            options.maximumFunctions = static_cast<size_t>(
+                std::strtoull(argv[7], nullptr, 0));
+        ProgramAnalysis analysis;
+        if (!analysis.build(*prog, *eng, options.callingConvention,
+                            options.maximumFunctions)) {
+            std::fprintf(stderr, "centrifuge: program analysis failed\n");
+            return 1;
+        }
+        ProjectRecoveryReport report;
+        std::string recoveryError;
+        if (!recoverSourceProject(*prog, *eng, analysis, options, report,
+                                  recoveryError)) {
+            std::fprintf(stderr, "centrifuge: project recovery failed: %s\n",
+                         recoveryError.c_str());
+            return 1;
+        }
+        std::printf("recovered project: %zu/%zu functions (%zu decompiled, "
+                    "%zu stubs, %zu complexity-limited), %zu source files, "
+                    "%zu unresolved markers, "
+                    "%zu imports from %zu DLLs, %zu data regions, %zu "
+                    "image regions (%llu bytes), %zu resources, entry %s "
+                    "(%s), %zu knowledge nodes, %zu "
+                    "edges -> %s\n",
+                    report.emittedFunctions, report.discoveredFunctions,
+                    report.decompiledFunctions, report.stubbedFunctions,
+                    report.complexityLimitedFunctions, report.sourceFiles,
+                    report.unresolvedMarkers,
+                    report.importedSymbols, report.importedLibraries,
+                    report.dataRegions, report.imageRegions,
+                    static_cast<unsigned long long>(report.imageBytes),
+                    report.resources,
+                    hexAddr(report.entryPoint).c_str(),
+                    report.entryPointRecovered ? "recovered" : "missing",
+                    report.knowledgeNodes, report.knowledgeEdges,
+                    options.outputDirectory.c_str());
+        return 0;
+    }
+    if (cmd == "cpp-types") {
+        CppRecoveryResult recovered = recoverCppTypes(*prog);
+        ProgramAnalysis analysis;
+        if (analysis.build(*prog, *eng)) recovered = analysis.cppTypes();
+        for (const CppClassInfo& type : recovered.classes) {
+            std::printf("class %s [%s] identity=%s typeinfo=%s vtable=%s "
+                        "size=%llu align=%llu confidence=%.2f%s%s\n",
+                        type.name.c_str(),
+                        type.abi == CppAbi::ITANIUM ? "itanium" : "msvc",
+                        type.stableIdentity.c_str(),
+                        hexAddr(type.typeInfoAddress).c_str(),
+                        hexAddr(type.vtableAddress).c_str(),
+                        static_cast<unsigned long long>(type.inferredSize),
+                        static_cast<unsigned long long>(type.inferredAlignment),
+                        type.confidence, type.isAbstract ? " abstract" : "",
+                        type.hasVirtualInheritance
+                            ? " virtual-inheritance" : "");
+            if (!type.libraryPattern.empty())
+                std::printf("  library-pattern %s\n",
+                            type.libraryPattern.c_str());
+            for (const CppBaseClass& base : type.bases)
+                std::printf("  base %s offset=%lld%s\n", base.name.c_str(),
+                            static_cast<long long>(base.byteOffset),
+                            base.isVirtual ? " virtual" : "");
+            for (const CppVirtualFunction& function : type.virtualFunctions)
+                std::printf("  vfunc[%zu] %s @ %s\n", function.slot,
+                            function.name.c_str(),
+                            hexAddr(function.address).c_str());
+            for (const CppFieldInfo& field : type.fields)
+                std::printf("  field %+lld size=%llu %s%s%s%s confidence=%.2f\n",
+                            static_cast<long long>(field.byteOffset),
+                            static_cast<unsigned long long>(field.byteSize),
+                            field.name.c_str(), field.isVptr ? " [vptr]" : "",
+                            field.isVbptr ? " [vbptr]" : "",
+                            field.isBaseSubobject ? " [base]" : "",
+                            field.confidence);
+            for (const CppMethodInfo& method : type.methods)
+                std::printf("  method %s @ %s role=%s this-adjust=%lld%s "
+                            "confidence=%.2f\n",
+                            method.name.c_str(), hexAddr(method.address).c_str(),
+                            cppMethodRoleName(method.role),
+                            static_cast<long long>(method.thisAdjustment),
+                            method.isVirtual ? " virtual" : "",
+                            method.confidence);
+        }
+        for (const CppVptrWrite& write : recovered.objectGraph.vptrWrites)
+            std::printf("vptr-write %s %+lld <- %s in %s confidence=%.2f\n",
+                        write.className.c_str(),
+                        static_cast<long long>(write.objectOffset),
+                        hexAddr(write.vtableAddress).c_str(),
+                        hexAddr(write.functionAddress).c_str(), write.confidence);
+        for (const CppVirtualCallSite& call :
+             recovered.objectGraph.virtualCalls)
+            std::printf("virtual-call %s slot=%zu vptr=%+lld at %s target=%s "
+                        "confidence=%.2f\n",
+                        call.className.c_str(), call.slot,
+                        static_cast<long long>(call.vptrOffset),
+                        hexAddr(call.instructionAddress).c_str(),
+                        hexAddr(call.resolvedTarget).c_str(), call.confidence);
+        for (const CppRuntimeOperation& operation :
+             recovered.objectGraph.runtimeOperations)
+            std::printf("runtime %s in %s class=%s type=%s landing-pad=%s "
+                        "action=%lld confidence=%.2f\n",
+                        cppRuntimeOperationName(operation.kind),
+                        hexAddr(operation.functionAddress).c_str(),
+                        operation.className.c_str(),
+                        operation.referencedType.c_str(),
+                        hexAddr(operation.landingPad).c_str(),
+                        static_cast<long long>(operation.action),
+                        operation.confidence);
+        for (const CppObjectCandidate& object : recovered.objectGraph.objects)
+            std::printf("object #%llu class=%s size=%llu allocation=%s%s "
+                        "events=%zu confidence=%.2f\n",
+                        static_cast<unsigned long long>(object.id),
+                        object.className.c_str(),
+                        static_cast<unsigned long long>(object.inferredSize),
+                        hexAddr(object.allocationSite).c_str(),
+                        object.placementNew ? " placement-new" : "",
+                        object.lifetime.size(), object.confidence);
+        return 0;
+    }
+    if (cmd == "semantic-coverage") {
+        const SemanticCoverageReport coverage =
+            auditSemanticCoverage(*prog, *eng);
+        const ConstructorProofReport proofs = auditConstructorProof(*eng);
+        std::printf("semantic coverage: %.2f%% bytes (%zu instructions, "
+                    "%zu decode failures, %zu empty semantics, "
+                    "%zu unimplemented operations)\n",
+                    coverage.byteCoverage() * 100.0, coverage.instructions,
+                    coverage.decodeFailures, coverage.emptySemantics,
+                    coverage.unimplementedOperations);
+        for (const auto& missing : coverage.missingByMnemonic)
+            std::printf("  missing %-16s %zu\n", missing.first.c_str(),
+                        missing.second);
+        std::printf("constructor proof inventory: %zu total, %zu inline, "
+                    "%zu verified shared, %zu unproven\n",
+                    proofs.constructors, proofs.inlineSpecifications,
+                    proofs.sharedSpecifications, proofs.unproven);
+        std::vector<std::pair<std::string, size_t>> unproven(
+            proofs.unprovenByMnemonic.begin(),
+            proofs.unprovenByMnemonic.end());
+        std::sort(unproven.begin(), unproven.end(),
+                  [](const auto& left, const auto& right) {
+                      return left.second != right.second
+                                 ? left.second > right.second
+                                 : left.first < right.first;
+                  });
+        for (size_t index = 0; index < unproven.size(); ++index)
+            std::printf("  unproven %-16s %zu constructors\n",
+                        unproven[index].first.c_str(), unproven[index].second);
+        // Keep the command usable as an inventory on partially specified
+        // architectures.  CI/baseline policy decides whether nonzero empty
+        // semantics is acceptable; explicit UNIMPLEMENTED is always fatal.
+        return coverage.unimplementedOperations ? 2 : 0;
+    }
+    if (cmd == "decompile-typed") {
+        if (argc < 6) { usage(argv[0]); return 1; }
+        uint64_t addr = 0;
+        if (!parseAddr(argv[5], addr)) {
+            std::fprintf(stderr, "centrifuge: bad address '%s'\n", argv[5]);
+            return 1;
+        }
+        const std::string abi = argc >= 7 ? argv[6] : std::string();
+        ProgramAnalysis analysis;
+        if (!analysis.build(*prog, *eng, abi)) {
+            std::fprintf(stderr, "centrifuge: program analysis failed\n");
+            return 1;
+        }
+        if (!analysis.functionAt(addr)) {
+            std::fprintf(stderr, "centrifuge: function %s was not discovered\n",
+                         hexAddr(addr).c_str());
+            return 1;
+        }
+        std::printf("%s", analysis.decompileFunction(*prog, *eng, addr).c_str());
         return 0;
     }
     if (cmd == "decompile") {
@@ -391,7 +727,8 @@ int cmdSpec(int argc, char** argv) {
                           static_cast<unsigned long long>(target));
             return buf;
         };
-        std::printf("%s", decompile(*eng, reader, addr, end, nameOf).c_str());
+        std::printf("%s", decompile(*eng, reader, addr, end, nameOf, nullptr,
+                                     prog->arch).c_str());
         return 0;
     }
     usage(argv[0]);

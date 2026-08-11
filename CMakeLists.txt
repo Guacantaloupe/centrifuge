@@ -2,10 +2,16 @@ cmake_minimum_required(VERSION 3.16)
 project(centrifuge LANGUAGES CXX)
 
 include(CTest)
+find_package(Threads REQUIRED)
 
 option(CENTRIFUGE_ENABLE_SANITIZERS
        "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(CENTRIFUGE_BUILD_FUZZERS "Build libFuzzer targets (Clang only)" OFF)
+set(CENTRIFUGE_BENCHMARK_MANIFEST
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_manifest.json"
+    CACHE FILEPATH "Linux/Windows decompiler quality benchmark manifest")
+set(CENTRIFUGE_BLENDER_WINDOWS_BINARY "" CACHE FILEPATH
+    "Optional path to a pinned Windows x64 blender.exe scale fixture")
 
 if(CENTRIFUGE_BUILD_FUZZERS AND NOT CENTRIFUGE_ENABLE_SANITIZERS)
   message(FATAL_ERROR
@@ -36,9 +42,16 @@ add_library(centrifuge_core STATIC
   src/cfg.cpp
   src/decompile.cpp
   src/analysis.cpp
+  src/midir.cpp
+  src/highir.cpp
+  src/cpp_recovery.cpp
+  src/program_graph.cpp
+  src/project_recovery.cpp
+  src/semantic_coverage.cpp
   src/ir.cpp
 )
 target_include_directories(centrifuge_core PUBLIC include)
+target_link_libraries(centrifuge_core PUBLIC Threads::Threads)
 
 if(CENTRIFUGE_ENABLE_SANITIZERS)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -141,8 +154,71 @@ if(BUILD_TESTING)
       LABELS "integration"
       TIMEOUT 60
     )
+    add_test(
+      NAME decompiler_large_differential
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/roundtrip.py"
+              --centrifuge "$<TARGET_FILE:centrifuge>"
+              --source-dir "${CMAKE_CURRENT_SOURCE_DIR}"
+              --cc "${CENTRIFUGE_C_COMPILER}"
+              --large
+    )
+    set_tests_properties(decompiler_large_differential PROPERTIES
+      LABELS "integration;differential;large"
+      TIMEOUT 180
+    )
   else()
     message(STATUS
       "Skipping decompiler_roundtrip: Python 3 and a C compiler are required")
+  endif()
+  if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME project_recovery_smoke
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/project_recovery_smoke.py"
+              --centrifuge "$<TARGET_FILE:centrifuge>"
+              --source-dir "${CMAKE_CURRENT_SOURCE_DIR}"
+              --cmake "${CMAKE_COMMAND}"
+    )
+    set_tests_properties(project_recovery_smoke PROPERTIES
+      LABELS "integration;project-recovery;recompilation;windows"
+      TIMEOUT 180
+    )
+    add_test(
+      NAME decompiler_quality_benchmark
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/quality_benchmark.py"
+              --centrifuge "$<TARGET_FILE:centrifuge>"
+              --source-dir "${CMAKE_CURRENT_SOURCE_DIR}"
+              --manifest "${CENTRIFUGE_BENCHMARK_MANIFEST}"
+              --output "${CMAKE_CURRENT_BINARY_DIR}/quality-benchmark.json"
+    )
+    set_tests_properties(decompiler_quality_benchmark PROPERTIES
+      LABELS "integration;benchmark;linux;windows"
+      TIMEOUT 180
+    )
+    if(CENTRIFUGE_BLENDER_WINDOWS_BINARY AND
+       EXISTS "${CENTRIFUGE_BLENDER_WINDOWS_BINARY}")
+      add_test(
+        NAME blender_windows_project_recovery
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/blender_windows_recovery.py"
+                --centrifuge "$<TARGET_FILE:centrifuge>"
+                --source-dir "${CMAKE_CURRENT_SOURCE_DIR}"
+                --blender "${CENTRIFUGE_BLENDER_WINDOWS_BINARY}"
+                --manifest
+                  "${CMAKE_CURRENT_SOURCE_DIR}/tests/blender_windows_manifest.json"
+                --output-dir "${CMAKE_CURRENT_BINARY_DIR}/blender-recovery"
+                --cmake "${CMAKE_COMMAND}"
+      )
+      set_tests_properties(blender_windows_project_recovery PROPERTIES
+        LABELS "integration;benchmark;large;windows;blender;project-recovery"
+        TIMEOUT 3600
+      )
+    else()
+      message(STATUS
+        "Blender recovery benchmark disabled; set "
+        "CENTRIFUGE_BLENDER_WINDOWS_BINARY to blender.exe")
+    endif()
   endif()
 endif()

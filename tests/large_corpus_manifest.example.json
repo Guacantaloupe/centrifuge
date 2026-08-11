@@ -1,0 +1,32 @@
+{
+  "cases": [],
+  "corpora": [
+    {
+      "name": "linux-elf64-system",
+      "glob": "corpus/linux/**/*",
+      "spec": "sleigh/x86-64.slaspec",
+      "abi": "sysv64",
+      "max_binaries": 200,
+      "maximum_decode_failures": 0,
+      "maximum_empty_semantics": 0
+    },
+    {
+      "name": "windows-pe64-system",
+      "glob": "corpus/windows/**/*.exe",
+      "spec": "sleigh/x86-64.slaspec",
+      "abi": "win64",
+      "max_binaries": 200,
+      "maximum_decode_failures": 0,
+      "maximum_empty_semantics": 0
+    },
+    {
+      "name": "windows-dll64-system",
+      "glob": "corpus/windows/**/*.dll",
+      "spec": "sleigh/x86-64.slaspec",
+      "abi": "win64",
+      "max_binaries": 200,
+      "maximum_decode_failures": 0,
+      "maximum_empty_semantics": 0
+    }
+  ]
+}

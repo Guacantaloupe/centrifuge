@@ -17,6 +17,8 @@ parser.add_argument("--centrifuge", default="build/centrifuge.exe")
 parser.add_argument("--source-dir", default=str(Path(__file__).resolve().parents[1]))
 parser.add_argument("--cc", default="gcc")
 parser.add_argument("--work-dir")
+parser.add_argument("--large", action="store_true",
+                    help="run the deterministic high-volume differential corpus")
 args = parser.parse_args()
 
 ROOT = Path(args.source_dir).resolve()
@@ -36,6 +38,22 @@ FUNCS = [
     ("fib",       0x80000040, 1, "plain", list(range(0, 11))),
     ("sum_array", 0x800003E4, 2, "array", [[1, 2, 3, 4], [5], [], [7, -1, 3]]),
 ]
+if args.large:
+    # Keep the corpus deterministic so a mismatch is reproducible by vector
+    # number alone.  Lengths cross cache-line and common unroll boundaries;
+    # values include both signs and deliberately exercise signed overflow-free
+    # accumulation over more than one thousand independently compiled calls.
+    arrays = []
+    for case in range(1024):
+        length = (case * 37) % 65
+        arrays.append([
+            ((case * 131 + index * 977 + index * index * 17) % 2001) - 1000
+            for index in range(length)
+        ])
+    FUNCS = [
+        ("fib", 0x80000040, 1, "plain", list(range(-4, 21))),
+        ("sum_array", 0x800003E4, 2, "array", arrays),
+    ]
 
 # all decompiled functions take 8 register args (calls pass a0..a7)
 SIG = "int64_t %s(int64_t p0, int64_t p1, int64_t p2, int64_t p3, int64_t p4, int64_t p5, int64_t p6, int64_t p7)"

@@ -1240,6 +1240,275 @@ public:
                     r.size = vo->size;
                     break;
                 }
+                case POp::SIMD_SHIFT: {
+                    // Packed lane-wise shift (psllw/d/q, psrlw/d/q,
+                    // psraw/d).  aux = laneBits | (right << 8) |
+                    // (arithmetic << 9).  Each lane is shifted by the
+                    // scalar count; arithmetic right shift keeps sign.
+                    const CExpr source = exprOfV(pi.find(op.in0));
+                    const CExpr count = exprOfV(pi.find(op.in1));
+                    const Varnode* sourceNode = pi.find(op.in0);
+                    const unsigned laneBits =
+                        (op.aux & 0xffU) ? (op.aux & 0xffU) : 32;
+                    const bool right = (op.aux & 0x0100U) != 0;
+                    const bool arithmetic = (op.aux & 0x0200U) != 0;
+                    const int laneBytes = static_cast<int>(laneBits / 8);
+                    const std::string laneType = uCast(laneBytes);
+                    const bool vectorSource =
+                        sourceNode && sourceNode->size > 8;
+                    const std::string sText = stripParens(source.text);
+                    const std::string nText = stripParens(count.text);
+                    const int lanes =
+                        std::max(1, vo->size / laneBytes);
+                    std::string result = "RecoveredVector<" +
+                        std::to_string(vo->size) + ">{}";
+                    for (int lane = lanes - 1; lane >= 0; --lane) {
+                        std::string laneValue;
+                        if (vectorSource) {
+                            laneValue = "recovered_vector_extract<" +
+                                laneType + ">(" + sText + ", " +
+                                std::to_string(lane) + ")";
+                        } else {
+                            const unsigned shift = lane * laneBits;
+                            const std::string mask =
+                                laneBits >= 64
+                                    ? "~0ULL"
+                                    : "((1ULL << " +
+                                          std::to_string(laneBits) +
+                                          ") - 1)";
+                            laneValue = "(" + laneType + ")((" + sText +
+                                ") >> " + std::to_string(shift) +
+                                " & " + mask + ")";
+                        }
+                        std::string shifted;
+                        if (right) {
+                            if (arithmetic) {
+                                shifted = "((" + laneType + ")(" +
+                                    laneValue + ") >> ((" + nText +
+                                    ") & " + std::to_string(laneBits - 1) +
+                                    "))";
+                            } else {
+                                shifted = "(" + laneType + ")((" +
+                                    laneValue + ") >> ((" + nText +
+                                    ") & " + std::to_string(laneBits - 1) +
+                                    "))";
+                            }
+                        } else {
+                            shifted = "(" + laneType + ")((" +
+                                laneValue + ") << ((" + nText +
+                                ") & " + std::to_string(laneBits - 1) +
+                                "))";
+                        }
+                        result = "recovered_vector_insert<" + laneType +
+                                 ">(" + result + ", " + shifted + ", " +
+                                 std::to_string(lane) + ")";
+                    }
+                    r.text = result;
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_COMPARE: {
+                    // Packed lane-wise integer compare (pcmpeqb/w/d/q,
+                    // pcmpgtb/w/d/q, and VEX/EVEX forms).  aux = laneBits |
+                    // (signed << 8) | (greater << 9).  Each lane yields
+                    // all-ones when the predicate holds, zero otherwise,
+                    // matching x86 mask semantics.  The project C model
+                    // carries only the low 64-bit window, so lanes beyond
+                    // the window are dropped (extract returns 0 for them).
+                    const CExpr lhs = exprOfV(pi.find(op.in0));
+                    const CExpr rhs = exprOfV(pi.find(op.in1));
+                    const Varnode* lhsNode = pi.find(op.in0);
+                    const unsigned laneBits =
+                        (op.aux & 0xffU) ? (op.aux & 0xffU) : 8;
+                    const bool signedCompare = (op.aux & 0x0100U) != 0;
+                    const bool greater = (op.aux & 0x0200U) != 0;
+                    const int laneBytes = static_cast<int>(laneBits / 8);
+                    const std::string laneType = uCast(laneBytes);
+                    const bool vectorSource =
+                        lhsNode && lhsNode->size > 8;
+                    const std::string lText = stripParens(lhs.text);
+                    const std::string rText = stripParens(rhs.text);
+                    const std::string zeroLane =
+                        "(" + laneType + ")0";
+                    const std::string onesLane =
+                        "(" + laneType + ")~(" + laneType +
+                        ")0";
+                    std::string result = "RecoveredVector<" +
+                        std::to_string(vo->size) + ">{}";
+                    const int lanes =
+                        std::max(1, vo->size / laneBytes);
+                    for (int lane = lanes - 1; lane >= 0; --lane) {
+                        std::string lv, rv;
+                        if (vectorSource) {
+                            lv = "recovered_vector_extract<" + laneType +
+                                 ">(" + lText + ", " +
+                                 std::to_string(lane) + ")";
+                            rv = "recovered_vector_extract<" + laneType +
+                                 ">(" + rText + ", " +
+                                 std::to_string(lane) + ")";
+                        } else {
+                            const unsigned shift = lane * laneBits;
+                            const std::string mask =
+                                laneBits >= 64
+                                    ? "~0ULL"
+                                    : "((1ULL << " +
+                                          std::to_string(laneBits) +
+                                          ") - 1)";
+                            const unsigned sourceBits =
+                                static_cast<unsigned>(lhsNode ? lhsNode->size : 8) * 8;
+                            if (shift >= sourceBits) {
+                                lv = zeroLane;
+                                rv = zeroLane;
+                            } else {
+                                lv = "(" + laneType + ")((" + lText +
+                                     ") >> " + std::to_string(shift) +
+                                     " & " + mask + ")";
+                                rv = "(" + laneType + ")((" + rText +
+                                     ") >> " + std::to_string(shift) +
+                                     " & " + mask + ")";
+                            }
+                        }
+                        std::string predicate;
+                        if (greater) {
+                            predicate = signedCompare
+                                ? "((int64_t)(" + lv + ") > (int64_t)(" +
+                                      rv + "))"
+                                : "((" + lv + ") > (" + rv + "))";
+                        } else {
+                            predicate = "((" + lv + ") == (" + rv +
+                                         "))";
+                        }
+                        result = "recovered_vector_insert<" + laneType +
+                                 ">(" + result + ", " + predicate +
+                                 " ? " + onesLane + " : " + zeroLane +
+                                 ", " + std::to_string(lane) + ")";
+                    }
+                    r.text = result;
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_MOVEMASK: {
+                    // vpmovmskb/pmovmskb/movmskps/movmskpd: the most
+                    // significant bit of each source lane becomes one bit
+                    // of the integer result.  aux = laneBits.
+                    const CExpr source = exprOfV(pi.find(op.in0));
+                    const Varnode* sourceNode = pi.find(op.in0);
+                    const unsigned laneBits =
+                        (op.aux & 0xffU) ? (op.aux & 0xffU) : 8;
+                    const int laneBytes = static_cast<int>(laneBits / 8);
+                    const bool vectorSource =
+                        sourceNode && sourceNode->size > 8;
+                    const std::string sText = stripParens(source.text);
+                    std::string result = "0";                    // The mask width is driven by the source vector lane
+                    // count (vpmovmskb ymm -> 32 bits), capped by the
+                    // destination register width so the emitted expression
+                    // stays representable in vo->size bytes.
+                    const int sourceLanes = vectorSource
+                        ? static_cast<int>(sourceNode->size / laneBytes)
+                        : static_cast<int>(vo->size * 8 /
+                                           static_cast<int>(laneBits));
+                    const int lanes = std::min(
+                        sourceLanes, vo->size * 8 / static_cast<int>(laneBits));
+                    for (int lane = 0; lane < lanes; ++lane) {
+                        std::string laneValue;
+                        if (vectorSource) {
+                            laneValue = "recovered_vector_extract<" +
+                                std::string(uCast(laneBytes)) + ">(" + sText +
+                                ", " + std::to_string(lane) + ")";
+                        } else {
+                            const unsigned shift = lane * laneBits;
+                            const unsigned sourceBits =
+                                static_cast<unsigned>(sourceNode ? sourceNode->size : 8) * 8;
+                            if (shift >= sourceBits) {
+                                laneValue = "(" + std::string(uCast(laneBytes)) +
+                                            ")0";
+                            } else {
+                                laneValue = "(" + std::string(uCast(laneBytes)) +
+                                    ")((" + sText + ") >> " +
+                                    std::to_string(shift) + ")";
+                            }
+                        }
+                        result = "(" + result + " | " +
+                            "(((" + laneValue + ") >> " +
+                            std::to_string(laneBits - 1) + ") & 1U) << " +
+                            std::to_string(lane) + ")";                    }
+                    r.text = result;
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_EXTEND: {
+                    // pmovsx/pmovzx: lane-wise sign/zero extension from
+                    // sourceBits lanes to destinationBits lanes.  aux =
+                    // sourceBits | (destinationBits << 8) | (signed << 15).
+                    // The source lane count is derived from the destination
+                    // vector width; lanes beyond the source are zero.
+                    const CExpr source = exprOfV(pi.find(op.in0));
+                    const Varnode* sourceNode = pi.find(op.in0);
+                    const int sourceBits =
+                        (op.aux & 0xff) ? (op.aux & 0xff) : 8;
+                    const int destinationBits =
+                        ((op.aux >> 8) & 0x7f) ? ((op.aux >> 8) & 0x7f) : 16;
+                    const bool signedExtend = (op.aux & 0x8000) != 0;
+                    const int destinationBytes = destinationBits / 8;
+                    const int lanes =
+                        std::max(1, vo->size / destinationBytes);
+                    const std::string sourceType =
+                        sourceBits == 8 ? "int8_t"
+                        : sourceBits == 16 ? "int16_t"
+                        : sourceBits == 32 ? "int32_t" : "int64_t";
+                    const std::string destinationType =
+                        destinationBits == 16 ? "int16_t"
+                        : destinationBits == 32 ? "int32_t"
+                        : destinationBits == 64 ? "int64_t" : "int32_t";
+                    const bool vectorSource =
+                        sourceNode && sourceNode->size > 8;
+                    const std::string sText = stripParens(source.text);
+                    std::string result = "RecoveredVector<" +
+                        std::to_string(vo->size) + ">{}";
+                    for (int lane = lanes - 1; lane >= 0; --lane) {
+                        std::string laneValue;
+                        if (vectorSource) {
+                            laneValue = "recovered_vector_extract<" +
+                                sourceType + ">(" + sText + ", " +
+                                std::to_string(lane) + ")";
+                        } else {
+                            const unsigned shift = lane * sourceBits;
+                            laneValue = "(" + sourceType + ")((" + sText +
+                                ") >> " + std::to_string(shift) + ")";
+                        }
+                        std::string extended =
+                            signedExtend
+                                ? "(" + destinationType + ")(int64_t)(" +
+                                      laneValue + ")"
+                                : "(" + destinationType + ")(uint64_t)(" +
+                                      laneValue + ") & " +
+                                      std::to_string(
+                                          destinationBits == 64
+                                              ? ~0ULL : (1ULL << destinationBits) - 1);
+                        result = "recovered_vector_insert<" +
+                            destinationType + ">(" + result + ", " +
+                            extended + ", " + std::to_string(lane) + ")";
+                    }
+                    r.text = result;
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_ZERO_UPPER: {
+                    // vzeroupper: zero the upper 128 bits of each YMM/ZMM
+                    // register, leaving the low XMM half intact.  The
+                    // project C model carries the full RecoveredVector byte
+                    // array, so clear every byte from offset 16 up.
+                    const CExpr vector = exprOfV(pi.find(op.in0));
+                    const std::string v = stripParens(vector.text);
+                    std::string result = v;
+                    for (int lane = 16; lane < vo->size; ++lane)
+                        result = "recovered_vector_insert<uint8_t>(" +
+                                 result + ", (uint8_t)0, " +
+                                 std::to_string(lane) + ")";
+                    r.text = result;
+                    r.size = vo->size;
+                    break;
+                }
                 case POp::SELECT: {
                     const CExpr c = exprOfV(pi.find(op.in0));
                     const CExpr yes = exprOfV(pi.find(op.in1));

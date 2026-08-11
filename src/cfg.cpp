@@ -225,8 +225,64 @@ void CfgBuilder::findNaturalLoops() {
     loops_.clear();
     std::map<uint64_t, size_t> byHeader;
 
+    // Batch dominator dataflow: computing dominators(block) per tail made
+    // this pass O(B^4) (each call re-ran the full iterative fixpoint over
+    // every block).  Large 5.x Blender functions (27KB+) blew up to minutes.
+    // Run the fixpoint once for the whole graph and look results up.
+    // dom(b) = {b} ∪ ⋂_{p in preds(b)} dom(p); entry = {entry}.
+    // Precompute the predecessor table once; predecessors() scanned every
+    // block per call, adding another O(B) factor to every back-edge walk.
+    std::map<uint64_t, std::vector<uint64_t>> preds;
+    for (const auto& b : blocks_) {
+        for (uint64_t s : b.succs) preds[s].push_back(b.start);
+        for (uint64_t s : b.exceptionSuccs) preds[s].push_back(b.start);
+    }
+
+    std::map<uint64_t, std::set<uint64_t>> dom;
+    if (!blocks_.empty() && idx_.count(entry_)) {
+        std::set<uint64_t> all;
+        for (const auto& b : blocks_) all.insert(b.start);
+        for (const auto& b : blocks_) {
+            if (b.start == entry_) dom[b.start] = {b.start};
+            else dom[b.start] = all;
+        }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& b : blocks_) {
+                if (b.start == entry_) continue;
+                std::set<uint64_t> nd;
+                bool first = true;
+                const auto predIt = preds.find(b.start);
+                if (predIt != preds.end()) {
+                    for (uint64_t p : predIt->second) {
+                        const auto dit = dom.find(p);
+                        if (dit == dom.end()) continue;
+                        if (first) {
+                            nd = dit->second;
+                            first = false;
+                        } else {
+                            std::set<uint64_t> inter;
+                            for (uint64_t x : nd)
+                                if (dit->second.count(x)) inter.insert(x);
+                            nd.swap(inter);
+                        }
+                    }
+                }
+                nd.insert(b.start);
+                if (nd != dom[b.start]) {
+                    dom[b.start] = nd;
+                    changed = true;
+                }
+            }
+        }
+    }
+
     for (const auto& tail : blocks_) {
-        const auto tailDom = dominators(tail.start);
+        const auto tailDomIt = dom.find(tail.start);
+        static const std::set<uint64_t> kEmptyDom;
+        const std::set<uint64_t>& tailDom =
+            tailDomIt == dom.end() ? kEmptyDom : tailDomIt->second;
         for (uint64_t header : tail.succs) {
             if (!tailDom.count(header)) continue; // not a back edge
 
@@ -251,7 +307,9 @@ void CfgBuilder::findNaturalLoops() {
             while (!worklist.empty()) {
                 const uint64_t block = worklist.back();
                 worklist.pop_back();
-                for (uint64_t pred : predecessors(block)) {
+                const auto predIt = preds.find(block);
+                if (predIt == preds.end()) continue;
+                for (uint64_t pred : predIt->second) {
                     if (loop.blocks.insert(pred).second && pred != header)
                         worklist.push_back(pred);
                 }

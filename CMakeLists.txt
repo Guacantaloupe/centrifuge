@@ -12,6 +12,12 @@ set(CENTRIFUGE_BENCHMARK_MANIFEST
     CACHE FILEPATH "Linux/Windows decompiler quality benchmark manifest")
 set(CENTRIFUGE_BLENDER_WINDOWS_BINARY "" CACHE FILEPATH
     "Optional path to a pinned Windows x64 blender.exe scale fixture")
+set(CENTRIFUGE_BLENDER_WINDOWS_MANIFEST
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/blender_windows_manifest.json"
+    CACHE FILEPATH "Manifest for the Blender Windows scale fixture")
+set(CENTRIFUGE_BLENDER_WINDOWS_OUTPUT
+    "${CMAKE_CURRENT_BINARY_DIR}/blender-recovery"
+    CACHE PATH "Output directory for the Blender recovery benchmark")
 
 if(CENTRIFUGE_BUILD_FUZZERS AND NOT CENTRIFUGE_ENABLE_SANITIZERS)
   message(FATAL_ERROR
@@ -86,6 +92,15 @@ endif()
 
 add_executable(centrifuge src/cli/main.cpp)
 target_link_libraries(centrifuge PRIVATE centrifuge_core)
+# decompile() recursively walks long straight-line CFG chains; each
+# recursion frame carries a large BlockEmitter plus lambdas.  Blender 5.x
+# contains functions whose block depth exhausts the default 1MB main-thread
+# stack (crash inside malloc).  Give every executable a 16MB stack.
+if(MSVC)
+  target_link_options(centrifuge PRIVATE /STACK:16777216)
+else()
+  target_link_options(centrifuge PRIVATE -Wl,--stack,16777216)
+endif()
 
 # Test-sample generator (pure C++, writes ELF32/ELF64/PE32+ test binaries)
 add_executable(make_samples tools/make_samples.cpp)
@@ -206,9 +221,8 @@ if(BUILD_TESTING)
                 --centrifuge "$<TARGET_FILE:centrifuge>"
                 --source-dir "${CMAKE_CURRENT_SOURCE_DIR}"
                 --blender "${CENTRIFUGE_BLENDER_WINDOWS_BINARY}"
-                --manifest
-                  "${CMAKE_CURRENT_SOURCE_DIR}/tests/blender_windows_manifest.json"
-                --output-dir "${CMAKE_CURRENT_BINARY_DIR}/blender-recovery"
+                --manifest "${CENTRIFUGE_BLENDER_WINDOWS_MANIFEST}"
+                --output-dir "${CENTRIFUGE_BLENDER_WINDOWS_OUTPUT}"
                 --cmake "${CMAKE_COMMAND}"
       )
       set_tests_properties(blender_windows_project_recovery PROPERTIES

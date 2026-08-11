@@ -663,7 +663,28 @@ public:
                 }
                 if (op.op == POp::CALL || op.op == POp::CALLIND) {
                     if (!emitCall(pi, op.in0)) {
-                        const std::string target = exprOfV(pi.find(op.in0)).text;
+                        const Varnode* targetNode = pi.find(op.in0);
+                        std::string target = exprOfV(targetNode).text;
+                        if (op.op == POp::CALLIND && targetNode &&
+                            targetNode->kind == Varnode::REGISTER &&
+                            architecture.rfind("x86", 0) == 0) {
+                            // An x86 indirect call through a 32-bit
+                            // register view (mov esi, eax; call rsi)
+                            // still targets the full 64-bit register.
+                            // exprOfV slices e.g. esi to (uint32_t)(rsi)
+                            // which truncates a valid 64-bit pointer.
+                            // Use the full register name instead.
+                            unsigned storageOffset = 0;
+                            unsigned shift = 0;
+                            uint64_t storageOffset64 = 0;
+                            if (!x86GprSlice(architecture, targetNode->offset,
+                                             targetNode->size, storageOffset64,
+                                             shift)) {
+                                storageOffset64 = targetNode->offset;
+                            }
+                            target = registerName(architecture, storageOffset64,
+                                                  8);
+                        }
                         line(op.op == POp::CALLIND
                                  ? (registerName(architecture,
                                                  returnRegisterOffset(architecture)) +

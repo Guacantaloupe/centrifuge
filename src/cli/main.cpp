@@ -733,11 +733,14 @@ int cmdSpec(int argc, char** argv) {
             std::fprintf(stderr, "centrifuge: failed to build CFG\n");
             return 1;
         }
-        const std::string abi = argc >= 8 ? argv[7] : std::string();
+        const std::string abi = argc >= 8
+            ? argv[7]
+            : (prog->arch.rfind("x86", 0) == 0 && prog->arch != "x86"
+                   ? "win64" : std::string());
         const std::string arch = prog->arch + abi;
-        StackFrameAnalysis analysis;
-        analysis.analyze(cfg, arch);
-        const StackFrameModel& model = analysis.model();
+        StackFrameAnalysis stackAnalysis;
+        stackAnalysis.analyze(cfg, arch);
+        const StackFrameModel& model = stackAnalysis.model();
         std::printf("// stack frame: size=0x%llx frame_pointer=%s "
                     "slots=%zu promoted=%zu\n",
                     (unsigned long long)model.frameSize,
@@ -754,8 +757,33 @@ int cmdSpec(int argc, char** argv) {
                           static_cast<unsigned long long>(target));
             return buf;
         };
-        std::printf("%s", decompile(*eng, reader, addr, end, nameOf, nullptr,
-                                     arch, false, &model, &globals).c_str());
+        // Phase 10a: lazily recover callee signatures (entry ABI-parameter
+        // usage) so internal calls emit in Windows x64 argument order
+        // (rcx, rdx, r8, r9, stack...) instead of the sleigh CALLIND register
+        // list.  Per-callee FunctionIR keeps this interactive-fast; the
+        // machine-semantic recovered project is unaffected.
+        std::map<uint64_t, std::optional<FunctionSignature>> signatureCache;
+        auto signatureOf = [&](uint64_t target)
+            -> std::optional<FunctionSignature> {
+            auto found = signatureCache.find(target);
+            if (found != signatureCache.end()) return found->second;
+            std::optional<FunctionSignature> result;
+            if (prog->memory.isExecutable(target)) {
+                CfgBuilder calleeCfg;
+                if (calleeCfg.build(*eng, reader, target, target + 0x1000)) {
+                    FunctionIR calleeIR;
+                    if (calleeIR.build(calleeCfg, prog->arch, abi)) {
+                        calleeIR.inferTypes();
+                        result = calleeIR.inferSignature();
+                    }
+                }
+            }
+            signatureCache[target] = result;
+            return result;
+        };
+        std::printf("%s", decompile(*eng, reader, addr, end, nameOf,
+                                     signatureOf, arch, false, &model,
+                                     &globals).c_str());
         return 0;
     }
     if (cmd == "decompile") {

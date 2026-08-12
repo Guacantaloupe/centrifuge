@@ -16,9 +16,9 @@
 #include <tuple>
 
 #include "centrifuge/decompile.hpp"
+#include "centrifuge/calling_convention.hpp"
 
 namespace centrifuge {
-namespace {
 
 using RegKey = std::pair<uint64_t, int>;
 
@@ -118,7 +118,6 @@ std::vector<std::pair<uint64_t, std::string>> abiArguments(
     return {{0, "arg0"}, {8, "arg1"}, {16, "arg2"}, {24, "arg3"}};
 }
 
-} // namespace
 
 std::string DataType::name() const {
     switch (kind) {
@@ -1617,6 +1616,15 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
         if (memoryModelChanged) ir.partitionMemory();
         reportStage("memory-ssa");
         analyzed.signature = ir.inferSignature();
+        {
+            // Phase 5: calling-convention recovery annotates the signature
+            // with variadic / hidden-sret facts derived from the SSA IR and
+            // the p-code CFG (see calling_convention.cpp).
+            const CallConventionFacts convention =
+                recoverCallConvention(ir, cfg, architecture_);
+            applyCallConvention(convention, analyzed.signature,
+                                architecture_);
+        }
         {
             std::map<SsaId, const SsaOp*> definitions;
             for (const SsaBlock& block : ir.blocks()) {

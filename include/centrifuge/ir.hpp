@@ -70,6 +70,13 @@ struct TypeDetail {
 using MidValueId = uint64_t;
 using SsaId = MidValueId;
 
+// ABI argument register offsets (offset = storage byte offset, name = slot
+// name) for the supported calling conventions.  Win64: rcx/rdx/r8/r9;
+// SystemV: rdi/rsi/rdx/rcx/r8/r9; RISC-V: a0-a7; AArch64: x0-x7.
+std::vector<std::pair<uint64_t, std::string>> abiArguments(
+    const std::string& architecture,
+    const std::string& callingConvention = {});
+
 struct MidValue {
     enum Storage { CONSTANT, REGISTER, TEMPORARY, MEMORY_STATE } storage = TEMPORARY;
     SsaId id = 0;
@@ -233,6 +240,24 @@ private:
     std::map<int64_t, SsaId> stackInputs_;
     bool hasTailCall_ = false;
     SsaId nextId_ = 1;
+
+public:
+    // Calling-convention recovery reads the entry-parameter and stack-input
+    // maps that FunctionIR::build derives during renaming.
+    const std::map<std::pair<uint64_t, int>, SsaId>& parameters() const {
+        return parameters_;
+    }
+    const std::map<int64_t, SsaId>& stackInputs() const {
+        return stackInputs_;
+    }
+    // Block-exit register states: {block start -> {register key -> SsaId}}.
+    // The RETURN-block exit state carries the machine return value (RAX on
+    // x86) even though the x86 `ret` p-code has no explicit operand.
+    const std::map<uint64_t,
+                   std::map<std::pair<uint64_t, int>, SsaId>>&
+    outgoing() const {
+        return outgoing_;
+    }
 };
 
 struct JumpTable {

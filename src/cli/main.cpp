@@ -28,6 +28,7 @@
 #include "centrifuge/sleigh.hpp"
 #include "centrifuge/semantic_coverage.hpp"
 #include "centrifuge/stack_recovery.hpp"
+#include "centrifuge/global_recovery.hpp"
 #include "centrifuge/import_prototype.hpp"
 
 using namespace centrifuge;
@@ -742,6 +743,9 @@ int cmdSpec(int argc, char** argv) {
                     (unsigned long long)model.frameSize,
                     model.hasFramePointer ? "yes" : "no",
                     model.slots.size(), model.promotedCount);
+        // Phase 8: name constant-address data accesses in the native view.
+        GlobalObjectRecovery globals;
+        globals.analyze(cfg, prog->memory);
         auto nameOf = [&](uint64_t target) -> std::string {
             for (const auto& s : prog->symbols)
                 if (s.isFunction && s.addr == target) return s.name;
@@ -751,7 +755,7 @@ int cmdSpec(int argc, char** argv) {
             return buf;
         };
         std::printf("%s", decompile(*eng, reader, addr, end, nameOf, nullptr,
-                                     arch, false, &model).c_str());
+                                     arch, false, &model, &globals).c_str());
         return 0;
     }
     if (cmd == "decompile") {

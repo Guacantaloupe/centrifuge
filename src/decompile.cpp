@@ -323,6 +323,7 @@ public:
     std::string architecture = "riscv64";
     bool useRecoveredRuntime = false;
     const StackFrameModel* stackModel = nullptr; // Native Source Backend
+    const GlobalObjectRecovery* globals = nullptr; // Phase 8
 
     explicit BlockEmitter(const CfgBlock& blk) : blk_(blk) {}
 
@@ -743,6 +744,27 @@ public:
                                      std::string(uCast(stored ? stored->size : 8)) +
                                      ">(" + stripParens(a.text) + ", " +
                                      stripParens(v.text) + ");");
+                            } else if (globals) {
+                                // Phase 8: name constant-address accesses.
+                                const Varnode* addrNode = pi.find(op.in0);
+                                if (addrNode &&
+                                    addrNode->kind == Varnode::CONST) {
+                                    const GlobalObject* object =
+                                        globals->objectAt(addrNode->offset);
+                                    if (object) {
+                                        line("*((" +
+                                             std::string(uCast(
+                                                 vs ? vs->size : 8)) +
+                                             " *)(uintptr_t)(" +
+                                             object->name + ")) = " +
+                                             stripParens(v.text) + ";");
+                                        continue;
+                                    }
+                                }
+                                line("*((" +
+                                     std::string(uCast(vs ? vs->size : 8)) +
+                                     " *)(" + stripParens(a.text) + ")) = " +
+                                     stripParens(v.text) + ";");
                             } else {
                                 line("*((" +
                                      std::string(uCast(vs ? vs->size : 8)) +
@@ -1586,6 +1608,24 @@ public:
                                 ">(" + stripParens(a.text) + ")";
                             r.size = vo->size;
                         }
+                    } else if (!useRecoveredRuntime && globals) {
+                        // Phase 8: name constant-address data accesses.
+                        const Varnode* addrNode = pi.find(op.in0);
+                        if (addrNode && addrNode->kind == Varnode::CONST) {
+                            const GlobalObject* object =
+                                globals->objectAt(addrNode->offset);
+                            if (object) {
+                                r.text =
+                                    "(*(" + std::string(uCast(vo->size)) +
+                                    " *)(uintptr_t)(" + object->name + "))";
+                                r.size = vo->size;
+                                break;
+                            }
+                        }
+                        const CExpr a = exprOfV(pi.find(op.in0));
+                        r.text = "(*(" + std::string(uCast(vo->size)) +
+                                  " *)(" + stripParens(a.text) + "))";
+                        r.size = vo->size;
                     } else {
                         const CExpr a = exprOfV(pi.find(op.in0));
                         r.text = useRecoveredRuntime
@@ -1723,7 +1763,8 @@ std::string decompile(
     const std::function<std::string(uint64_t)>& nameOf,
     const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf,
     const std::string& architecture, bool useRecoveredRuntime,
-    const StackFrameModel* stackModel) {
+    const StackFrameModel* stackModel,
+    const GlobalObjectRecovery* globals) {
     CfgBuilder cfg;
     if (!cfg.build(eng, read, start, end)) return "// failed to build CFG\n";
 
@@ -1767,6 +1808,8 @@ std::string decompile(
                     body.architecture = architecture;
                     body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
+    body.globals = globals;
+
                     body.spBias = frameBias;
                     body.emit();
                     if (body.hasCond && !body.cond.empty()) {
@@ -1792,6 +1835,8 @@ std::string decompile(
                 body.architecture = architecture;
                 body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
+    body.globals = globals;
+
                 body.spBias = frameBias;
                 body.emit();
                 for (int i = 0; i <= depth; ++i) out << "    ";
@@ -1824,6 +1869,8 @@ std::string decompile(
                 header.architecture = architecture;
                 header.useRecoveredRuntime = useRecoveredRuntime;
                     header.stackModel = stackModel;
+    header.globals = globals;
+
                 header.spBias = frameBias;
                 header.emit();
                 if (header.out.str().empty() && header.hasCond &&
@@ -1838,6 +1885,8 @@ std::string decompile(
                         body.architecture = architecture;
                         body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
+    body.globals = globals;
+
                         body.spBias = frameBias;
                         body.emit();
                         const std::string condition =
@@ -1864,6 +1913,8 @@ std::string decompile(
         be.architecture = architecture;
         be.useRecoveredRuntime = useRecoveredRuntime;
                     be.stackModel = stackModel;
+    be.globals = globals;
+
         be.spBias = frameBias;
         be.emit();
         out << be.out.str(); // flush block body
@@ -1895,6 +1946,8 @@ std::string decompile(
                 thenBody.architecture = architecture;
                 thenBody.useRecoveredRuntime = useRecoveredRuntime;
                     thenBody.stackModel = stackModel;
+    thenBody.globals = globals;
+
                 thenBody.spBias = frameBias;
                 thenBody.emit();
                 BlockEmitter elseBody(*fb);
@@ -1904,6 +1957,8 @@ std::string decompile(
                 elseBody.architecture = architecture;
                 elseBody.useRecoveredRuntime = useRecoveredRuntime;
                     elseBody.stackModel = stackModel;
+    elseBody.globals = globals;
+
                 elseBody.spBias = frameBias;
                 elseBody.emit();
                 for (int i = 0; i <= depth; ++i) out << "    ";
@@ -1929,6 +1984,8 @@ std::string decompile(
                 te.architecture = architecture;
                 te.useRecoveredRuntime = useRecoveredRuntime;
                     te.stackModel = stackModel;
+    te.globals = globals;
+
                 te.spBias = frameBias;
                 te.emit();
                 out << te.out.str(); // flush if-body
@@ -2021,7 +2078,8 @@ std::string decompileTyped(
     const std::function<std::string(uint64_t)>& nameOf,
     const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf) {
     return decompileTyped(eng, read, start, end, architecture, functionName,
-                          signature, nameOf, signatureOf, false, nullptr);
+                          signature, nameOf, signatureOf, false, nullptr,
+                          nullptr);
 }
 
 std::string decompileTyped(
@@ -2031,10 +2089,11 @@ std::string decompileTyped(
     const FunctionSignature& signature,
     const std::function<std::string(uint64_t)>& nameOf,
     const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf,
-    bool useRecoveredRuntime, const StackFrameModel* stackModel) {
+    bool useRecoveredRuntime, const StackFrameModel* stackModel,
+    const GlobalObjectRecovery* globals) {
     const std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
                                        architecture, useRecoveredRuntime,
-                                       stackModel);
+                                       stackModel, globals);
     std::set<std::string> locals;
     std::map<std::string, std::vector<std::string>> typedLocals;
     if (stackModel) {

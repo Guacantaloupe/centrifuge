@@ -14,6 +14,7 @@
 #include "centrifuge/ir.hpp"
 #include "centrifuge/sleigh.hpp"
 #include "centrifuge/stack_recovery.hpp"
+#include "centrifuge/global_recovery.hpp"
 
 namespace centrifuge {
 
@@ -31,7 +32,8 @@ std::string decompile(
         nullptr,
     const std::string& architecture = "riscv64",
     bool useRecoveredRuntime = false,
-    const StackFrameModel* stackModel = nullptr);
+    const StackFrameModel* stackModel = nullptr,
+    const GlobalObjectRecovery* globals = nullptr);
 
 // Emits a complete C-like function with the recovered declaration and ABI
 // register aliases.  Direct calls use propagated callee signatures.
@@ -46,6 +48,7 @@ std::string decompileTyped(
     const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf =
         nullptr,
     bool useRecoveredRuntime = false,
-    const StackFrameModel* stackModel = nullptr);
+    const StackFrameModel* stackModel = nullptr,
+    const GlobalObjectRecovery* globals = nullptr);
 
 } // namespace centrifuge

@@ -329,6 +329,12 @@ public:
     bool useRecoveredRuntime = false;
     const StackFrameModel* stackModel = nullptr; // Native Source Backend
     const GlobalObjectRecovery* globals = nullptr; // Phase 8
+    // Phase 10a: in the entry block, ABI argument registers read before
+    // any redefinition are named param1..N instead of their machine names
+    // (local_m76 = (uint32_t)(rcx) becomes (uint32_t)(param1)).
+    bool entryBlock = false;
+    std::map<uint64_t, int> paramIndex; // ABI reg storage -> param number
+    std::set<uint64_t> paramDefined;    // ABI regs redefined in entry block
 
     explicit BlockEmitter(const CfgBlock& blk) : blk_(blk) {}
 
@@ -518,6 +524,34 @@ bool emitCall(const PcodeInsn& pi, uint64_t targetId) {
         regConst.clear();
         pending.clear();
         regExpr.clear();
+        if (entryBlock) {
+            paramIndex.clear();
+            paramDefined.clear();
+            if (architecture.rfind("x86", 0) == 0) {
+                const bool win64 =
+                    architecture.find("win64") != std::string::npos;
+                if (win64) {
+                    paramIndex[1 * 8] = 1;
+                    paramIndex[2 * 8] = 2;
+                    paramIndex[8 * 8] = 3;
+                    paramIndex[9 * 8] = 4;
+                } else {
+                    paramIndex[7 * 8] = 1;
+                    paramIndex[6 * 8] = 2;
+                    paramIndex[2 * 8] = 3;
+                    paramIndex[1 * 8] = 4;
+                    paramIndex[8 * 8] = 5;
+                    paramIndex[9 * 8] = 6;
+                }
+            }
+            std::string annotation;
+            for (const auto& param : paramIndex)
+                annotation += std::string(annotation.empty() ? "" : ", ") +
+                              "param" + std::to_string(param.second) + "=" +
+                              registerName(architecture, param.first, 8);
+            if (!annotation.empty())
+                line("// params: " + annotation);
+        }
 
         auto exprOfV = [&](const Varnode* v) -> CExpr {
             if (!v) return CExpr{"0", 8, true};
@@ -534,6 +568,12 @@ bool emitCall(const PcodeInsn& pi, uint64_t targetId) {
                 if (x86GprSlice(architecture, v->offset, v->size,
                                 storageOffset, shift)) {
                     name = registerName(architecture, storageOffset, 8);
+                    if (entryBlock) {
+                        const auto param = paramIndex.find(storageOffset);
+                        if (param != paramIndex.end() &&
+                            !paramDefined.count(storageOffset))
+                            name = "param" + std::to_string(param->second);
+                    }
                     if (v->size < 8 || shift) {
                         const std::string shifted = shift
                             ? name + " >> " + std::to_string(shift) : name;
@@ -1733,6 +1773,8 @@ bool emitCall(const PcodeInsn& pi, uint64_t targetId) {
         for (const auto& write : pending) {
             const uint64_t written = registerStorageOffset(
                 architecture, write.first, write.second.size);
+            if (entryBlock && paramIndex.count(written))
+                paramDefined.insert(written);
             for (auto it = regExpr.begin(); it != regExpr.end();) {
                 bool depends = false;
                 for (const auto& ref : it->second.registerRefs)
@@ -1863,6 +1905,8 @@ std::string decompile(
     body.globals = globals;
 
                     body.spBias = frameBias;
+
+                    body.entryBlock = !useRecoveredRuntime && (a == start);
                     body.emit();
                     if (body.hasCond && !body.cond.empty()) {
                         for (int i = 0; i <= depth; ++i) out << "    ";
@@ -1890,6 +1934,8 @@ std::string decompile(
     body.globals = globals;
 
                 body.spBias = frameBias;
+
+                body.entryBlock = !useRecoveredRuntime && (a == start);
                 body.emit();
                 for (int i = 0; i <= depth; ++i) out << "    ";
                 out << "while (1) {\n" << body.out.str();
@@ -1964,6 +2010,7 @@ std::string decompile(
                         header.stackModel = stackModel;
                         header.globals = globals;
                         header.spBias = frameBias;
+                        header.entryBlock = !useRecoveredRuntime && (a == start);
                         header.emit();
                         if (header.out.str().empty() && header.hasCond &&
                             !header.cond.empty()) {
@@ -2008,6 +2055,8 @@ std::string decompile(
     be.globals = globals;
 
         be.spBias = frameBias;
+
+        be.entryBlock = !useRecoveredRuntime && (a == start);
         be.emit();
         out << be.out.str(); // flush block body
         frameBias = std::min(frameBias, be.spBias); // keep prologue bias
@@ -2041,6 +2090,8 @@ std::string decompile(
     thenBody.globals = globals;
 
                 thenBody.spBias = frameBias;
+
+                thenBody.entryBlock = !useRecoveredRuntime && (a == start);
                 thenBody.emit();
                 BlockEmitter elseBody(*fb);
                 elseBody.indent = depth + 2;
@@ -2052,6 +2103,8 @@ std::string decompile(
     elseBody.globals = globals;
 
                 elseBody.spBias = frameBias;
+
+                elseBody.entryBlock = !useRecoveredRuntime && (a == start);
                 elseBody.emit();
                 for (int i = 0; i <= depth; ++i) out << "    ";
                 out << "if (" << be.cond << ") {\n" << thenBody.out.str();
@@ -2079,6 +2132,8 @@ std::string decompile(
     te.globals = globals;
 
                 te.spBias = frameBias;
+
+                te.entryBlock = !useRecoveredRuntime && (a == start);
                 te.emit();
                 out << te.out.str(); // flush if-body
                 for (int i = 0; i <= depth + 1; ++i) out << "    ";

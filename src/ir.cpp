@@ -635,6 +635,40 @@ void FunctionIR::inferTypes() {
         if (merged == it->second.type) return false;
         it->second.type = merged; return true;
     };
+    // Phase 7: attach an element type to a pointer value's TypeDetail.
+    // Conservative: never downgrade a known element; widen UNKNOWN only.
+    auto attachElementType = [&](SsaId pointerId, const DataType& element,
+                                  std::map<SsaId, SsaValue>& values) {
+        auto it = values.find(pointerId);
+        if (it == values.end() || element.bits == 0) return false;
+        DataType& type = it->second.type;
+        if (type.kind != TypeKind::POINTER)
+            type = {TypeKind::POINTER, 64, 1};
+        if (!type.detail) type.detail = std::make_shared<TypeDetail>();
+        if (!type.detail->elementType) {
+            type.detail->elementType =
+                std::make_shared<DataType>(element);
+            return true;
+        }
+        DataType& current = *type.detail->elementType;
+        if (current.kind == TypeKind::UNKNOWN && current.bits == 0) {
+            current = element;
+            return true;
+        }
+        // Float evidence upgrades a width-inferred unsigned element.
+        if (element.kind == TypeKind::FLOAT &&
+            current.kind == TypeKind::UNSIGNED_INT &&
+            current.bits == element.bits) {
+            current = element;
+            return true;
+        }
+        if (current.kind == element.kind &&
+            (element.bits > current.bits || current.bits == 0)) {
+            current.bits = element.bits;
+            return true;
+        }
+        return false;
+    };
     bool changed = true;
     for (int pass = 0; changed && pass < 32; ++pass) {
         changed = false;
@@ -677,11 +711,57 @@ void FunctionIR::inferTypes() {
                     if (op.inputs.size() > 1) changed |= constrain(op.inputs[1], {TypeKind::BOOL, 1, 1});
                     break;
                 case POp::LOAD:
-                    if (!op.inputs.empty()) changed |= constrain(op.inputs[0], {TypeKind::POINTER, 64, 1});
-                    changed |= constrain(op.output, {TypeKind::UNSIGNED_INT, bits, 1});
+                    if (!op.inputs.empty()) {
+                        changed |= constrain(op.inputs[0],
+                                             {TypeKind::POINTER, 64, 1});
+                        // Phase 7: recover the pointer's element type from
+                        // the access width and the loaded value's kind.
+                        // Scalar inference covers <=8-byte accesses; SSE
+                        // scalar loads (movsd/movss) present a 16-byte xmm
+                        // container whose logical element is 4/8 bytes.
+                        const SsaValue* loaded = value(op.output);
+                        if (loaded && loaded->size > 0 && loaded->size <= 16) {
+                            const int elementBits =
+                                loaded->size <= 8 ? loaded->size * 8 : 64;
+                            DataType element{
+                                loaded->type.kind == TypeKind::FLOAT
+                                    ? TypeKind::FLOAT
+                                    : (loaded->type.kind ==
+                                               TypeKind::SIGNED_INT
+                                           ? TypeKind::SIGNED_INT
+                                           : TypeKind::UNSIGNED_INT),
+                                elementBits, 1};
+                            changed |= attachElementType(
+                                op.inputs[0], element, values_);
+                        }
+                    }
+                    changed |= constrain(op.output,
+                                         {TypeKind::UNSIGNED_INT, bits, 1});
                     break;
                 case POp::STORE:
-                    if (!op.inputs.empty()) changed |= constrain(op.inputs[0], {TypeKind::POINTER, 64, 1});
+                    if (!op.inputs.empty()) {
+                        changed |= constrain(op.inputs[0],
+                                             {TypeKind::POINTER, 64, 1});
+                        // The stored value's width and kind type the element.
+                        // sleigh encodes STORE as in0=addr in2=value (in1 is
+                        // unused), so the SSA input list is [addr, 0, value].
+                        if (op.inputs.size() > 2) {
+                            const SsaValue* stored = value(op.inputs[2]);
+                            if (stored && stored->size > 0 &&
+                                stored->size <= 8) {
+                                DataType element{
+                                    stored->type.kind == TypeKind::FLOAT
+                                        ? TypeKind::FLOAT
+                                        : (stored->type.kind ==
+                                                   TypeKind::SIGNED_INT
+                                               ? TypeKind::SIGNED_INT
+                                               : TypeKind::UNSIGNED_INT),
+                                    stored->size * 8, 1};
+                                changed |= attachElementType(
+                                    op.inputs[0], element, values_);
+                            }
+                        }
+                    }
                     break;
                 case POp::INT_EQUAL: case POp::INT_NOTEQUAL: case POp::INT_LESS:
                 case POp::INT_SLESS: case POp::INT_LESSEQUAL: case POp::INT_SLESSEQUAL:
@@ -844,6 +924,12 @@ void FunctionIR::inferTypes() {
         // Requiring two fields truncated single-field objects such as the
         // Windows CONTEXT pointer passed to RtlCaptureContext to uint32_t.
         if (fields.empty()) continue;
+        // Phase 7: a single narrow access is scalar dereference evidence -
+        // the pointer element type attached by LOAD/STORE inference is more
+        // precise than a synthetic single-field struct.  Scalar and SSE
+        // scalar accesses are <=128 bits; only wide struct blits (>=16
+        // bytes of payload, e.g. CONTEXT-style stores) aggregate.
+        if (fields.size() == 1 && fields[0].type.bits <= 128) continue;
         std::sort(fields.begin(), fields.end(), [](const TypeField& a,
                                                    const TypeField& b) {
             return std::tie(a.byteOffset, a.name) < std::tie(b.byteOffset, b.name);

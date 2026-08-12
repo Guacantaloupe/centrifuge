@@ -127,6 +127,9 @@ target_link_libraries(test_stack_recovery PRIVATE centrifuge_core)
 add_executable(test_calling_convention tests/test_calling_convention.cpp)
 target_link_libraries(test_calling_convention PRIVATE centrifuge_core)
 
+add_executable(test_type_recovery tests/test_type_recovery.cpp)
+target_link_libraries(test_type_recovery PRIVATE centrifuge_core)
+
 if(CENTRIFUGE_BUILD_FUZZERS)
   add_executable(fuzz_loader fuzz/loader_fuzz.cpp)
   target_link_libraries(fuzz_loader PRIVATE centrifuge_core)
@@ -167,6 +170,13 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/sleigh/x86-64.slaspec"
   )
   set_tests_properties(calling_convention PROPERTIES LABELS "unit;x86")
+
+  add_test(
+    NAME type_recovery
+    COMMAND test_type_recovery
+            "${CMAKE_CURRENT_SOURCE_DIR}/sleigh/x86-64.slaspec"
+  )
+  set_tests_properties(type_recovery PROPERTIES LABELS "unit;x86")
 
   add_test(
     NAME loader_malformed

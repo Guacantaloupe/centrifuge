@@ -1,4 +1,4 @@
-// centrifuge - a Ghidra reimplementation in C++17
+﻿// centrifuge - a Ghidra reimplementation in C++17
 // decompile.cpp - minimal C decompiler (v0.4)
 #include "centrifuge/decompile.hpp"
 
@@ -147,6 +147,11 @@ uint64_t stackPointerOffset(const std::string& architecture) {
     if (architecture.rfind("x86", 0) == 0) return 4 * 8;
     if (architecture == "aarch64" || architecture == "arm64") return 31 * 8;
     return 2 * 8;
+}
+
+uint64_t framePointerOffset(const std::string& architecture) {
+    if (architecture.rfind("x86", 0) == 0) return 5 * 8; // rbp
+    return 8 * 8; // riscv s0 / arm64 x29 (unused by default)
 }
 
 uint64_t returnRegisterOffset(const std::string& architecture) {
@@ -317,6 +322,7 @@ public:
     std::function<std::optional<FunctionSignature>(uint64_t)> signatureOf;
     std::string architecture = "riscv64";
     bool useRecoveredRuntime = false;
+    const StackFrameModel* stackModel = nullptr; // Native Source Backend
 
     explicit BlockEmitter(const CfgBlock& blk) : blk_(blk) {}
 
@@ -431,34 +437,42 @@ public:
     }
 
     // returns the stack-slot offset if the address varnode is sp+const
+    // (or, with the stack model, rbp+const relative to the entry rsp)
     bool slotOf(const PcodeInsn& pi, uint64_t addrId, int64_t& off) const {
         const Varnode* v = pi.find(addrId);
         if (!v) return false;
         const uint64_t spOffset = stackPointerOffset(architecture);
-        if (v->kind == Varnode::REGISTER && v->offset == spOffset) {
-            off = spBias;
-            return true;
+        const uint64_t bpOffset = framePointerOffset(architecture);
+        const bool fpActive =
+            stackModel && stackModel->hasFramePointer;
+        auto baseOf = [&](const Varnode* n, int64_t& bias) {
+            if (!n || n->kind != Varnode::REGISTER) return false;
+            if (n->offset == spOffset) { bias = spBias; return true; }
+            if (fpActive && n->offset == bpOffset) {
+                bias = stackModel->frameBaseOffset;
+                return true;
+            }
+            return false;
+        };
+        if (v->kind == Varnode::REGISTER) {
+            int64_t bias = 0;
+            if (baseOf(v, bias)) { off = bias; return true; }
+            return false;
         }
         if (v->kind != Varnode::UNIQUE) return false;
-        // find the defining INT_ADD(sp, const)
+        // find the defining INT_ADD(sp|bp, const)
         for (const auto& op : pi.ops) {
             if (op.out != addrId) continue;
             if (op.op != POp::INT_ADD && op.op != POp::INT_SUB) return false;
             const Varnode* a = pi.find(op.in0);
             const Varnode* b = pi.find(op.in1);
-            const Varnode* spv = nullptr;
+            int64_t baseBias = 0;
             const Varnode* cv = nullptr;
-            if (a && a->kind == Varnode::REGISTER && a->offset == spOffset) {
-                spv = a;
-                cv = b;
-            } else if (b && b->kind == Varnode::REGISTER &&
-                       b->offset == spOffset) {
-                spv = b;
-                cv = a;
-            }
-            if (!spv || !cv || cv->kind != Varnode::CONST) return false;
+            if (baseOf(a, baseBias)) cv = b;
+            else if (baseOf(b, baseBias)) cv = a;
+            if (!cv || cv->kind != Varnode::CONST) return false;
             const int64_t k = static_cast<int64_t>(cv->offset);
-            off = spBias + (op.op == POp::INT_SUB ? -k : k);
+            off = baseBias + (op.op == POp::INT_SUB ? -k : k);
             return true;
         }
         return false;
@@ -699,10 +713,27 @@ public:
                     if (op.op == POp::STORE) {
                         int64_t slot = 0;
                         const Varnode* vs = pi.find(op.in2);
-                        if (slotOf(pi, op.in0, slot) && !useRecoveredRuntime) {
-                            line(localName(slot) + " = " +
-                                 stripParens(exprOfV(pi.find(op.in2)).text) +
-                                 ";");
+                        if (slotOf(pi, op.in0, slot)) {
+                            const StackSlot* ss =
+                                stackModel ? stackModel->slotAt(slot)
+                                           : nullptr;
+                            if (ss && ss->promoted) {
+                                line(ss->variableName + " = " +
+                                     stripParens(exprOfV(pi.find(op.in2)).text) +
+                                     ";");
+                            } else if (!useRecoveredRuntime) {
+                                line(localName(slot) + " = " +
+                                     stripParens(exprOfV(pi.find(op.in2)).text) +
+                                     ";");
+                            } else {
+                                const CExpr a = exprOfV(pi.find(op.in0));
+                                const CExpr v = exprOfV(pi.find(op.in2));
+                                const Varnode* stored = pi.find(op.in2);
+                                line("recovered_store<" +
+                                     std::string(uCast(stored ? stored->size : 8)) +
+                                     ">(" + stripParens(a.text) + ", " +
+                                     stripParens(v.text) + ");");
+                            }
                         } else {
                             const CExpr a = exprOfV(pi.find(op.in0));
                             const CExpr v = exprOfV(pi.find(op.in2));
@@ -1541,8 +1572,20 @@ public:
                 }
                 case POp::LOAD: {
                     int64_t slot = 0;
-                    if (slotOf(pi, op.in0, slot) && !useRecoveredRuntime) {
-                        r = CExpr{localName(slot), vo->size, false};
+                    if (slotOf(pi, op.in0, slot)) {
+                        const StackSlot* ss =
+                            stackModel ? stackModel->slotAt(slot) : nullptr;
+                        if (ss && ss->promoted) {
+                            r = CExpr{ss->variableName, vo->size, false};
+                        } else if (!useRecoveredRuntime) {
+                            r = CExpr{localName(slot), vo->size, false};
+                        } else {
+                            const CExpr a = exprOfV(pi.find(op.in0));
+                            r.text =
+                                "recovered_load<" + std::string(uCast(vo->size)) +
+                                ">(" + stripParens(a.text) + ")";
+                            r.size = vo->size;
+                        }
                     } else {
                         const CExpr a = exprOfV(pi.find(op.in0));
                         r.text = useRecoveredRuntime
@@ -1679,7 +1722,8 @@ std::string decompile(
     uint64_t end,
     const std::function<std::string(uint64_t)>& nameOf,
     const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf,
-    const std::string& architecture, bool useRecoveredRuntime) {
+    const std::string& architecture, bool useRecoveredRuntime,
+    const StackFrameModel* stackModel) {
     CfgBuilder cfg;
     if (!cfg.build(eng, read, start, end)) return "// failed to build CFG\n";
 
@@ -1722,6 +1766,7 @@ std::string decompile(
                     body.signatureOf = signatureOf;
                     body.architecture = architecture;
                     body.useRecoveredRuntime = useRecoveredRuntime;
+                    body.stackModel = stackModel;
                     body.spBias = frameBias;
                     body.emit();
                     if (body.hasCond && !body.cond.empty()) {
@@ -1746,6 +1791,7 @@ std::string decompile(
                 body.signatureOf = signatureOf;
                 body.architecture = architecture;
                 body.useRecoveredRuntime = useRecoveredRuntime;
+                    body.stackModel = stackModel;
                 body.spBias = frameBias;
                 body.emit();
                 for (int i = 0; i <= depth; ++i) out << "    ";
@@ -1777,6 +1823,7 @@ std::string decompile(
                 header.signatureOf = signatureOf;
                 header.architecture = architecture;
                 header.useRecoveredRuntime = useRecoveredRuntime;
+                    header.stackModel = stackModel;
                 header.spBias = frameBias;
                 header.emit();
                 if (header.out.str().empty() && header.hasCond &&
@@ -1790,6 +1837,7 @@ std::string decompile(
                         body.signatureOf = signatureOf;
                         body.architecture = architecture;
                         body.useRecoveredRuntime = useRecoveredRuntime;
+                    body.stackModel = stackModel;
                         body.spBias = frameBias;
                         body.emit();
                         const std::string condition =
@@ -1815,6 +1863,7 @@ std::string decompile(
         be.signatureOf = signatureOf;
         be.architecture = architecture;
         be.useRecoveredRuntime = useRecoveredRuntime;
+                    be.stackModel = stackModel;
         be.spBias = frameBias;
         be.emit();
         out << be.out.str(); // flush block body
@@ -1845,6 +1894,7 @@ std::string decompile(
                 thenBody.signatureOf = signatureOf;
                 thenBody.architecture = architecture;
                 thenBody.useRecoveredRuntime = useRecoveredRuntime;
+                    thenBody.stackModel = stackModel;
                 thenBody.spBias = frameBias;
                 thenBody.emit();
                 BlockEmitter elseBody(*fb);
@@ -1853,6 +1903,7 @@ std::string decompile(
                 elseBody.signatureOf = signatureOf;
                 elseBody.architecture = architecture;
                 elseBody.useRecoveredRuntime = useRecoveredRuntime;
+                    elseBody.stackModel = stackModel;
                 elseBody.spBias = frameBias;
                 elseBody.emit();
                 for (int i = 0; i <= depth; ++i) out << "    ";
@@ -1877,6 +1928,7 @@ std::string decompile(
                 te.signatureOf = signatureOf;
                 te.architecture = architecture;
                 te.useRecoveredRuntime = useRecoveredRuntime;
+                    te.stackModel = stackModel;
                 te.spBias = frameBias;
                 te.emit();
                 out << te.out.str(); // flush if-body
@@ -1969,7 +2021,7 @@ std::string decompileTyped(
     const std::function<std::string(uint64_t)>& nameOf,
     const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf) {
     return decompileTyped(eng, read, start, end, architecture, functionName,
-                          signature, nameOf, signatureOf, false);
+                          signature, nameOf, signatureOf, false, nullptr);
 }
 
 std::string decompileTyped(
@@ -1979,17 +2031,34 @@ std::string decompileTyped(
     const FunctionSignature& signature,
     const std::function<std::string(uint64_t)>& nameOf,
     const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf,
-    bool useRecoveredRuntime) {
+    bool useRecoveredRuntime, const StackFrameModel* stackModel) {
     const std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
-                                       architecture, useRecoveredRuntime);
+                                       architecture, useRecoveredRuntime,
+                                       stackModel);
     std::set<std::string> locals;
+    std::map<std::string, std::vector<std::string>> typedLocals;
+    if (stackModel) {
+        // Native Source Backend: promoted slots declare their recovered
+        // width; the text scan below still picks up un-promoted fallbacks.
+        for (const StackSlot& ss : stackModel->slots) {
+            if (ss.promoted && !ss.typeName.empty() &&
+                !ss.variableName.empty())
+                typedLocals[ss.typeName].push_back(ss.variableName);
+        }
+    }
     for (size_t at = 0; (at = body.find("local_", at)) != std::string::npos;) {
         size_t finish = at + 6;
         while (finish < body.size() &&
                (std::isalnum(static_cast<unsigned char>(body[finish])) ||
                 body[finish] == '_'))
             ++finish;
-        locals.insert(body.substr(at, finish - at));
+        const std::string name = body.substr(at, finish - at);
+        bool promoted = false;
+        for (const auto& kv : typedLocals)
+            if (std::find(kv.second.begin(), kv.second.end(), name) !=
+                kv.second.end())
+                promoted = true;
+        if (!promoted) locals.insert(name);
         at = finish;
     }
     for (const FunctionParameter& parameter : signature.parameters)
@@ -2115,6 +2184,11 @@ std::string decompileTyped(
         for (const std::string& local : locals)
             out << (index++ ? ", " : "") << local << " = 0";
         out << ";\n";
+    }
+    if (!typedLocals.empty()) {
+        for (const auto& kv : typedLocals)
+            for (const std::string& name : kv.second)
+                out << "    " << kv.first << " " << name << " = 0;\n";
     }
     for (const FunctionParameter& parameter : signature.parameters)
         if (parameter.onStack) {

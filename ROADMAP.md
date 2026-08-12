@@ -38,6 +38,30 @@ No external decoders/libraries — every layer is written from scratch.
 - Dear ImGui listing/navigation, function map, xrefs
 - Project model; scripting API (Lua) driving the core library
 
+## ✅ Native Source Recovery Backend (Decompiler roadmap, Phase 1-3)
+Machine Semantic Backend (Binary → p-code → machine-like C++ → compile →
+verifier) remains the correctness oracle.  The new Native Source Recovery
+Backend lifts provably-stable machine state into real source semantics:
+
+- **StackFrameAnalysis** (src/stack_recovery.cpp): prologue/epilogue
+  recovery on the p-code CFG — frame size, frame pointer, saved registers,
+  sp-bias tracking through x86 unique-carrier p-code (sp = sp - 8 is
+  materialised as u = sp - 8; *(u) = ...; sp = u)
+- **StackSlotRecovery**: stable stack accesses (rbp/rsp + const) become
+  StackSlot IR objects with width, read/write sites, lifetime, role
+  (LOCAL / SAVED_REGISTER / PARAMETER / RETURN_ADDRESS)
+- **VariablePromotion**: safe LOCAL slots (single width, no overlap, no
+  address escape) promote to typed locals (uint32_t local_m28); anything
+  unprovable falls back to the Machine Semantic representation
+- Overlap detection, address-taken (lea / escaped-address) detection,
+  mixed-width fallback
+- CLI: decompile-native <addr> emits the native view
+- Golden tests: 	est_stack_recovery (frame-pointer, rsp-relative,
+  parameter/return-address, mixed-width, address-taken functions)
+
+Next phases: CallingConventionRecovery → FunctionPrototypeRecovery →
+TypeRecovery → MemoryObjectRecovery → ControlFlowStructuring.
+
 ## 🎯 v0.7 — Symbolic execution (angr rotor) ⭐ the merge
 The p-code interpreter already models values as {const, unknown}; generalize
 it to **symbolic values** (expression trees over registers/memory):

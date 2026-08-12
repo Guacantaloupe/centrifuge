@@ -51,6 +51,7 @@ add_library(centrifuge_core STATIC
   src/midir.cpp
   src/highir.cpp
   src/cpp_recovery.cpp
+  src/stack_recovery.cpp
   src/program_graph.cpp
   src/project_recovery.cpp
   src/semantic_coverage.cpp
@@ -118,6 +119,9 @@ target_link_libraries(test_ir PRIVATE centrifuge_core)
 add_executable(test_loaders tests/test_loaders.cpp)
 target_link_libraries(test_loaders PRIVATE centrifuge_core)
 
+add_executable(test_stack_recovery tests/test_stack_recovery.cpp)
+target_link_libraries(test_stack_recovery PRIVATE centrifuge_core)
+
 if(CENTRIFUGE_BUILD_FUZZERS)
   add_executable(fuzz_loader fuzz/loader_fuzz.cpp)
   target_link_libraries(fuzz_loader PRIVATE centrifuge_core)
@@ -144,6 +148,13 @@ if(BUILD_TESTING)
 
   add_test(NAME function_ir COMMAND test_ir)
   set_tests_properties(function_ir PROPERTIES LABELS "unit;analysis")
+
+  add_test(
+    NAME stack_recovery
+    COMMAND test_stack_recovery
+            "${CMAKE_CURRENT_SOURCE_DIR}/sleigh/x86-64.slaspec"
+  )
+  set_tests_properties(stack_recovery PROPERTIES LABELS "unit;x86")
 
   add_test(
     NAME loader_malformed

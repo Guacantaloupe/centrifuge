@@ -13,11 +13,15 @@
 
 #include "centrifuge/ir.hpp"
 #include "centrifuge/sleigh.hpp"
+#include "centrifuge/stack_recovery.hpp"
 
 namespace centrifuge {
 
 // Decompile the function starting at `start` (until RET/undecodable/`end`).
 // `nameOf` resolves call-target addresses to function names ("" = indirect).
+// `stackModel` (optional) enables the Native Source Recovery Backend:
+// provably-stable stack slots promoted by StackFrameAnalysis are emitted as
+// local variables instead of raw memory expressions.
 std::string decompile(
     const SleighEngine& eng,
     const std::function<bool(uint64_t, void*, size_t)>& read, uint64_t start,
@@ -26,10 +30,13 @@ std::string decompile(
     const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf =
         nullptr,
     const std::string& architecture = "riscv64",
-    bool useRecoveredRuntime = false);
+    bool useRecoveredRuntime = false,
+    const StackFrameModel* stackModel = nullptr);
 
 // Emits a complete C-like function with the recovered declaration and ABI
 // register aliases.  Direct calls use propagated callee signatures.
+// `stackModel` (optional) enables native local-variable declaration from
+// the stack frame model instead of text scanning.
 std::string decompileTyped(
     const SleighEngine& eng,
     const std::function<bool(uint64_t, void*, size_t)>& read, uint64_t start,
@@ -38,6 +45,7 @@ std::string decompileTyped(
     const std::function<std::string(uint64_t)>& nameOf = nullptr,
     const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf =
         nullptr,
-    bool useRecoveredRuntime = false);
+    bool useRecoveredRuntime = false,
+    const StackFrameModel* stackModel = nullptr);
 
 } // namespace centrifuge

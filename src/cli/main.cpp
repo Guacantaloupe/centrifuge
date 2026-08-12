@@ -27,6 +27,7 @@
 #include "centrifuge/project_recovery.hpp"
 #include "centrifuge/sleigh.hpp"
 #include "centrifuge/semantic_coverage.hpp"
+#include "centrifuge/stack_recovery.hpp"
 
 using namespace centrifuge;
 
@@ -237,6 +238,8 @@ void usage(const char* argv0) {
                 "[abi] [max-functions]\n", argv0);
     std::printf("  %s spec <spec.slaspec> <file> semantic-coverage\n", argv0);
     std::printf("  %s spec <spec.slaspec> <file> decompile-typed <addr> [abi]\n",
+                argv0);
+    std::printf("  %s spec <spec.slaspec> <file> decompile-native <addr> [end] [abi]\n",
                 argv0);
     std::printf("  %s spec <spec.slaspec> <file> decompile <addr> [end]\n",
                 argv0);
@@ -708,6 +711,46 @@ int cmdSpec(int argc, char** argv) {
             return 1;
         }
         std::printf("%s", analysis.decompileFunction(*prog, *eng, addr).c_str());
+        return 0;
+    }
+    if (cmd == "decompile-native") {
+        // Native Source Recovery Backend: StackFrameAnalysis drives stack
+        // slot promotion; stable locals become typed variables instead of
+        // raw rsp/rbp memory expressions.
+        if (argc < 6) { usage(argv[0]); return 1; }
+        uint64_t addr = 0;
+        if (!parseAddr(argv[5], addr)) {
+            std::fprintf(stderr, "centrifuge: bad address '%s'\n", argv[5]);
+            return 1;
+        }
+        uint64_t end = 0;
+        if (argc >= 7) end = std::strtoull(argv[6], nullptr, 0);
+        if (end == 0) end = addr + 0x1000;
+        CfgBuilder cfg;
+        if (!cfg.build(*eng, reader, addr, end)) {
+            std::fprintf(stderr, "centrifuge: failed to build CFG\n");
+            return 1;
+        }
+        const std::string abi = argc >= 8 ? argv[7] : std::string();
+        const std::string arch = prog->arch + abi;
+        StackFrameAnalysis analysis;
+        analysis.analyze(cfg, arch);
+        const StackFrameModel& model = analysis.model();
+        std::printf("// stack frame: size=0x%llx frame_pointer=%s "
+                    "slots=%zu promoted=%zu\n",
+                    (unsigned long long)model.frameSize,
+                    model.hasFramePointer ? "yes" : "no",
+                    model.slots.size(), model.promotedCount);
+        auto nameOf = [&](uint64_t target) -> std::string {
+            for (const auto& s : prog->symbols)
+                if (s.isFunction && s.addr == target) return s.name;
+            char buf[24];
+            std::snprintf(buf, sizeof(buf), "FUN_%llx",
+                          static_cast<unsigned long long>(target));
+            return buf;
+        };
+        std::printf("%s", decompile(*eng, reader, addr, end, nameOf, nullptr,
+                                     arch, false, &model).c_str());
         return 0;
     }
     if (cmd == "decompile") {

@@ -316,6 +316,11 @@ public:
     bool resolvedKnown = false;
     std::map<uint64_t, int64_t> regConst; // registers holding constants
     std::vector<std::pair<uint64_t, CExpr>> pending; // register writes
+    // Phase 10b-2: block-local register definitions (storage -> defining
+    // expression).  Used to inline argument setup into call sites
+    // (rcx = X; FUN(rcx) -> FUN(X)); entries are invalidated when a
+    // dependency is redefined or at block boundaries.
+    std::map<uint64_t, CExpr> regExpr;
 
     // resolves a call target address to a function name ("" = indirect)
     std::function<std::string(uint64_t)> nameOf;
@@ -371,7 +376,28 @@ public:
     }
 
     // emit "a0 = fname(args);" for a resolved call; returns true if emitted
-    bool emitCall(const PcodeInsn& pi, uint64_t targetId) {
+    // Phase 10b-2: an argument-setup expression may be inlined into a call site
+// only when evaluating it again has no side effects.  Constants, loads,
+// arithmetic and named globals qualify; anything with a function-like call
+// (identifier directly before '(') is kept as a register variable to avoid
+// duplicate evaluation.
+bool inlineableExpression(const CExpr& expression) {
+    if (expression.text.empty()) return false;
+    if (expression.isConst) return true;
+    size_t pos = 0;
+    while ((pos = expression.text.find('(', pos)) != std::string::npos) {
+        if (pos > 0) {
+            const char previous = expression.text[pos - 1];
+            if (std::isalnum(static_cast<unsigned char>(previous)) ||
+                previous == '_' || previous == '>')
+                return false;
+        }
+        ++pos;
+    }
+    return true;
+}
+
+bool emitCall(const PcodeInsn& pi, uint64_t targetId) {
         if (!nameOf) return false;
         int64_t target = 0;
         if (!resolveTarget(pi, targetId, target)) return false;
@@ -422,7 +448,14 @@ public:
                     ? "recovered_load<std::uint64_t>(" + address + ")"
                     : "*((uint64_t *)(uintptr_t)(" + address + "))";
             } else {
-                argument = registerName(architecture, offset);
+                const uint64_t argumentStorage = registerStorageOffset(
+                    architecture, offset, 8);
+                std::string text = registerName(architecture, offset);
+                const auto definition = regExpr.find(argumentStorage);
+                if (definition != regExpr.end() &&
+                    inlineableExpression(definition->second))
+                    text = stripParens(definition->second.text);
+                argument = text;
             }
             if (signature && signature->parameters[i].type.kind == TypeKind::POINTER)
                 argument = "(void *)(uintptr_t)" + argument;
@@ -484,6 +517,7 @@ public:
         hasCond = false;
         regConst.clear();
         pending.clear();
+        regExpr.clear();
 
         auto exprOfV = [&](const Varnode* v) -> CExpr {
             if (!v) return CExpr{"0", 8, true};
@@ -1693,7 +1727,24 @@ public:
                          snapshot.first + ";");
             }
 
-            for (const auto& kv : pending) {
+        // Phase 10b-2: track block-local register definitions for argument
+        // inlining, invalidating any entry whose expression reads a register
+        // that this instruction redefines.
+        for (const auto& write : pending) {
+            const uint64_t written = registerStorageOffset(
+                architecture, write.first, write.second.size);
+            for (auto it = regExpr.begin(); it != regExpr.end();) {
+                bool depends = false;
+                for (const auto& ref : it->second.registerRefs)
+                    if (ref.first == written) { depends = true; break; }
+                if (depends)
+                    it = regExpr.erase(it);
+                else
+                    ++it;
+            }
+            regExpr[written] = write.second;
+        }
+        for (const auto& kv : pending) {
                 const uint64_t storage = registerStorageOffset(
                     architecture, kv.first, kv.second.size);
                 // track sp adjustment (prologue/frame): sp = sp +/- K

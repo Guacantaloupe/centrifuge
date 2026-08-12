@@ -1777,6 +1777,7 @@ std::string decompile(
 
     std::set<uint64_t> emitted;
     int64_t frameBias = 0; // sp bias right after the prologue (for locals)
+    std::optional<uint64_t> suppressBackedgeTo; // structured loop backedge
 
     std::function<void(uint64_t, int)> emitBlock;
     emitBlock = [&](uint64_t a, int depth) {
@@ -1848,59 +1849,99 @@ std::string decompile(
             }
         }
 
-        // Conservative canonical while: a condition-only header, one body
-        // block, one exit, and an unconditional body back edge.
-        if (loop && loop->blocks.size() == 2 && loop->exits.size() == 1) {
+        // Conservative canonical while: a condition-only header, a
+        // straight-line body chain (one or more blocks) ending in an
+        // unconditional back edge to the header, one exit.
+        if (loop && loop->blocks.size() >= 2 && loop->exits.size() == 1 &&
+            loop->backEdges.size() == 1) {
             uint64_t bodyAddr = 0;
             for (uint64_t member : loop->blocks)
                 if (member != a) bodyAddr = member;
             const CfgBlock* bodyBlock = cfg.blockAt(bodyAddr);
             const PcodeInsn* headerTerm = b->terminator();
-            const PcodeInsn* bodyTerm = bodyBlock ? bodyBlock->terminator() : nullptr;
             if (bodyBlock && !cfg.loopByHeader(bodyAddr) && headerTerm &&
-                headerTerm->kind == Insn::JCC && b->succs.size() == 2 &&
-                bodyBlock->succs == std::vector<uint64_t>{a} && bodyTerm &&
-                bodyTerm->kind == Insn::JMP && bodyTerm->targetKnown &&
-                bodyTerm->target == a) {
-                BlockEmitter header(*b);
-                header.indent = depth + 1;
-                header.nameOf = nameOf;
-                header.signatureOf = signatureOf;
-                header.architecture = architecture;
-                header.useRecoveredRuntime = useRecoveredRuntime;
-                    header.stackModel = stackModel;
-    header.globals = globals;
-
-                header.spBias = frameBias;
-                header.emit();
-                if (header.out.str().empty() && header.hasCond &&
-                    !header.cond.empty()) {
-                    const bool targetEnters = headerTerm->target == bodyAddr;
-                    const bool fallEnters = b->succs[0] == bodyAddr;
-                    if (targetEnters || fallEnters) {
-                        BlockEmitter body(*bodyBlock);
-                        body.indent = depth + 2;
-                        body.nameOf = nameOf;
-                        body.signatureOf = signatureOf;
-                        body.architecture = architecture;
-                        body.useRecoveredRuntime = useRecoveredRuntime;
-                    body.stackModel = stackModel;
-    body.globals = globals;
-
-                        body.spBias = frameBias;
-                        body.emit();
-                        const std::string condition =
-                            targetEnters ? header.cond
-                                         : "!(" + header.cond + ")";
-                        for (int i = 0; i <= depth; ++i) out << "    ";
-                        out << "while (" << condition << ") {\n"
-                            << body.out.str();
-                        for (int i = 0; i <= depth; ++i) out << "    ";
-                        out << "}\n";
-                        emitted.insert(bodyAddr);
-                        frameBias = std::min(frameBias, body.spBias);
-                        emitBlock(loop->exits.front().second, depth);
-                        return;
+                headerTerm->kind == Insn::JCC && b->succs.size() == 2) {
+                bool bodyInLoop = false, exitInLoop = false;
+                for (uint64_t s : b->succs) {
+                    bodyInLoop |= loop->blocks.count(s) != 0;
+                    exitInLoop |= !loop->blocks.count(s);
+                }
+                if (bodyInLoop && exitInLoop) {
+                    // Build the straight-line body chain (all members in the
+                    // loop, no internal conditionals, no nested loops) ending
+                    // with a JMP back to the header.
+                    std::vector<uint64_t> chain;
+                    std::set<uint64_t> chainSeen;
+                    uint64_t cursor = bodyAddr;
+                    bool validChain = true;
+                    while (cursor && loop->blocks.count(cursor) &&
+                           !chainSeen.count(cursor)) {
+                        chainSeen.insert(cursor);
+                        const CfgBlock* member = cfg.blockAt(cursor);
+                        if (!member ||
+                            (cfg.loopByHeader(cursor) &&
+                             cursor != loop->header)) {
+                            validChain = false;
+                            break;
+                        }
+                        chain.push_back(cursor);
+                        const PcodeInsn* memberTerm =
+                            member->terminator();
+                        if (memberTerm && memberTerm->kind == Insn::JMP &&
+                            memberTerm->targetKnown &&
+                            memberTerm->target == loop->header)
+                            break; // chain end: the back edge
+                        if (memberTerm && memberTerm->kind == Insn::JCC) {
+                            validChain = false; // keep goto form
+                            break;
+                        }
+                        if (member->succs.size() == 1 &&
+                            loop->blocks.count(member->succs[0])) {
+                            cursor = member->succs[0];
+                        } else {
+                            validChain = false;
+                            break;
+                        }
+                    }
+                    if (validChain && !chain.empty()) {
+                        BlockEmitter header(*b);
+                        header.indent = depth + 1;
+                        header.nameOf = nameOf;
+                        header.signatureOf = signatureOf;
+                        header.architecture = architecture;
+                        header.useRecoveredRuntime = useRecoveredRuntime;
+                        header.stackModel = stackModel;
+                        header.globals = globals;
+                        header.spBias = frameBias;
+                        header.emit();
+                        if (header.out.str().empty() && header.hasCond &&
+                            !header.cond.empty()) {
+                            const bool targetEnters =
+                                headerTerm->target == bodyAddr;
+                            const bool fallEnters =
+                                b->succs[0] == bodyAddr;
+                            if (targetEnters || fallEnters) {
+                                const std::string condition =
+                                    targetEnters
+                                        ? header.cond
+                                        : "!(" + header.cond + ")";
+                                for (int i = 0; i <= depth; ++i)
+                                    out << "    ";
+                                out << "while (" << condition << ") {\n";
+                                suppressBackedgeTo = loop->header;
+                                for (uint64_t member : chain)
+                                    emitBlock(member, depth + 1);
+                                suppressBackedgeTo = std::nullopt;
+                                for (uint64_t member : chain)
+                                    emitted.insert(member);
+                                for (int i = 0; i <= depth; ++i)
+                                    out << "    ";
+                                out << "}\n";
+                                emitBlock(loop->exits.front().second,
+                                          depth);
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -2049,6 +2090,11 @@ std::string decompile(
             return;
         }
         if (term->kind == Insn::JMP && term->targetKnown) {
+            if (suppressBackedgeTo && term->target == *suppressBackedgeTo) {
+                // Structured loop backedge: the while/do-while condition
+                // already covers it - emit nothing.
+                return;
+            }
             for (int i = 0; i <= depth; ++i) out << "    ";
             out << "goto L" << hexAddr(term->target) << ";\n";
             return;

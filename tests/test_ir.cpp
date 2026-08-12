@@ -13,6 +13,7 @@
 #include "centrifuge/decompile.hpp"
 #include "centrifuge/program_graph.hpp"
 #include "centrifuge/sleigh.hpp"
+#include "centrifuge/import_prototype.hpp"
 
 using namespace centrifuge;
 

@@ -15,6 +15,8 @@
 
 namespace centrifuge {
 
+class ImportPrototypeRecovery; // defined in import_prototype.hpp
+
 enum class TypeKind {
     UNKNOWN,
     BOOL,
@@ -76,6 +78,9 @@ using SsaId = MidValueId;
 std::vector<std::pair<uint64_t, std::string>> abiArguments(
     const std::string& architecture,
     const std::string& callingConvention = {});
+
+// Merge two observed types conservatively (widest kind-compatible shape).
+DataType mergeType(DataType a, DataType b);
 
 struct MidValue {
     enum Storage { CONSTANT, REGISTER, TEMPORARY, MEMORY_STATE } storage = TEMPORARY;
@@ -293,10 +298,29 @@ struct FunctionEffects {
     bool mergeFrom(const FunctionEffects& other);
 };
 
+struct CallSiteArgInfo {
+    bool observed = false;
+    int widthBytes = 0;
+    DataType type; // inferred from the SSA value at the call site
+    bool addressUsed = false; // value feeds a LOAD/STORE address
+    bool constant = false;
+    uint64_t constantValue = 0;
+};
+
 struct AnalyzedCallSite {
     uint64_t address = 0;
     std::optional<uint64_t> target;
     std::vector<std::optional<uint64_t>> arguments;
+    // Per-ABI-register argument observations (index i matches
+    // abiArguments(arch)[i]).  Only present when the caller's SSA value was
+    // observable.
+    std::vector<CallSiteArgInfo> argInfo;
+    // How the call's return value is consumed by the caller.
+    bool returnsValue = false;
+    bool returnDereferenced = false; // result feeds a LOAD/STORE address
+    bool returnArithmetic = false;   // result feeds integer arithmetic
+    bool returnBoolean = false;      // result feeds a conditional
+    int returnWidthBytes = 0;
     bool indirect = false;
 };
 
@@ -327,6 +351,8 @@ public:
     }
     const AnalyzedFunction* functionAt(uint64_t address) const;
     std::optional<FunctionSignature> signatureAt(uint64_t address) const;
+    // Call-site-recovered prototypes for DLL imports (Phase 6).
+    const ImportPrototypeRecovery& importPrototypes() const;
     std::optional<FunctionEffects> effectsAt(uint64_t address) const;
     const CppRecoveryResult& cppTypes() const { return cppTypes_; }
     std::string decompileFunction(const Program& program,
@@ -337,6 +363,10 @@ private:
     std::string architecture_;
     std::string callingConvention_;
     std::map<uint64_t, AnalyzedFunction> functions_;
+    std::unique_ptr<ImportPrototypeRecovery> importPrototypes_;
+
+public:
+    ~ProgramAnalysis();
     CppRecoveryResult cppTypes_;
 };
 

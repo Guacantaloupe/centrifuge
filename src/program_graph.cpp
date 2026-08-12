@@ -8,6 +8,7 @@
 #include <tuple>
 
 #include "centrifuge/ir.hpp"
+#include "centrifuge/import_prototype.hpp"
 
 namespace centrifuge {
 namespace {

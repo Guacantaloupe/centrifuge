@@ -15,6 +15,7 @@
 #include "centrifuge/decompile.hpp"
 #include "centrifuge/ir.hpp"
 #include "centrifuge/program_graph.hpp"
+#include "centrifuge/import_prototype.hpp"
 #include "centrifuge/sleigh.hpp"
 
 namespace centrifuge {
@@ -329,6 +330,12 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
     std::map<uint64_t, size_t> importByIat;
     for (size_t index = 0; index < program.imports.size(); ++index)
         importByIat.emplace(program.imports[index].iatAddress, index);
+    // Phase 6: recover import prototypes from call-site evidence, seeded by
+    // the CRT/Win32 knowledge table.  Declarations below use the recovered
+    // shapes instead of the generic 8-argument form.
+    ImportPrototypeRecovery importPrototypes;
+    importPrototypes.aggregate(analysis, program);
+    importPrototypes.applyKnownPrototypes();
     std::map<uint64_t, std::string> externalNames;
     for (const auto& entry : analysis.functions())
         for (uint64_t callee : entry.second.callees)

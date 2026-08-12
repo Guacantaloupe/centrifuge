@@ -3,6 +3,7 @@
 
 #include "centrifuge/ir.hpp"
 #include "centrifuge/sleigh.hpp"
+#include "centrifuge/import_prototype.hpp"
 
 #include <algorithm>
 #include <atomic>

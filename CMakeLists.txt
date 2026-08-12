@@ -53,6 +53,7 @@ add_library(centrifuge_core STATIC
   src/cpp_recovery.cpp
   src/stack_recovery.cpp
   src/calling_convention.cpp
+  src/import_prototype.cpp
   src/program_graph.cpp
   src/project_recovery.cpp
   src/semantic_coverage.cpp

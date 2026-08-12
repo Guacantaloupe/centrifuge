@@ -17,6 +17,7 @@
 
 #include "centrifuge/decompile.hpp"
 #include "centrifuge/calling_convention.hpp"
+#include "centrifuge/import_prototype.hpp"
 
 namespace centrifuge {
 
@@ -1219,9 +1220,18 @@ std::optional<FunctionEffects> ProgramAnalysis::effectsAt(
 std::optional<FunctionSignature> ProgramAnalysis::signatureAt(
     uint64_t address) const {
     const AnalyzedFunction* function = functionAt(address);
-    return function ? std::optional<FunctionSignature>(function->signature)
-                    : std::nullopt;
+    if (function) return function->signature;
+    // Phase 6: imported targets carry call-site-recovered prototypes.
+    const auto imported = importPrototypes_->prototypeFor(address);
+    if (imported) return imported->signature;
+    return std::nullopt;
 }
+
+const ImportPrototypeRecovery& ProgramAnalysis::importPrototypes() const {
+    return *importPrototypes_;
+}
+
+ProgramAnalysis::~ProgramAnalysis() = default;
 
 bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                             const std::string& callingConvention,
@@ -1229,6 +1239,7 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
     architecture_ = program.arch;
     callingConvention_ = callingConvention;
     functions_.clear();
+    if (!importPrototypes_) importPrototypes_ = std::make_unique<ImportPrototypeRecovery>();
     cppTypes_ = recoverCppTypes(program);
 
     const std::shared_ptr<const SleighEngine> engineReference(
@@ -1686,6 +1697,16 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                 constantCache.emplace(id, result);
                 return result;
             };
+            // Single-pass use index: map every SSA value id to the ops that
+            // consume it, so per-call-site prototype queries stay O(uses)
+            // instead of O(call sites x function size).
+            std::map<SsaId, std::vector<const SsaOp*>> uses;
+            for (const SsaBlock& useBlock : ir.blocks())
+                for (const SsaOp& useOp : useBlock.ops) {
+                    if (useOp.removed) continue;
+                    for (SsaId input : useOp.inputs)
+                        if (input) uses[input].push_back(&useOp);
+                }
             for (const SsaBlock& block : ir.blocks())
                 for (const SsaOp& operation : block.ops) {
                     if (operation.op != POp::CALL &&
@@ -1696,10 +1717,73 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                     callSite.indirect = operation.op == POp::CALLIND;
                     if (!operation.inputs.empty())
                         callSite.target = constantValue(operation.inputs[0]);
-                    for (size_t index = 1; index < operation.inputs.size() &&
-                                                index <= 8; ++index) {
+                    // Phase 6: record per-register argument observations and
+                    // return-value consumption for prototype recovery.
+                    const auto abi = abiArguments(architecture_,
+                                                  callingConvention_);
+                    callSite.argInfo.resize(abi.size());
+                    for (size_t index = 0;
+                         index < abi.size() &&
+                         index + 1 < operation.inputs.size();
+                         ++index) {
+                        const SsaId argumentId =
+                            operation.inputs[index + 1];
+                        const SsaValue* argument = ir.value(argumentId);
+                        CallSiteArgInfo& info = callSite.argInfo[index];
+                        if (!argument) continue;
+                        info.observed = true;
+                        info.widthBytes = argument->size;
+                        info.type = argument->type;
+                        if (argument->constant) {
+                            info.constant = true;
+                            info.constantValue = *argument->constant;
+                        }
+                        const auto foundUses = uses.find(argumentId);
+                        if (foundUses != uses.end())
+                            for (const SsaOp* useOp : foundUses->second)
+                                if ((useOp->op == POp::LOAD ||
+                                     useOp->op == POp::STORE) &&
+                                    !useOp->inputs.empty() &&
+                                    useOp->inputs[0] == argumentId)
+                                    info.addressUsed = true;
+                    }
+                    callSite.arguments.clear();
+                    // Keep the original constant-value resolution (recursive
+                    // def-chain folding); argInfo is an *additional* view for
+                    // import prototype recovery and must not weaken it.
+                    for (size_t index = 1;
+                         index < operation.inputs.size() && index <= 8;
+                         ++index) {
                         callSite.arguments.push_back(
                             constantValue(operation.inputs[index]));
+                    }
+                    // Return-value consumption: find uses of the call output
+                    // through the prebuilt use index.
+                    if (operation.output) {
+                        const auto foundUses = uses.find(operation.output);
+                        if (foundUses != uses.end())
+                            for (const SsaOp* useOp : foundUses->second) {
+                                callSite.returnsValue = true;
+                                if (useOp->op == POp::LOAD ||
+                                    useOp->op == POp::STORE) {
+                                    callSite.returnDereferenced = true;
+                                } else if (useOp->op == POp::INT_ADD ||
+                                           useOp->op == POp::INT_SUB ||
+                                           useOp->op == POp::INT_MULT ||
+                                           useOp->op == POp::INT_DIV ||
+                                           useOp->op == POp::INT_AND ||
+                                           useOp->op == POp::INT_OR ||
+                                           useOp->op == POp::INT_XOR ||
+                                           useOp->op == POp::INT_LEFT ||
+                                           useOp->op == POp::INT_RIGHT) {
+                                    callSite.returnArithmetic = true;
+                                } else if (useOp->op == POp::CBRANCH ||
+                                           useOp->op == POp::BRANCH) {
+                                    callSite.returnBoolean = true;
+                                }
+                            }
+                        const SsaValue* result = ir.value(operation.output);
+                        if (result) callSite.returnWidthBytes = result->size;
                     }
                     analyzed.callSites.push_back(std::move(callSite));
                 }
@@ -1900,6 +1984,10 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
     }
     const auto modRefFinished = std::chrono::steady_clock::now();
     refineCppObjectGraph(program, engine, *this, cppTypes_);
+    // Phase 6: recover import prototypes from call-site evidence (the import
+    // table itself has no machine code; the union of every call site does).
+    importPrototypes_->aggregate(*this, program);
+    importPrototypes_->applyKnownPrototypes();
     const auto refinementFinished = std::chrono::steady_clock::now();
     if (std::getenv("CENTRIFUGE_ANALYSIS_PROFILE")) {
         const auto secondsBetween = [](const auto& begin, const auto& end) {

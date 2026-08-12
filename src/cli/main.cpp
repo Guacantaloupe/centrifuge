@@ -28,6 +28,7 @@
 #include "centrifuge/sleigh.hpp"
 #include "centrifuge/semantic_coverage.hpp"
 #include "centrifuge/stack_recovery.hpp"
+#include "centrifuge/import_prototype.hpp"
 
 using namespace centrifuge;
 

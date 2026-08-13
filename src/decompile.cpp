@@ -445,6 +445,27 @@ bool inlineableExpression(const CExpr& expression) {
     return true;
 }
 
+// Phase 10e: register references reachable from a varnode (through temps).
+void collectRegRefs(const PcodeInsn& pi, uint64_t id,
+                    const std::string& architecture,
+                    std::set<uint64_t>& out, int depth = 0) {
+    if (depth > 6) return;
+    const Varnode* v = pi.find(id);
+    if (!v) return;
+    if (v->kind == Varnode::REGISTER) {
+        out.insert(registerStorageOffset(architecture, v->offset, v->size));
+        return;
+    }
+    if (v->kind != Varnode::UNIQUE) return;
+    for (const auto& op : pi.ops) {
+        if (op.out != id) continue;
+        collectRegRefs(pi, op.in0, architecture, out, depth + 1);
+        collectRegRefs(pi, op.in1, architecture, out, depth + 1);
+        collectRegRefs(pi, op.in2, architecture, out, depth + 1);
+        return;
+    }
+}
+
 class BlockEmitter {
 public:
     std::ostringstream out;
@@ -487,6 +508,16 @@ public:
     const std::map<int64_t, PushSlotInfo>* pushSlots = nullptr;
     bool dropRspWrite = false; // this instruction's rsp write is folded
     int64_t rspRebase = 0;     // output rsp = simulated rsp + rspRebase
+    // Phase 10e: liveOut[b] = registers read in any successor without an
+    // intervening write; a side-effect-free write to a non-live, non-return
+    // register that is also not read later in this block (blockReadPos) is
+    // dead and its line is dropped.  liveOutCall additionally carries ABI
+    // call-argument registers (which only block elimination of non-constant
+    // definitions, since 10b-2 always inlines constant argument setups).
+    const std::set<uint64_t>* liveOut = nullptr;
+    const std::set<uint64_t>* liveOutCall = nullptr;
+    const std::set<uint64_t>* callArgsLocal = nullptr;
+    const std::map<uint64_t, std::vector<int>>* readPos = nullptr;
 
     explicit BlockEmitter(const CfgBlock& blk) : blk_(blk) {}
 
@@ -850,7 +881,8 @@ public:
             if (operation == 4) regConst.erase(0); // RAX
         };
 
-        for (const auto& pi : blk_.insns) {
+        for (size_t piIndex = 0; piIndex < blk_.insns.size(); ++piIndex) {
+            const auto& pi = blk_.insns[piIndex];
             dropRspWrite = false; // Phase 10f: per-instruction fold flag
             for (const auto& op : pi.ops) {
                 if (op.op == POp::CBRANCH) {
@@ -2005,6 +2037,22 @@ public:
                     rspRebase -= spDelta;
                     continue;
                 }
+                // Phase 10e: drop dead register writes - no real reads in
+                // any successor or later in this block, side-effect-free
+                // expression, and not the return register (retValue may
+                // still need it).  ABI call-argument registers only block
+                // elimination of non-constant definitions: constant argument
+                // setups are always inlined into the call text by 10b-2.
+                if (!isSpWrite && liveOut && !liveOut->count(storage) &&
+                    !readAfter(storage, piIndex) &&
+                    storage != registerStorageOffset(
+                                   architecture,
+                                   returnRegisterOffset(architecture), 8) &&
+                    inlineableExpression(kv.second) &&
+                    (!liveOutCall || !liveOutCall->count(storage) ||
+                     (callArgsLocal && callArgsLocal->count(storage) &&
+                      kv.second.isConst)))
+                    continue;
                 // track constant-valued registers (for jalr resolution)
                 {
                     int64_t k = 0;
@@ -2073,6 +2121,17 @@ public:
     // left the output rsp variable offset from the simulated frame.
     std::string rebaseText(const std::string& s) const {
         return rspRebase ? rebaseRspText(s, rspRebase) : s;
+    }
+
+    // Phase 10e: is this register read at or after the given instruction
+    // position within the current block?
+    bool readAfter(uint64_t storage, size_t piIndex) const {
+        if (!readPos) return true; // unknown -> keep the write
+        const auto it = readPos->find(storage);
+        if (it == readPos->end()) return false;
+        for (const int position : it->second)
+            if (static_cast<size_t>(position) >= piIndex) return true;
+        return false;
     }
 
 private:
@@ -2242,6 +2301,120 @@ std::string decompile(
         }
     }
 
+    // Phase 10e (native view): block-level register liveness for dead
+    // register-write elimination.  liveOut[b] = registers read in any
+    // successor reachable without an intervening write; liveOutCall[b] also
+    // carries ABI call-argument registers.  Within a block, instruction-level
+    // read positions (blockReadPos) decide whether a write is followed by a
+    // real read.
+    std::map<uint64_t, std::set<uint64_t>> liveOut, liveOutCall;
+    std::map<uint64_t, std::set<uint64_t>> callArgsLocal;
+    std::map<uint64_t, std::map<uint64_t, std::vector<int>>> blockReadPos;
+    const bool livenessEnabled =
+        !useRecoveredRuntime && architecture.rfind("x86", 0) == 0;
+    if (livenessEnabled) {
+        for (const auto& b : cfg.blocks()) { // seed entries for every block
+            liveOut[b.start];
+            liveOutCall[b.start];
+            callArgsLocal[b.start];
+            blockReadPos[b.start];
+        }
+    }
+    auto findLiveSet = [](const std::map<uint64_t, std::set<uint64_t>>& m,
+                          uint64_t key) -> const std::set<uint64_t>* {
+        const auto it = m.find(key);
+        return it == m.end() ? nullptr : &it->second;
+    };
+    auto findReadPos =
+        [](const std::map<uint64_t,
+                         std::map<uint64_t, std::vector<int>>>& m,
+           uint64_t key) -> const std::map<uint64_t, std::vector<int>>* {
+        const auto it = m.find(key);
+        return it == m.end() ? nullptr : &it->second;
+    };
+    if (!useRecoveredRuntime && architecture.rfind("x86", 0) == 0) {
+        const std::vector<uint64_t> abiRegs =
+            defaultArgumentRegisters(architecture);
+        std::map<uint64_t, std::set<uint64_t>> readIn, writtenIn,
+            callReadIn;
+        for (const auto& b : cfg.blocks()) {
+            const size_t piCount = b.insns.size();
+            for (size_t piIndex = 0; piIndex < piCount; ++piIndex) {
+                const auto& pi = b.insns[piIndex];
+                for (const auto& op : pi.ops) {
+                    const Varnode* out = pi.find(op.out);
+                    if (out && out->kind == Varnode::REGISTER)
+                        writtenIn[b.start].insert(
+                            registerStorageOffset(architecture, out->offset,
+                                                  out->size));
+                    if (op.op == POp::CALL || op.op == POp::CALLIND) {
+                        // ABI argument registers may be consumed by name at
+                        // the call site; the target operand is still a real
+                        // read (indirect calls), so fall through.
+                        for (const uint64_t reg : abiRegs)
+                            callReadIn[b.start].insert(reg);
+                    }
+                    std::set<uint64_t> refs;
+                    collectRegRefs(pi, op.in0, architecture, refs);
+                    collectRegRefs(pi, op.in1, architecture, refs);
+                    collectRegRefs(pi, op.in2, architecture, refs);
+                    if (op.op == POp::X86_STRING) {
+                        // rep movs/stos/lods/scas use rcx/rsi/rdi/rax
+                        // implicitly in the emitted C.
+                        for (const uint64_t reg : {8ULL, 48ULL, 56ULL, 0ULL})
+                            refs.insert(reg);
+                    }
+                    for (const uint64_t r : refs) {
+                        readIn[b.start].insert(r);
+                        blockReadPos[b.start][r].push_back(
+                            static_cast<int>(piIndex));
+                    }
+                }
+            }
+            if (b.tailCallTarget) {
+                // tail calls consume the ABI argument registers by name
+                for (const uint64_t reg : abiRegs) {
+                    readIn[b.start].insert(reg);
+                    blockReadPos[b.start][reg].push_back(
+                        static_cast<int>(piCount));
+                }
+            }
+        }
+        callArgsLocal = callReadIn;
+        std::map<uint64_t, std::set<uint64_t>> fullIn = readIn;
+        for (const auto& kv : callReadIn)
+            for (const uint64_t r : kv.second)
+                fullIn[kv.first].insert(r);
+        for (int pass = 0; pass < 32; ++pass) {
+            bool changed = false;
+            for (const auto& b : cfg.blocks()) {
+                for (auto* out : {&liveOut, &liveOutCall}) {
+                    auto& cur = (*out)[b.start];
+                    std::set<uint64_t> merged = cur;
+                    for (const uint64_t successor : b.succs) {
+                        const auto& succIn = (out == &liveOut)
+                            ? fullIn : readIn;
+                        const auto it = succIn.find(successor);
+                        if (it != succIn.end())
+                            for (const uint64_t r : it->second)
+                                if (!writtenIn[b.start].count(r))
+                                    merged.insert(r);
+                        const auto it2 = out->find(successor);
+                        if (it2 != out->end())
+                            for (const uint64_t r : it2->second)
+                                if (!writtenIn[b.start].count(r))
+                                    merged.insert(r);
+                    }
+                    if (merged.size() != cur.size()) {
+                        cur = merged;
+                        changed = true;
+                    }
+                }
+            }
+            if (!changed) break;
+        }
+    }
+
     std::set<uint64_t> emitted;
     int64_t frameBias = 0; // sp bias right after the prologue (for locals)
     std::optional<uint64_t> suppressBackedgeTo; // structured loop backedge
@@ -2282,6 +2455,13 @@ std::string decompile(
 
                     body.entryBlock = !useRecoveredRuntime && (a == start);
 body.liveFlags = &liveFlags;
+body.liveOut = livenessEnabled ? findLiveSet(liveOut, b->start) : nullptr;
+body.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, b->start) : nullptr;
+body.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
+body.readPos = livenessEnabled ? findReadPos(blockReadPos, b->start) : nullptr;
+
+
+body.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
 body.pushSlots = &pushSlots;
                     body.emit();
                     if (body.hasCond && !body.cond.empty()) {
@@ -2313,6 +2493,13 @@ body.pushSlots = &pushSlots;
 
                 body.entryBlock = !useRecoveredRuntime && (a == start);
 body.liveFlags = &liveFlags;
+body.liveOut = livenessEnabled ? findLiveSet(liveOut, b->start) : nullptr;
+body.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, b->start) : nullptr;
+body.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
+body.readPos = livenessEnabled ? findReadPos(blockReadPos, b->start) : nullptr;
+
+
+body.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
 body.pushSlots = &pushSlots;
                 body.emit();
                 for (int i = 0; i <= depth; ++i) out << "    ";
@@ -2390,6 +2577,13 @@ body.pushSlots = &pushSlots;
                         header.spBias = frameBias;
                         header.entryBlock = !useRecoveredRuntime && (a == start);
 header.liveFlags = &liveFlags;
+header.liveOut = livenessEnabled ? findLiveSet(liveOut, b->start) : nullptr;
+header.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, b->start) : nullptr;
+header.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
+header.readPos = livenessEnabled ? findReadPos(blockReadPos, b->start) : nullptr;
+
+
+header.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
 header.pushSlots = &pushSlots;
                         header.emit();
                         if (header.out.str().empty() && header.hasCond &&
@@ -2438,6 +2632,13 @@ header.pushSlots = &pushSlots;
 
         be.entryBlock = !useRecoveredRuntime && (a == start);
 be.liveFlags = &liveFlags;
+be.liveOut = livenessEnabled ? findLiveSet(liveOut, b->start) : nullptr;
+be.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, b->start) : nullptr;
+be.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
+be.readPos = livenessEnabled ? findReadPos(blockReadPos, b->start) : nullptr;
+
+
+be.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
 be.pushSlots = &pushSlots;
         be.emit();
         out << be.out.str(); // flush block body
@@ -2475,6 +2676,13 @@ be.pushSlots = &pushSlots;
 
                 thenBody.entryBlock = !useRecoveredRuntime && (a == start);
 thenBody.liveFlags = &liveFlags;
+thenBody.liveOut = livenessEnabled ? findLiveSet(liveOut, tb->start) : nullptr;
+thenBody.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, tb->start) : nullptr;
+thenBody.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, tb->start) : nullptr;
+thenBody.readPos = livenessEnabled ? findReadPos(blockReadPos, tb->start) : nullptr;
+
+
+thenBody.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, tb->start) : nullptr;
 thenBody.pushSlots = &pushSlots;
                 thenBody.emit();
                 BlockEmitter elseBody(*fb);
@@ -2490,6 +2698,13 @@ thenBody.pushSlots = &pushSlots;
 
                 elseBody.entryBlock = !useRecoveredRuntime && (a == start);
 elseBody.liveFlags = &liveFlags;
+elseBody.liveOut = livenessEnabled ? findLiveSet(liveOut, fb->start) : nullptr;
+elseBody.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, fb->start) : nullptr;
+elseBody.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, fb->start) : nullptr;
+elseBody.readPos = livenessEnabled ? findReadPos(blockReadPos, fb->start) : nullptr;
+
+
+elseBody.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, fb->start) : nullptr;
 elseBody.pushSlots = &pushSlots;
                 elseBody.emit();
                 for (int i = 0; i <= depth; ++i) out << "    ";
@@ -2521,6 +2736,13 @@ elseBody.pushSlots = &pushSlots;
 
                 te.entryBlock = !useRecoveredRuntime && (a == start);
 te.liveFlags = &liveFlags;
+te.liveOut = livenessEnabled ? findLiveSet(liveOut, tb->start) : nullptr;
+te.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, tb->start) : nullptr;
+te.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, tb->start) : nullptr;
+te.readPos = livenessEnabled ? findReadPos(blockReadPos, tb->start) : nullptr;
+
+
+te.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, tb->start) : nullptr;
 te.pushSlots = &pushSlots;
                 te.emit();
                 out << te.out.str(); // flush if-body

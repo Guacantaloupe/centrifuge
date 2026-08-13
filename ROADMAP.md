@@ -139,7 +139,16 @@ recovered project) remains untouched.
   `x^x`/`x-x` folds to 0 (`be3c96e`, 10e start).
 - 10g done (`b0cb764`): function-level live-flag pre-analysis drops dead
   r4096..r4101 writes (425 -> 328 lines on 0x140001030).
-- 10f done (HEAD): push/pop save slots are promoted to `saved_m<slot>` variables.
+- 10e done (HEAD): dead register-write elimination.  A dual block-level
+  liveness analysis (real operand reads vs ABI call-argument reads) plus
+  instruction-level read positions drops side-effect-free writes that are
+  never read again (e.g. `rcx = 5368714672;` before a call whose argument
+  text inlines that constant).  Constant argument setups are always inlined
+  by 10b-2, so call-argument registers only block elimination of
+  non-constant definitions; the return register and everything reachable
+  from successors stay conservative.  Gated on `!useRecoveredRuntime` so
+  the oracle and riscv paths are byte-identical.
+- 10f done: push/pop save slots are promoted to `saved_m<slot>` variables.
   A function-level pre-analysis tracks the simulated rsp bias block by block,
   confirms slots written exactly once by a push (rsp-8) and restored exactly
   once by a pop (rsp+8) into the same register, and the emitter folds the paired

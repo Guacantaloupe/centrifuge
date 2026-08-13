@@ -706,11 +706,47 @@ public:
                     paramIndex[9 * 8] = 6;
                 }
             }
+            // Phase 10d: infer each parameter's width from entry-block
+            // references (e.g. (uint32_t)(param1) -> 32-bit) so the comment
+            // carries the ABI usage evidence for downstream binding.
+            std::map<int, int> paramWidth; // param# -> narrowest reference
+            {
+                std::set<int> definedParams;
+                for (const auto& pi : blk_.insns) {
+                    for (const auto& op : pi.ops) {
+                        const Varnode* out = pi.find(op.out);
+                        if (out && out->kind == Varnode::REGISTER) {
+                            const uint64_t storage = registerStorageOffset(
+                                architecture, out->offset, out->size);
+                            const auto pit = paramIndex.find(storage);
+                            if (pit != paramIndex.end())
+                                definedParams.insert(pit->second);
+                        }
+                        for (const uint64_t input :
+                             {op.in0, op.in1, op.in2}) {
+                            const Varnode* v = pi.find(input);
+                            if (!v || v->kind != Varnode::REGISTER) continue;
+                            const uint64_t storage = registerStorageOffset(
+                                architecture, v->offset, v->size);
+                            const auto pit = paramIndex.find(storage);
+                            if (pit == paramIndex.end()) continue;
+                            if (definedParams.count(pit->second)) continue;
+                            int& w = paramWidth[pit->second];
+                            if (w == 0 || v->size < w) w = v->size;
+                        }
+                    }
+                }
+            }
             std::string annotation;
-            for (const auto& param : paramIndex)
-                annotation += std::string(annotation.empty() ? "" : ", ") +
-                              "param" + std::to_string(param.second) + "=" +
-                              registerName(architecture, param.first, 8);
+            for (const auto& param : paramIndex) {
+                std::string entry = "param" +
+                    std::to_string(param.second) + "=" +
+                    registerName(architecture, param.first, 8);
+                const auto wit = paramWidth.find(param.second);
+                if (wit != paramWidth.end() && wit->second < 8)
+                    entry += " (" + std::string(uCast(wit->second)) + ")";
+                annotation += annotation.empty() ? entry : ", " + entry;
+            }
             if (!annotation.empty())
                 line("// params: " + annotation);
         }

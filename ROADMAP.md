@@ -139,7 +139,12 @@ recovered project) remains untouched.
   `x^x`/`x-x` folds to 0 (`be3c96e`, 10e start).
 - 10g done (`b0cb764`): function-level live-flag pre-analysis drops dead
   r4096..r4101 writes (425 -> 328 lines on 0x140001030).
-- 10e done (HEAD): dead register-write elimination.  A dual block-level
+- 10d done (HEAD): parameter width inference - entry-block references to
+  ABI parameters narrower than 64 bits (e.g. `(uint32_t)(param1)`) annotate
+  the `// params:` header comment (`param1=rcx (uint32_t)`), recording the
+  usage evidence for downstream prototype binding; references after a
+  redefinition are ignored.
+- 10e done: dead register-write elimination.  A dual block-level
   liveness analysis (real operand reads vs ABI call-argument reads) plus
   instruction-level read positions drops side-effect-free writes that are
   never read again (e.g. `rcx = 5368714672;` before a call whose argument

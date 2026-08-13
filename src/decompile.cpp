@@ -335,6 +335,10 @@ public:
     bool entryBlock = false;
     std::map<uint64_t, int> paramIndex; // ABI reg storage -> param number
     std::set<uint64_t> paramDefined;    // ABI regs redefined in entry block
+    // Phase 10g: x86 flag registers (r4096..r4101) actually read anywhere
+    // in the function (branch conditions, adc/sbb, cmov) survive; dead flag
+    // writes are dropped from the output.
+    const std::set<uint64_t>* liveFlags = nullptr;
 
     explicit BlockEmitter(const CfgBlock& blk) : blk_(blk) {}
 
@@ -1775,6 +1779,9 @@ bool emitCall(const PcodeInsn& pi, uint64_t targetId) {
                 architecture, write.first, write.second.size);
             if (entryBlock && paramIndex.count(written))
                 paramDefined.insert(written);
+            if (liveFlags && written >= 4096 && written <= 4101 &&
+                !liveFlags->count(written))
+                continue; // Phase 10g: dead flag write
             for (auto it = regExpr.begin(); it != regExpr.end();) {
                 bool depends = false;
                 for (const auto& ref : it->second.registerRefs)
@@ -1789,6 +1796,9 @@ bool emitCall(const PcodeInsn& pi, uint64_t targetId) {
         for (const auto& kv : pending) {
                 const uint64_t storage = registerStorageOffset(
                     architecture, kv.first, kv.second.size);
+                if (liveFlags && storage >= 4096 && storage <= 4101 &&
+                    !liveFlags->count(storage))
+                    continue; // Phase 10g: dead flag write
                 // track sp adjustment (prologue/frame): sp = sp +/- K
                 if (storage == stackPointerOffset(architecture) &&
                     kv.second.size == 8) {
@@ -1868,6 +1878,23 @@ std::string decompile(
     for (const auto& b : cfg.blocks())
         if (b.start != start) labeled.insert(b.start); // all goto targets
 
+    // Phase 10g: collect x86 flag registers (r4096..r4101) that are read
+    // anywhere in the function, so dead flag writes can be dropped.
+    std::set<uint64_t> liveFlags;
+    if (architecture.rfind("x86", 0) == 0) {
+        for (const auto& b : cfg.blocks())
+            for (const auto& pi : b.insns)
+                for (const auto& op : pi.ops) {
+                    const uint64_t operands[3] = {op.in0, op.in1, op.in2};
+                    for (const uint64_t operand : operands) {
+                        const Varnode* v = pi.find(operand);
+                        if (v && v->kind == Varnode::REGISTER &&
+                            v->offset >= 4096 && v->offset <= 4101)
+                            liveFlags.insert(v->offset);
+                    }
+                }
+    }
+
     std::set<uint64_t> emitted;
     int64_t frameBias = 0; // sp bias right after the prologue (for locals)
     std::optional<uint64_t> suppressBackedgeTo; // structured loop backedge
@@ -1907,6 +1934,7 @@ std::string decompile(
                     body.spBias = frameBias;
 
                     body.entryBlock = !useRecoveredRuntime && (a == start);
+body.liveFlags = &liveFlags;
                     body.emit();
                     if (body.hasCond && !body.cond.empty()) {
                         for (int i = 0; i <= depth; ++i) out << "    ";
@@ -1936,6 +1964,7 @@ std::string decompile(
                 body.spBias = frameBias;
 
                 body.entryBlock = !useRecoveredRuntime && (a == start);
+body.liveFlags = &liveFlags;
                 body.emit();
                 for (int i = 0; i <= depth; ++i) out << "    ";
                 out << "while (1) {\n" << body.out.str();
@@ -2011,6 +2040,7 @@ std::string decompile(
                         header.globals = globals;
                         header.spBias = frameBias;
                         header.entryBlock = !useRecoveredRuntime && (a == start);
+header.liveFlags = &liveFlags;
                         header.emit();
                         if (header.out.str().empty() && header.hasCond &&
                             !header.cond.empty()) {
@@ -2057,6 +2087,7 @@ std::string decompile(
         be.spBias = frameBias;
 
         be.entryBlock = !useRecoveredRuntime && (a == start);
+be.liveFlags = &liveFlags;
         be.emit();
         out << be.out.str(); // flush block body
         frameBias = std::min(frameBias, be.spBias); // keep prologue bias
@@ -2092,6 +2123,7 @@ std::string decompile(
                 thenBody.spBias = frameBias;
 
                 thenBody.entryBlock = !useRecoveredRuntime && (a == start);
+thenBody.liveFlags = &liveFlags;
                 thenBody.emit();
                 BlockEmitter elseBody(*fb);
                 elseBody.indent = depth + 2;
@@ -2105,6 +2137,7 @@ std::string decompile(
                 elseBody.spBias = frameBias;
 
                 elseBody.entryBlock = !useRecoveredRuntime && (a == start);
+elseBody.liveFlags = &liveFlags;
                 elseBody.emit();
                 for (int i = 0; i <= depth; ++i) out << "    ";
                 out << "if (" << be.cond << ") {\n" << thenBody.out.str();
@@ -2134,6 +2167,7 @@ std::string decompile(
                 te.spBias = frameBias;
 
                 te.entryBlock = !useRecoveredRuntime && (a == start);
+te.liveFlags = &liveFlags;
                 te.emit();
                 out << te.out.str(); // flush if-body
                 for (int i = 0; i <= depth + 1; ++i) out << "    ";

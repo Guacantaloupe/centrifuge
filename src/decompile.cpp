@@ -518,6 +518,8 @@ public:
     const std::set<uint64_t>* liveOutCall = nullptr;
     const std::set<uint64_t>* callArgsLocal = nullptr;
     const std::map<uint64_t, std::vector<int>>* readPos = nullptr;
+    // Phase 10h: memory access for string-literal recovery at call sites.
+    std::function<bool(uint64_t, void*, size_t)> memRead;
 
     explicit BlockEmitter(const CfgBlock& blk) : blk_(blk) {}
 
@@ -627,6 +629,20 @@ public:
             }
             if (signature && signature->parameters[i].type.kind == TypeKind::POINTER)
                 argument = "(void *)(uintptr_t)" + argument;
+            // Phase 10h: a bare constant argument that points at a printable
+            // data-segment C string reads naturally as a string literal.
+            if (!useRecoveredRuntime && memRead &&
+                argument.size() > 2 &&
+                std::isdigit(static_cast<unsigned char>(argument[0]))) {
+                char* end = nullptr;
+                const unsigned long long value =
+                    std::strtoull(argument.c_str(), &end, 10);
+                if (end && *end == '\0' && value > 0x10000ULL) {
+                    const std::string literal =
+                        stringLiteralAt(static_cast<uint64_t>(value));
+                    if (!literal.empty()) argument = literal;
+                }
+            }
             args += (i ? ", " : "") + argument;
         }
         const std::string call = fname + "(" + args + ")";
@@ -1049,6 +1065,21 @@ public:
                                              " *)(uintptr_t)(" +
                                              object->name + ")) = " +
                                              stripParens(v.text) + ";");
+                                        continue;
+                                    }
+                                    // Phase 10h: object-internal stores.
+                                    uint64_t offset = 0;
+                                    object = globals->objectContaining(
+                                        addrNode->offset, offset);
+                                    if (object && offset != 0) {
+                                        line("*((" +
+                                             std::string(uCast(
+                                                 vs ? vs->size : 8)) +
+                                             " *)(uintptr_t)(" +
+                                             object->name + " + " +
+                                             std::to_string(offset) +
+                                             ")) = " + stripParens(v.text) +
+                                             ";");
                                         continue;
                                     }
                                 }
@@ -1935,6 +1966,19 @@ public:
                                 r.size = vo->size;
                                 break;
                             }
+                            // Phase 10h: accesses inside an object's span
+                            // (g_data_xxx + 1) still name the object.
+                            uint64_t offset = 0;
+                            object = globals->objectContaining(
+                                addrNode->offset, offset);
+                            if (object && offset != 0) {
+                                r.text =
+                                    "(*(" + std::string(uCast(vo->size)) +
+                                    " *)(uintptr_t)(" + object->name + " + " +
+                                    std::to_string(offset) + "))";
+                                r.size = vo->size;
+                                break;
+                            }
                         }
                         const CExpr a = exprOfV(pi.find(op.in0));
                         r.text = "(*(" + std::string(uCast(vo->size)) +
@@ -2157,6 +2201,29 @@ public:
     // left the output rsp variable offset from the simulated frame.
     std::string rebaseText(const std::string& s) const {
         return rspRebase ? rebaseRspText(s, rspRebase) : s;
+    }
+
+    // Phase 10h: recover a printable, NUL-terminated C string at `address`
+    // (4..256 bytes, non-executable data) as a C string literal; "" when
+    // the target is not a string (code, binary data, or unreadable).
+    std::string stringLiteralAt(uint64_t address) const {
+        if (!memRead || address < 0x10000ULL) return "";
+        unsigned char buffer[257];
+        if (!memRead(address, buffer, sizeof(buffer))) return "";
+        size_t length = 0;
+        while (length < sizeof(buffer) && buffer[length] != 0) {
+            if (buffer[length] < 0x20 || buffer[length] > 0x7e) return "";
+            ++length;
+        }
+        if (length == sizeof(buffer) || length < 4) return "";
+        std::string literal = "\"";
+        for (size_t index = 0; index < length; ++index) {
+            const char c = static_cast<char>(buffer[index]);
+            if (c == '"' || c == '\\') literal += '\\';
+            literal += c;
+        }
+        literal += "\"";
+        return literal;
     }
 
     // Phase 10e: is this register read at or after the given instruction
@@ -2495,6 +2562,7 @@ body.liveOut = livenessEnabled ? findLiveSet(liveOut, b->start) : nullptr;
 body.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, b->start) : nullptr;
 body.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
 body.readPos = livenessEnabled ? findReadPos(blockReadPos, b->start) : nullptr;
+body.memRead = read;
 
 
 body.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
@@ -2533,6 +2601,7 @@ body.liveOut = livenessEnabled ? findLiveSet(liveOut, b->start) : nullptr;
 body.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, b->start) : nullptr;
 body.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
 body.readPos = livenessEnabled ? findReadPos(blockReadPos, b->start) : nullptr;
+body.memRead = read;
 
 
 body.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
@@ -2617,6 +2686,7 @@ header.liveOut = livenessEnabled ? findLiveSet(liveOut, b->start) : nullptr;
 header.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, b->start) : nullptr;
 header.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
 header.readPos = livenessEnabled ? findReadPos(blockReadPos, b->start) : nullptr;
+header.memRead = read;
 
 
 header.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
@@ -2672,6 +2742,7 @@ be.liveOut = livenessEnabled ? findLiveSet(liveOut, b->start) : nullptr;
 be.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, b->start) : nullptr;
 be.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
 be.readPos = livenessEnabled ? findReadPos(blockReadPos, b->start) : nullptr;
+be.memRead = read;
 
 
 be.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
@@ -2716,6 +2787,7 @@ thenBody.liveOut = livenessEnabled ? findLiveSet(liveOut, tb->start) : nullptr;
 thenBody.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, tb->start) : nullptr;
 thenBody.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, tb->start) : nullptr;
 thenBody.readPos = livenessEnabled ? findReadPos(blockReadPos, tb->start) : nullptr;
+thenBody.memRead = read;
 
 
 thenBody.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, tb->start) : nullptr;
@@ -2738,6 +2810,7 @@ elseBody.liveOut = livenessEnabled ? findLiveSet(liveOut, fb->start) : nullptr;
 elseBody.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, fb->start) : nullptr;
 elseBody.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, fb->start) : nullptr;
 elseBody.readPos = livenessEnabled ? findReadPos(blockReadPos, fb->start) : nullptr;
+elseBody.memRead = read;
 
 
 elseBody.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, fb->start) : nullptr;
@@ -2776,6 +2849,7 @@ te.liveOut = livenessEnabled ? findLiveSet(liveOut, tb->start) : nullptr;
 te.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, tb->start) : nullptr;
 te.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, tb->start) : nullptr;
 te.readPos = livenessEnabled ? findReadPos(blockReadPos, tb->start) : nullptr;
+te.memRead = read;
 
 
 te.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, tb->start) : nullptr;

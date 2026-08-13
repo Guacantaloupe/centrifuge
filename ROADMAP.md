@@ -139,7 +139,14 @@ recovered project) remains untouched.
   `x^x`/`x-x` folds to 0 (`be3c96e`, 10e start).
 - 10g done (`b0cb764`): function-level live-flag pre-analysis drops dead
   r4096..r4101 writes (425 -> 328 lines on 0x140001030).
-- 10d done (HEAD): parameter width inference - entry-block references to
+- 10h done (HEAD): address symbolization enhancements.  (1) GlobalObjectRecovery
+  gains objectContaining(), so accesses inside a recovered object's span
+  (`g_data_1468ce6e0 + 1`) keep the symbol instead of falling back to a raw
+  absolute-address cast.  (2) Call-site arguments that are bare constants
+  pointing at printable, NUL-terminated data-segment strings are emitted as
+  string literals (`FUN_140385810("BLENDER_RESTORE_LD_PRELOAD", ...)`);
+  code addresses and binary data stay numeric.
+- 10d done: parameter width inference - entry-block references to
   ABI parameters narrower than 64 bits (e.g. `(uint32_t)(param1)`) annotate
   the `// params:` header comment (`param1=rcx (uint32_t)`), recording the
   usage evidence for downstream prototype binding; references after a

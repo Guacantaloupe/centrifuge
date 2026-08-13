@@ -40,6 +40,10 @@ public:
     const std::vector<GlobalObject>& objects() const { return objects_; }
     // Exact object containing the access at `address` (or null).
     const GlobalObject* objectAt(uint64_t address) const;
+    // Object whose span contains `address` (or null); `offset` receives the
+    // byte offset within the object.  Catches accesses like g_data_xxx + 1.
+    const GlobalObject* objectContaining(uint64_t address,
+                                         uint64_t& offset) const;
 
 private:
     std::vector<GlobalObject> objects_;

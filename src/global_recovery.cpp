@@ -127,4 +127,20 @@ const GlobalObject* GlobalObjectRecovery::objectAt(uint64_t address) const {
     return &objects_[found->second];
 }
 
+const GlobalObject* GlobalObjectRecovery::objectContaining(
+    uint64_t address, uint64_t& offset) const {
+    if (const GlobalObject* exact = objectAt(address)) {
+        offset = 0;
+        return exact;
+    }
+    for (const GlobalObject& object : objects_) {
+        if (address >= object.address &&
+            address < object.address + object.size) {
+            offset = address - object.address;
+            return &object;
+        }
+    }
+    return nullptr;
+}
+
 } // namespace centrifuge

@@ -919,6 +919,14 @@ public:
                         } else {
                             r = b;
                         }
+                    } else if (a.text == b.text && !a.text.empty() &&
+                               (op.op == POp::INT_XOR ||
+                                op.op == POp::INT_SUB)) {
+                        // Phase 10e: x ^ x == 0, x - x == 0 (side-effect
+                        // free expressions, e.g. xor rcx,rcx clearing).
+                        r.text = "0";
+                        r.size = vo->size;
+                        r.isConst = true;
                     } else {
                         r.text = "(" + a.text + " " + c + " " + b.text + ")";
                         r.size = vo->size;

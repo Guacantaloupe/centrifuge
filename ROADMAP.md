@@ -1,4 +1,4 @@
-# Roadmap — Centrifuge (离心机): merging Ghidra + angr in C++17
+﻿# Roadmap — Centrifuge (离心机): merging Ghidra + angr in C++17
 
 One foundation (loaders → spec-driven disassembly → p-code), two analysis
 rotors: static decompilation (Ghidra) and symbolic exploration (angr).
@@ -91,3 +91,61 @@ Every layer is validated against deterministic hand-built binaries
 round-trips). The p-code semantics are proven by the decompiler round-trip —
 the same semantics power the symbolic engine, so the two rotors can never
 disagree.
+
+## Phase 10: RegisterPromotion + ABI Binding (Final Leap: simulation -> source)
+
+**Goal (user acceptance criteria)**: for successfully recovered plain functions the
+generated C/C++ compiles with a normal compiler producing natural Windows x64 ABI:
+no simulated RSP, no manual register argument passing, no redundant
+recovered_load/store, no fixed PE addresses, no Guest Stack, no NativeCallBridge
+for plain function calls, Windows API called via real prototypes.
+
+**Current gap (evidence, Blender 0x140001030)**: output is register-level semantics:
+- simulated RSP: sp = rsp - 8\, stack slots as \*(uint64_t*)(rsp+K)- manual args: cx = 5368714496; rdx = rsp+48; rax = FUN_14000ca60(rdi,rsi,rdx,rcx,r8,r9,...)  (sleigh CALLIND fixed register order, not caller-semantic order)
+- flag simulation: r4096..r4101 = CF/PF/AF/ZF/SF/OF + __builtin_parity noise
+- fixed PE addresses: g_data_146589b00, 0x140001000 constants
+- stack slots as raw pointer load/store (17 slots, 1 promoted)
+
+**Sub-phases**:
+- 10a Entry-parameter ABI-ization: entry defs of rcx/rdx/r8/r9/xmm0-3 that are
+  used before redefinition become declared params (param1..N, width/sign from
+  use evidence); entry spills like \local_m76 = (uint32_t)(rcx)\ fold into params.
+- 10b Call-site ABI-ization: collect (abi-slot -> last-written value) before each
+  call, emit F(arg1=rcx, arg2=rdx, arg3=r8, arg4=r9, stack...) in real ABI order;
+  internal callee signatures come from 10a (bidirectional binding).
+- 10c Return-value promotion: function-exit rax/xmm0 results bound to calls.
+- 10d Param/return type refinement (width/sign/float via TypeRecovery evidence).
+- 10e General register promotion: rbx/rsi/rdi/r12-r15 live ranges -> locals (SSA).
+- 10f Simulated-RSP elimination: fixed inc/dec + slot accesses -> compiler frame.
+- 10g Dead-flag elimination: r4096..r4101 inactive at branch points.
+- 10h Address symbolization: constant addresses -> symbol refs.
+
+**Verification**: native view output for Blender funcs must compile with g++ and
+contain zero simulated-rsp ops, zero r409x, zero fixed PE addrs; unit tests per
+sub-phase; ctest 13/13 + Blender benchmark stay green. Oracle (machine-semantic
+recovered project) remains untouched.
+
+**Progress**:
+- 10a done (`c49756c`): entry ABI registers read before redefinition are named
+  param1..N (win64 rcx/rdx/r8/r9) with a `// params:` header comment, gated on
+  `!useRecoveredRuntime` so the oracle project stays byte-identical.
+- 10b-1 done (`0ef227a`): internal call sites emit Windows x64 argument order
+  (rcx, rdx, r8, r9, stack...) via per-callee lazy signature recovery (FunctionIR
+  + memo cache; full ProgramAnalysis.build is too slow for interactive use).
+- 10b-2 done (`fc35152`): pre-call argument setup inlined into call sites
+  (rcx = K; rdx = rsp+48; FUN(rcx,rdx,...) -> FUN(K, rsp+48, ...)) via a
+  block-local register->expression map with dependency invalidation.
+- 10c done (`7b4c282`): return-register setup inlined into `return` statements;
+  `x^x`/`x-x` folds to 0 (`be3c96e`, 10e start).
+- 10g done (`b0cb764`): function-level live-flag pre-analysis drops dead
+  r4096..r4101 writes (425 -> 328 lines on 0x140001030).
+- 10f done (HEAD): push/pop save slots are promoted to `saved_m<slot>` variables.
+  A function-level pre-analysis tracks the simulated rsp bias block by block,
+  confirms slots written exactly once by a push (rsp-8) and restored exactly
+  once by a pop (rsp+8) into the same register, and the emitter folds the paired
+  rsp writes away.  Later rsp-relative flag expressions and the frame allocation
+  are re-based via a per-emitter rspRebase text rewrite so the C stays
+  semantically identical (the `sub rsp,104` lands the output variable exactly on
+  the simulated frame).  Prologue of 0x140001030: 16 lines -> 8 `saved_mX` lines;
+  epilogue pops collapse to plain register restores.  Conservative fallback for
+  slots with multiple readers/writers (e.g. mid-function frames).

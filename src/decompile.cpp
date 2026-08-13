@@ -3,6 +3,7 @@
 #include "centrifuge/decompile.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -148,6 +149,124 @@ uint64_t stackPointerOffset(const std::string& architecture) {
     if (architecture == "aarch64" || architecture == "arm64") return 31 * 8;
     return 2 * 8;
 }
+
+// Phase 10f: a push/pop save slot confirmed by the function-level
+// pre-analysis.  The store is emitted as savedName = reg and the matching
+// rsp adjustment is folded away instead of simulating stack movement.
+struct PushSlotInfo {
+    std::string savedName;
+    std::string storedReg;
+    int64_t storeDelta = 0;
+    int64_t loadDelta = 0;
+};
+
+// rsp delta of a single p-code op (sp op const / COPY of such a temp)
+bool spWriteDelta(const PcodeInsn& pi, const PcodeOp& op,
+                  const std::string& architecture, int64_t& delta) {
+    const uint64_t spOffset = stackPointerOffset(architecture);
+    auto constDelta = [&](const Varnode* a, const Varnode* b, POp opcode,
+                          int64_t& out) {
+        const Varnode* cv = nullptr;
+        bool spFirst = false;
+        if (a && a->kind == Varnode::REGISTER && a->offset == spOffset) {
+            cv = b;
+            spFirst = true;
+        } else if (b && b->kind == Varnode::REGISTER &&
+                   b->offset == spOffset) {
+            cv = a;
+        }
+        if (!spFirst || !cv || cv->kind != Varnode::CONST) return false;
+        out = (opcode == POp::INT_ADD) ? static_cast<int64_t>(cv->offset)
+                                       : -static_cast<int64_t>(cv->offset);
+        return true;
+    };
+    if (op.op == POp::INT_ADD || op.op == POp::INT_SUB)
+        return constDelta(pi.find(op.in0), pi.find(op.in1), op.op, delta);
+    if (op.op == POp::COPY) {
+        const Varnode* in = pi.find(op.in0);
+        if (!in) return false;
+        if (in->kind == Varnode::CONST) {
+            delta = static_cast<int64_t>(in->offset);
+            return true;
+        }
+        if (in->kind == Varnode::UNIQUE) {
+            for (const auto& op2 : pi.ops) {
+                if (op2.out != in->id) continue;
+                if (op2.op == POp::INT_ADD || op2.op == POp::INT_SUB)
+                    return constDelta(pi.find(op2.in0), pi.find(op2.in1),
+                                      op2.op, delta);
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+// net constant rsp adjustment of an instruction, if every rsp write it
+// performs is a constant adjustment (false when none or unparseable)
+bool piRspDelta(const PcodeInsn& pi, const std::string& architecture,
+                int64_t& delta) {
+    const uint64_t spOffset = stackPointerOffset(architecture);
+    int64_t net = 0;
+    bool any = false;
+    for (const auto& op : pi.ops) {
+        const Varnode* vo = pi.find(op.out);
+        if (!vo || vo->kind != Varnode::REGISTER) continue;
+        if (registerStorageOffset(architecture, vo->offset, vo->size) !=
+                spOffset ||
+            vo->size != 8)
+            continue;
+        any = true;
+        int64_t d = 0;
+        if (!spWriteDelta(pi, op, architecture, d)) return false;
+        net += d;
+    }
+    delta = net;
+    return any;
+}
+
+// simulated rsp bias after executing a whole block
+int64_t simulateBlockSp(const CfgBlock& b, int64_t startBias,
+                        const std::string& architecture) {
+    int64_t bias = startBias;
+    for (const auto& pi : b.insns) {
+        int64_t d = 0;
+        if (piRspDelta(pi, architecture, d)) bias += d;
+    }
+    return bias;
+}
+
+// Phase 10f: re-base rsp references after folded push/pop adjustments.
+// Every bare "rsp" identifier is rewritten to "(rsp - rebase)" so the text
+// evaluates in the simulated frame (the output variable lags by rebase).
+std::string rebaseRspText(const std::string& s, int64_t rebase) {
+    if (rebase == 0 || s.find("rsp") == std::string::npos) return s;
+    const std::string token = "rsp";
+    const std::string replacement = "(rsp - " + std::to_string(rebase) + ")";
+    std::string result;
+    size_t at = 0;
+    while (at < s.size()) {
+        const size_t pos = s.find(token, at);
+        if (pos == std::string::npos) {
+            result += s.substr(at);
+            break;
+        }
+        const bool left = pos == 0 ||
+            !(std::isalnum(static_cast<unsigned char>(s[pos - 1])) ||
+              s[pos - 1] == '_');
+        const size_t after = pos + token.size();
+        const bool right = after >= s.size() ||
+            !(std::isalnum(static_cast<unsigned char>(s[after])) ||
+              s[after] == '_');
+        if (left && right)
+            result += s.substr(at, pos - at) + replacement;
+        else
+            result += s.substr(at, pos - at + token.size());
+        at = pos + token.size();
+    }
+    return result;
+}
+
 
 uint64_t framePointerOffset(const std::string& architecture) {
     if (architecture.rfind("x86", 0) == 0) return 5 * 8; // rbp
@@ -360,6 +479,14 @@ public:
     // in the function (branch conditions, adc/sbb, cmov) survive; dead flag
     // writes are dropped from the output.
     const std::set<uint64_t>* liveFlags = nullptr;
+    // Phase 10f: push/pop save slots (native view).  A slot confirmed by the
+    // function-level pre-analysis is emitted as a plain saved_<slot> variable
+    // instead of a simulated rsp adjustment + local_m<slot> slot: the paired
+    // rsp write is folded away and later rsp-relative flag expressions are
+    // re-based through rspRebase so the C stays semantically identical.
+    const std::map<int64_t, PushSlotInfo>* pushSlots = nullptr;
+    bool dropRspWrite = false; // this instruction's rsp write is folded
+    int64_t rspRebase = 0;     // output rsp = simulated rsp + rspRebase
 
     explicit BlockEmitter(const CfgBlock& blk) : blk_(blk) {}
 
@@ -724,6 +851,7 @@ public:
         };
 
         for (const auto& pi : blk_.insns) {
+            dropRspWrite = false; // Phase 10f: per-instruction fold flag
             for (const auto& op : pi.ops) {
                 if (op.op == POp::CBRANCH) {
                     cond = stripParens(exprOfV(pi.find(op.in1)).text);
@@ -793,6 +921,23 @@ public:
                         int64_t slot = 0;
                         const Varnode* vs = pi.find(op.in2);
                         if (slotOf(pi, op.in0, slot)) {
+                        // Phase 10f: fold a confirmed push slot into a plain
+                        // saved_<slot> variable; flush drops the paired rsp
+                        // write so no simulated stack movement remains.
+                        int64_t piDelta = 0;
+                        if (!useRecoveredRuntime && pushSlots &&
+                            piRspDelta(pi, architecture, piDelta) &&
+                            piDelta == -8) {
+                            const auto saved = pushSlots->find(slot);
+                            if (saved != pushSlots->end()) {
+                                line(saved->second.savedName + " = " +
+                                     stripParens(
+                                         exprOfV(pi.find(op.in2)).text) +
+                                     ";");
+                                dropRspWrite = true;
+                                continue;
+                            }
+                        }
                             const StackSlot* ss =
                                 stackModel ? stackModel->slotAt(slot)
                                            : nullptr;
@@ -1681,6 +1826,21 @@ public:
                 case POp::LOAD: {
                     int64_t slot = 0;
                     if (slotOf(pi, op.in0, slot)) {
+                        // Phase 10f: restore a confirmed pop slot from its
+                        // saved_<slot> variable; flush drops the paired rsp
+                        // write.
+                        int64_t piDelta = 0;
+                        if (!useRecoveredRuntime && pushSlots &&
+                            piRspDelta(pi, architecture, piDelta) &&
+                            piDelta == 8) {
+                            const auto saved = pushSlots->find(slot);
+                            if (saved != pushSlots->end()) {
+                                r = CExpr{saved->second.savedName, vo->size,
+                                          false};
+                                dropRspWrite = true;
+                                break;
+                            }
+                        }
                         const StackSlot* ss =
                             stackModel ? stackModel->slotAt(slot) : nullptr;
                         if (ss && ss->promoted) {
@@ -1771,6 +1931,8 @@ public:
                     }
                 }
             }
+            if (dropRspWrite)
+                snapshots.erase("rsp"); // folded rsp write: no old value needed
             if (!snapshots.empty()) {
                 line("{");
                 ++indent;
@@ -1790,6 +1952,10 @@ public:
             if (liveFlags && written >= 4096 && written <= 4101 &&
                 !liveFlags->count(written))
                 continue; // Phase 10g: dead flag write
+            const bool foldedSpWrite =
+                dropRspWrite &&
+                written == stackPointerOffset(architecture) &&
+                write.second.size == 8;
             for (auto it = regExpr.begin(); it != regExpr.end();) {
                 bool depends = false;
                 for (const auto& ref : it->second.registerRefs)
@@ -1798,6 +1964,12 @@ public:
                     it = regExpr.erase(it);
                 else
                     ++it;
+            }
+            if (foldedSpWrite) {
+                // The output rsp does not change, so no stale definition may
+                // be inlined as if the adjustment had been emitted.
+                regExpr.erase(written);
+                continue;
             }
             regExpr[written] = write.second;
         }
@@ -1808,13 +1980,30 @@ public:
                     !liveFlags->count(storage))
                     continue; // Phase 10g: dead flag write
                 // track sp adjustment (prologue/frame): sp = sp +/- K
-                if (storage == stackPointerOffset(architecture) &&
-                    kv.second.size == 8) {
-                    int64_t bias = 0;
-                    if (parseSpExpr(kv.second.text,
-                                    registerName(architecture, storage, 8),
-                                    bias))
-                        spBias += bias;
+                const bool isSpWrite =
+                    storage == stackPointerOffset(architecture) &&
+                    kv.second.size == 8;
+                int64_t spDelta = 0;
+                const bool spDeltaKnown =
+                    isSpWrite &&
+                    parseSpExpr(kv.second.text,
+                                registerName(architecture, storage, 8),
+                                spDelta);
+                const bool foldSpWrite =
+                    dropRspWrite && isSpWrite && spDeltaKnown;
+                bool emittedSpWrite = false;
+                if (isSpWrite && !foldSpWrite) {
+                    if (spDeltaKnown) spBias += spDelta;
+                    // rebaseText must still see the current rebase when the
+                    // write line is emitted below; only then is the output
+                    // variable back on the simulated frame.
+                    emittedSpWrite = true;
+                } else if (foldSpWrite) {
+                    // Folded push/pop: the simulated frame still moves but
+                    // the output variable does not, so offset the rebase.
+                    spBias += spDelta;
+                    rspRebase -= spDelta;
+                    continue;
                 }
                 // track constant-valued registers (for jalr resolution)
                 {
@@ -1842,8 +2031,21 @@ public:
                 for (const auto& snapshot : snapshots)
                     expression = replaceIdentifier(expression, snapshot.first,
                                                    snapshot.second);
-                line(x86RegisterWrite(architecture, kv.first, kv.second.size,
-                                      stripParens(expression)) + ";");
+                if (emittedSpWrite) {
+                    // rsp write: re-base only the right-hand side so the
+                    // output variable lands on the simulated frame; the LHS
+                    // register name must stay a plain identifier.
+                    lineRaw(x86RegisterWrite(architecture, kv.first,
+                                             kv.second.size,
+                                             rebaseText(stripParens(expression))) +
+                            ";");
+                    rspRebase = 0; // output re-synced
+                } else {
+                    line(x86RegisterWrite(architecture, kv.first,
+                                          kv.second.size,
+                                          stripParens(expression)) +
+                         ";");
+                }
             }
             if (!snapshots.empty()) {
                 --indent;
@@ -1863,15 +2065,24 @@ public:
         const auto definition = regExpr.find(storage);
         if (definition != regExpr.end() &&
             inlineableExpression(definition->second))
-            return stripParens(definition->second.text);
-        return registerName(architecture, offset);
+            return rebaseText(stripParens(definition->second.text));
+        return rebaseText(registerName(architecture, offset));
+    }
+
+    // Phase 10f: re-base rsp references when folded push/pop adjustments
+    // left the output rsp variable offset from the simulated frame.
+    std::string rebaseText(const std::string& s) const {
+        return rspRebase ? rebaseRspText(s, rspRebase) : s;
     }
 
 private:
     const CfgBlock& blk_;
-    void line(const std::string& s) {
+    void lineRaw(const std::string& s) {
         for (int i = 0; i < indent; ++i) out << "    ";
         out << s << "\n";
+    }
+    void line(const std::string& s) {
+        lineRaw(rebaseText(s));
     }
 };
 
@@ -1911,6 +2122,124 @@ std::string decompile(
                             liveFlags.insert(v->offset);
                     }
                 }
+    }
+
+    // Phase 10f (native view): find push/pop save slots.  A slot is a pure
+    // callee-save spill when it is written exactly once by a push-like
+    // instruction (rsp - 8) and restored exactly once by a pop-like
+    // instruction (rsp + 8) into the same register.  Such slots are emitted
+    // as saved_<slot> variables with their rsp adjustments folded away,
+    // leaving the simulated rsp only for the real frame allocation.
+    std::map<int64_t, PushSlotInfo> pushSlots;
+    if (!useRecoveredRuntime && architecture.rfind("x86", 0) == 0) {
+        // Entry bias per block: the most negative predecessor exit bias,
+        // mirroring how frameBias propagates through block emission.
+        std::map<uint64_t, int64_t> entryBias;
+        entryBias[start] = 0;
+        for (int pass = 0; pass < 16; ++pass) {
+            bool changed = false;
+            for (const auto& b : cfg.blocks()) {
+                if (b.start == start) continue;
+                int64_t bias = std::numeric_limits<int64_t>::max();
+                for (const uint64_t pred : cfg.predecessors(b.start)) {
+                    const auto it = entryBias.find(pred);
+                    if (it == entryBias.end()) continue;
+                    const CfgBlock* pb = cfg.blockAt(pred);
+                    if (!pb) continue;
+                    bias = std::min(bias, simulateBlockSp(*pb, it->second,
+                                                         architecture));
+                }
+                if (bias != std::numeric_limits<int64_t>::max()) {
+                    const auto cur = entryBias.find(b.start);
+                    if (cur == entryBias.end() || cur->second != bias) {
+                        entryBias[b.start] = bias;
+                        changed = true;
+                    }
+                }
+            }
+            if (!changed) break;
+        }
+        std::map<int64_t, int> storeCount, loadCount;
+        std::map<int64_t, std::string> storedReg, loadedReg;
+        std::map<int64_t, int64_t> storeDelta, loadDelta;
+        for (const auto& b : cfg.blocks()) {
+            const auto eit = entryBias.find(b.start);
+            if (eit == entryBias.end()) continue;
+            int64_t bias = eit->second;
+            BlockEmitter probe(b);
+            probe.spBias = bias;
+            probe.architecture = architecture;
+            probe.stackModel = stackModel;
+            for (const auto& pi : b.insns) {
+                int64_t piDelta = 0;
+                const bool hasDelta = piRspDelta(pi, architecture, piDelta);
+                probe.spBias = bias; // slot addresses use the pre-instruction bias
+                for (const auto& op : pi.ops) {
+                    int64_t slot = 0;
+                    if (op.op == POp::STORE && probe.slotOf(pi, op.in0, slot) &&
+                        slot < 0) {
+                        storeCount[slot]++;
+                        storeDelta[slot] = hasDelta ? piDelta : 0;
+                        const Varnode* vs = pi.find(op.in2);
+                        if (vs && vs->kind == Varnode::REGISTER &&
+                            vs->size == 8 &&
+                            registerStorageOffset(architecture, vs->offset,
+                                                  vs->size) !=
+                                stackPointerOffset(architecture))
+                            storedReg[slot] = registerName(
+                                architecture,
+                                registerStorageOffset(architecture, vs->offset,
+                                                      vs->size));
+                        else
+                            storedReg[slot].clear();
+                    } else if (op.op == POp::LOAD &&
+                               probe.slotOf(pi, op.in0, slot) && slot < 0) {
+                        loadCount[slot]++;
+                        loadDelta[slot] = hasDelta ? piDelta : 0;
+                        // pop: LOAD u3, rsp; ...; COPY rbx, u3 - the
+                        // destination register is the later COPY's target.
+                        const Varnode* vo = pi.find(op.out);
+                        std::string reg;
+                        if (vo && vo->kind == Varnode::REGISTER &&
+                            vo->size == 8) {
+                            reg = registerName(
+                                architecture,
+                                registerStorageOffset(architecture,
+                                                      vo->offset, vo->size));
+                        } else if (vo && vo->kind == Varnode::UNIQUE) {
+                            for (const auto& op2 : pi.ops) {
+                                if (op2.op != POp::COPY || op2.in0 != vo->id)
+                                    continue;
+                                const Varnode* dest = pi.find(op2.out);
+                                if (dest && dest->kind == Varnode::REGISTER &&
+                                    dest->size == 8)
+                                    reg = registerName(
+                                        architecture,
+                                        registerStorageOffset(
+                                            architecture, dest->offset,
+                                            dest->size));
+                                break;
+                            }
+                        }
+                        loadedReg[slot] = reg;
+                    }
+                }
+                if (hasDelta) bias += piDelta;
+            }
+        }
+        for (const auto& kv : storeCount) {
+            const int64_t slot = kv.first;
+            if (kv.second != 1 || loadCount[slot] != 1 ||
+                storeDelta[slot] != -8 || loadDelta[slot] != 8 ||
+                storedReg[slot].empty() || storedReg[slot] != loadedReg[slot])
+                continue;
+            PushSlotInfo info;
+            info.savedName = "saved_m" + std::to_string(-slot);
+            info.storedReg = storedReg[slot];
+            info.storeDelta = -8;
+            info.loadDelta = 8;
+            pushSlots[slot] = info;
+        }
     }
 
     std::set<uint64_t> emitted;
@@ -1953,6 +2282,7 @@ std::string decompile(
 
                     body.entryBlock = !useRecoveredRuntime && (a == start);
 body.liveFlags = &liveFlags;
+body.pushSlots = &pushSlots;
                     body.emit();
                     if (body.hasCond && !body.cond.empty()) {
                         for (int i = 0; i <= depth; ++i) out << "    ";
@@ -1983,6 +2313,7 @@ body.liveFlags = &liveFlags;
 
                 body.entryBlock = !useRecoveredRuntime && (a == start);
 body.liveFlags = &liveFlags;
+body.pushSlots = &pushSlots;
                 body.emit();
                 for (int i = 0; i <= depth; ++i) out << "    ";
                 out << "while (1) {\n" << body.out.str();
@@ -2059,6 +2390,7 @@ body.liveFlags = &liveFlags;
                         header.spBias = frameBias;
                         header.entryBlock = !useRecoveredRuntime && (a == start);
 header.liveFlags = &liveFlags;
+header.pushSlots = &pushSlots;
                         header.emit();
                         if (header.out.str().empty() && header.hasCond &&
                             !header.cond.empty()) {
@@ -2106,6 +2438,7 @@ header.liveFlags = &liveFlags;
 
         be.entryBlock = !useRecoveredRuntime && (a == start);
 be.liveFlags = &liveFlags;
+be.pushSlots = &pushSlots;
         be.emit();
         out << be.out.str(); // flush block body
         frameBias = std::min(frameBias, be.spBias); // keep prologue bias
@@ -2142,6 +2475,7 @@ be.liveFlags = &liveFlags;
 
                 thenBody.entryBlock = !useRecoveredRuntime && (a == start);
 thenBody.liveFlags = &liveFlags;
+thenBody.pushSlots = &pushSlots;
                 thenBody.emit();
                 BlockEmitter elseBody(*fb);
                 elseBody.indent = depth + 2;
@@ -2156,6 +2490,7 @@ thenBody.liveFlags = &liveFlags;
 
                 elseBody.entryBlock = !useRecoveredRuntime && (a == start);
 elseBody.liveFlags = &liveFlags;
+elseBody.pushSlots = &pushSlots;
                 elseBody.emit();
                 for (int i = 0; i <= depth; ++i) out << "    ";
                 out << "if (" << be.cond << ") {\n" << thenBody.out.str();
@@ -2186,6 +2521,7 @@ elseBody.liveFlags = &liveFlags;
 
                 te.entryBlock = !useRecoveredRuntime && (a == start);
 te.liveFlags = &liveFlags;
+te.pushSlots = &pushSlots;
                 te.emit();
                 out << te.out.str(); // flush if-body
                 for (int i = 0; i <= depth + 1; ++i) out << "    ";
@@ -2226,7 +2562,8 @@ te.liveFlags = &liveFlags;
                         std::to_string(targetSignature->parameters[i].stackOffset);
                     argument = useRecoveredRuntime
                         ? "recovered_load<std::uint64_t>(" + address + ")"
-                        : "*((uint64_t *)(uintptr_t)(" + address + "))";
+                        : "*((uint64_t *)(uintptr_t)(" +
+                              be.rebaseText(address) + "))";
                 } else {
                     argument = registerName(architecture, offset);
                 }
@@ -2308,6 +2645,15 @@ std::string decompileTyped(
                 !ss.variableName.empty())
                 typedLocals[ss.typeName].push_back(ss.variableName);
         }
+    }
+    for (size_t at = 0; (at = body.find("saved_", at)) != std::string::npos;) {
+        size_t finish = at + 6;
+        while (finish < body.size() &&
+               (std::isalnum(static_cast<unsigned char>(body[finish])) ||
+                body[finish] == '_'))
+            ++finish;
+        locals.insert(body.substr(at, finish - at));
+        at = finish;
     }
     for (size_t at = 0; (at = body.find("local_", at)) != std::string::npos;) {
         size_t finish = at + 6;

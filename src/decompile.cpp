@@ -305,6 +305,27 @@ bool parseRegConstExpr(const std::string& t, std::string& reg, int64_t& k) {
 // later expressions read the register's plain name - so register reuse and
 // multi-predicate joins come out correct naturally (C sequential semantics
 // match the machine).
+// Phase 10b-2: an argument-setup expression may be inlined into a call site
+// only when evaluating it again has no side effects.  Constants, loads,
+// arithmetic and named globals qualify; anything with a function-like call
+// (identifier directly before '(') is kept as a register variable to avoid
+// duplicate evaluation.
+bool inlineableExpression(const CExpr& expression) {
+    if (expression.text.empty()) return false;
+    if (expression.isConst) return true;
+    size_t pos = 0;
+    while ((pos = expression.text.find('(', pos)) != std::string::npos) {
+        if (pos > 0) {
+            const char previous = expression.text[pos - 1];
+            if (std::isalnum(static_cast<unsigned char>(previous)) ||
+                previous == '_' || previous == '>')
+                return false;
+        }
+        ++pos;
+    }
+    return true;
+}
+
 class BlockEmitter {
 public:
     std::ostringstream out;
@@ -386,28 +407,7 @@ public:
     }
 
     // emit "a0 = fname(args);" for a resolved call; returns true if emitted
-    // Phase 10b-2: an argument-setup expression may be inlined into a call site
-// only when evaluating it again has no side effects.  Constants, loads,
-// arithmetic and named globals qualify; anything with a function-like call
-// (identifier directly before '(') is kept as a register variable to avoid
-// duplicate evaluation.
-bool inlineableExpression(const CExpr& expression) {
-    if (expression.text.empty()) return false;
-    if (expression.isConst) return true;
-    size_t pos = 0;
-    while ((pos = expression.text.find('(', pos)) != std::string::npos) {
-        if (pos > 0) {
-            const char previous = expression.text[pos - 1];
-            if (std::isalnum(static_cast<unsigned char>(previous)) ||
-                previous == '_' || previous == '>')
-                return false;
-        }
-        ++pos;
-    }
-    return true;
-}
-
-bool emitCall(const PcodeInsn& pi, uint64_t targetId) {
+    bool emitCall(const PcodeInsn& pi, uint64_t targetId) {
         if (!nameOf) return false;
         int64_t target = 0;
         if (!resolveTarget(pi, targetId, target)) return false;
@@ -1846,7 +1846,17 @@ bool emitCall(const PcodeInsn& pi, uint64_t targetId) {
     }
 
     std::string retValue() const {
-        return registerName(architecture, returnRegisterOffset(architecture));
+        const uint64_t offset = returnRegisterOffset(architecture);
+        // Phase 10c: inline a block-local, side-effect-free definition of
+        // the return register (rax = rsp + 40; return rax -> return rsp+40).
+        // Call results are kept as the register name by inlineableExpression.
+        const uint64_t storage =
+            registerStorageOffset(architecture, offset, 8);
+        const auto definition = regExpr.find(storage);
+        if (definition != regExpr.end() &&
+            inlineableExpression(definition->second))
+            return stripParens(definition->second.text);
+        return registerName(architecture, offset);
     }
 
 private:

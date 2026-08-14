@@ -1,4 +1,4 @@
-// centrifuge - recompilable C++ source-project recovery
+﻿// centrifuge - recompilable C++ source-project recovery
 #include "centrifuge/project_recovery.hpp"
 
 #include <algorithm>
@@ -1361,7 +1361,7 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
         << "    // PE image region on each generated LOAD/STORE.\n"
         << "    if (!runtime_strict_heap_bounds &&\n"
         << "        (address < original_image_begin || address >= original_image_end)) {\n"
-        << "        if (address < 0x10000U) { ++runtime_faults; return nullptr; }\n"
+        << "        if (address < 0x10000U) { const std::uint64_t faults = ++runtime_faults; if (faults > 50000000ULL) { std::fprintf(stderr, \"CENTRIFUGE: fatal: %llu recovered memory faults - possible null-pointer loop\\n\", static_cast<unsigned long long>(faults)); std::abort(); } return nullptr; }\n"
         << "        return reinterpret_cast<void*>(address);\n"
         << "    }\n"
         << "    for (auto& region : runtime_regions) {\n"
@@ -1376,7 +1376,7 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
         << "    if (!runtime_strict_heap_bounds) {\n"
         << "        if (address >= original_image_begin && address < original_image_end) "
            "{ ++runtime_faults; return nullptr; }\n"
-        << "        if (address < 0x10000U) { ++runtime_faults; return nullptr; }\n"
+        << "        if (address < 0x10000U) { const std::uint64_t faults = ++runtime_faults; if (faults > 50000000ULL) { std::fprintf(stderr, \"CENTRIFUGE: fatal: %llu recovered memory faults - possible null-pointer loop\\n\", static_cast<unsigned long long>(faults)); std::abort(); } return nullptr; }\n"
         << "        return reinterpret_cast<void*>(address);\n"
         << "    }\n"
         << "    { std::lock_guard<std::mutex> guard(runtime_heap_mutex);\n"
@@ -1394,7 +1394,7 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
         << "    if (address >= original_image_begin && address < original_image_end) {\n"
         << "        ++runtime_faults; return nullptr;\n"
         << "    }\n"
-        << "    if (address < 0x10000U) { ++runtime_faults; return nullptr; }\n"
+        << "    if (address < 0x10000U) { const std::uint64_t faults = ++runtime_faults; if (faults > 50000000ULL) { std::fprintf(stderr, \"CENTRIFUGE: fatal: %llu recovered memory faults - possible null-pointer loop\\n\", static_cast<unsigned long long>(faults)); std::abort(); } return nullptr; }\n"
         << "    return reinterpret_cast<void*>(address);\n}\n\n"
         << "bool recovered_resolve_iat_slot(std::uintptr_t address, std::size_t size, "
            "std::uintptr_t& value) {\n"

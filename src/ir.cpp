@@ -1405,6 +1405,68 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
     if (program.tls)
         for (uint64_t callback : program.tls->callbacks)
             queueFunction(ensureDiscovered(callback));
+    // Stripped PE images routinely call through global function-pointer slots
+    // (call qword ptr [.data+0x...]).  Those indirect targets are invisible to
+    // the direct-call closure but frequently sit on the startup path
+    // (allocators, CRT thunks, vtables).  Promote every readable data pointer
+    // that lands on executable memory with a prologue-like byte pattern so a
+    // bounded selection still recovers the real indirect callees instead of
+    // leaving dispatch misses that return 0 and crash downstream memsets.
+    // (Unbounded analyses already include every discovered function, so the
+    // extra scan is only meaningful when the selection is bounded.)
+    if (bounded) {
+        auto isPrologueLike = [&](uint64_t address) {
+            uint8_t b[8] = {0};
+            for (size_t n = 0; n < sizeof(b); ++n)
+                if (!read(address + n, &b[n], 1)) return false;
+            if (b[0] >= 0x50 && b[0] <= 0x57) return true;
+            if ((b[0] == 0x40 || b[0] == 0x41 || b[0] == 0x44 ||
+                 b[0] == 0x45) &&
+                b[1] >= 0x50 && b[1] <= 0x57)
+                return true;
+            if (b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC) return true;
+            if (b[0] == 0x48 && b[1] == 0x81 && b[2] == 0xEC) return true;
+            if (b[0] == 0x48 && b[1] == 0x89 && b[2] == 0x5C &&
+                b[3] == 0x24)
+                return true;
+            if ((b[0] == 0x0F && b[1] == 0x29) ||
+                (b[0] == 0x66 && b[1] == 0x0F && b[2] == 0x29))
+                return true;
+            return false;
+        };
+        const size_t promotedRootLimit =
+            bounded ? std::max<size_t>(1, maximumFunctions / 10)
+                    : std::numeric_limits<size_t>::max();
+        size_t promotedRoots = 0;
+        bool hitLimit = false;
+        // Scan writable data blocks (.data, .bss) before read-only ones
+        // (.rdata).  Startup allocator slots (operator-new thunks, stack
+        // allocators) live in .data on MSVC images and must not be crowded
+        // out by the hundreds of vtable pointers that .rdata yields first.
+        for (int pass = 0; pass < 2 && !hitLimit; ++pass) {
+            for (const MemoryBlock& block : program.memory.blocks()) {
+                if (hitLimit) break;
+                if (block.perm & static_cast<int>(Perm::X)) continue;
+                if (!(block.perm & static_cast<int>(Perm::R))) continue;
+                const bool writable =
+                    (block.perm & static_cast<int>(Perm::W)) != 0;
+                if ((pass == 0) != writable) continue;
+                for (uint64_t address = block.base;
+                     address + 8 <= block.end() && address + 8 >= address;
+                     address += 8) {
+                    uint64_t value = 0;
+                    if (!read(address, &value, 8)) continue;
+                    if (!executable(value)) continue;
+                    if (!isPrologueLike(value)) continue;
+                    if (queueFunction(ensureDiscovered(value)) &&
+                        ++promotedRoots >= promotedRootLimit) {
+                        hitLimit = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     auto queueOrdinaryWhenIdle = [&](size_t processedIndex) {
         if (!bounded || processedIndex + 1 >= maximumFunctions ||
             processedIndex + 1 < selected.size())

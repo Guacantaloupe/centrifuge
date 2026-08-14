@@ -1543,6 +1543,210 @@ public:
                     r.size = vo->size;
                     break;
                 }
+                case POp::INT_NOT: {
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    r.text = "(~(" + stripParens(a.text) + "))";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::FLOAT_SCALE: {
+                    // x87 fscale: a * 2^b
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const CExpr b = exprOfV(pi.find(op.in1));
+                    r.text = "((" + stripParens(a.text) + ") * exp2((" +
+                             stripParens(b.text) + ")))";
+                    r.size = vo->size;
+                    r.floating = true;
+                    break;
+                }
+                case POp::SIMD_PACK: {
+                    // packsswb/packuswb/packssdw/packusdw: saturate the
+                    // lanes of both sources into half-width destination
+                    // lanes.  aux = srcLaneBits | (unsigned ? 0x0100 : 0).
+                    // The full 128-bit result is built with insert chains
+                    // since the simulated vector holds all 16 bytes.
+                    const CExpr lhs = exprOfV(pi.find(op.in0));
+                    const CExpr rhs = exprOfV(pi.find(op.in1));
+                    const std::string a = stripParens(lhs.text);
+                    const std::string b = stripParens(rhs.text);
+                    const int srcBits = op.aux & 0xff;
+                    const bool us = (op.aux & 0x0100) != 0;
+                    const int outBits = srcBits / 2;
+                    const int n = 16 / (srcBits / 8);
+                    const std::string srcLane =
+                        srcBits == 32 ? "int32_t" : "int16_t";
+                    const std::string outType =
+                        us ? (outBits == 8 ? "uint8_t" : "uint16_t")
+                           : (outBits == 8 ? "int8_t" : "int16_t");
+                    const int64_t lo = us
+                        ? 0
+                        : -(static_cast<int64_t>(1) << (outBits - 1));
+                    const int64_t hi = us
+                        ? ((static_cast<int64_t>(1) << outBits) - 1)
+                        : ((static_cast<int64_t>(1) << (outBits - 1)) - 1);
+                    auto sat = [&](const std::string& x) {
+                        return "((" + x + ") < " + std::to_string(lo) +
+                               " ? " + std::to_string(lo) + " : (" + x +
+                               ") > " + std::to_string(hi) + " ? " +
+                               std::to_string(hi) + " : (" + x + "))";
+                    };
+                    std::string result = "RecoveredVector<16>{}";
+                    for (int i = 0; i < 16 / (outBits / 8); ++i) {
+                        const int srcIndex = i < n ? i : i - n;
+                        const std::string& src = i < n ? a : b;
+                        const std::string value = sat(
+                            "recovered_vector_extract<" + srcLane + ">(" +
+                            src + ", " + std::to_string(srcIndex) + ")");
+                        result = "recovered_vector_insert<" + outType +
+                                 ">(" + result + ", " + value + ", " +
+                                 std::to_string(i) + ")";
+                    }
+                    r.text = result;
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_FLOAT2INT: {
+                    // cvtps2dq/cvttps2dq/cvtpd2dq/cvttpd2dq: float lanes to
+                    // int32 lanes.  The low 64-bit window carries the first
+                    // two int32 lanes.  C++ float->int truncates, so the
+                    // rounding (non-truncate) forms use llround.
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const std::string source = stripParens(a.text);
+                    const int sourceBits = op.aux & 0xff;
+                    const bool truncate = (op.aux & 0x8000) != 0;
+                    const std::string lane =
+                        sourceBits == 64 ? "double" : "float";
+                    const std::string e0 =
+                        "((int32_t)" +
+                        (truncate ? std::string() : "llround(") +
+                        "recovered_vector_extract<" + lane + ">(" +
+                        source + ", 0)" + (truncate ? "" : ")") + ")";
+                    const std::string e1 =
+                        "((int32_t)" +
+                        (truncate ? std::string() : "llround(") +
+                        "recovered_vector_extract<" + lane + ">(" +
+                        source + ", 1)" + (truncate ? "" : ")") + ")";
+                    r.text = "(" + e0 + " | (" + e1 + " << 32))";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_FP_COMPARE: {
+                    // cmpps/cmppd/cmpss/cmpsd: lane-wise predicate masks.
+                    // aux = laneBits | (scalar ? 0x8000 : 0); op.in2 is the
+                    // x86 predicate immediate.  Emit the low 64-bit window
+                    // as a mask (all-ones per true lane).
+                    const CExpr lhs = exprOfV(pi.find(op.in0));
+                    const CExpr rhs = exprOfV(pi.find(op.in1));
+                    const std::string a = stripParens(lhs.text);
+                    const std::string b = stripParens(rhs.text);
+                    const bool f32 = (op.aux & 0xff) == 32;
+                    const bool scalar = (op.aux & 0x8000) != 0;
+                    const std::string lane = f32 ? "float" : "double";
+                    const Varnode* immNode = pi.find(op.in2);
+                    const int imm = immNode && immNode->isConst()
+                        ? static_cast<int>(immNode->offset & 0xff) : 0;
+                    auto pred = [&](int index) -> std::string {
+                        const std::string x =
+                            "recovered_vector_extract<" + lane + ">(" +
+                            a + ", " + std::to_string(index) + ")";
+                        const std::string y =
+                            "recovered_vector_extract<" + lane + ">(" +
+                            b + ", " + std::to_string(index) + ")";
+                        const std::string na = "std::isnan(" + x + ")";
+                        const std::string nb = "std::isnan(" + y + ")";
+                        switch (imm) {
+                        case 0: return "((" + x + ") == (" + y + "))";
+                        case 1: return "((" + x + ") < (" + y + "))";
+                        case 2: return "((" + x + ") <= (" + y + "))";
+                        case 3: return "((" + na + ") || (" + nb + "))";
+                        case 4: return "((" + x + ") != (" + y + "))";
+                        case 5: return "!((" + x + ") < (" + y + "))";
+                        case 6: return "!((" + x + ") <= (" + y + "))";
+                        default: return "!((" + na + ") || (" + nb + "))";
+                        }
+                    };
+                    if (scalar) {
+                        // comisd/ucomisd-style: the source operand is a
+                        // scalar lane (8/4 bytes of bits), not a vector.
+                        const std::string x =
+                            "recovered_vector_scalar<" + lane + ">(" +
+                            a + ")";
+                        const std::string y =
+                            "recovered_float_from_bits<" + lane + ">(" +
+                            b + ")";
+                        const std::string na = "std::isnan(" + x + ")";
+                        const std::string nb = "std::isnan(" + y + ")";
+                        std::string condition;
+                        switch (imm) {
+                        case 0: condition = "((" + x + ") == (" + y + "))"; break;
+                        case 1: condition = "((" + x + ") < (" + y + "))"; break;
+                        case 2: condition = "((" + x + ") <= (" + y + "))"; break;
+                        case 3: condition = "((" + na + ") || (" + nb + "))"; break;
+                        case 4: condition = "((" + x + ") != (" + y + "))"; break;
+                        case 5: condition = "!((" + x + ") < (" + y + "))"; break;
+                        case 6: condition = "!((" + x + ") <= (" + y + "))"; break;
+                        default: condition = "!((" + na + ") || (" + nb + "))"; break;
+                        }
+                        r.text = "(" + condition + " ? " +
+                                 (f32 ? "0xffffffffULL"
+                                      : "0xffffffffffffffffULL") +
+                                 " : 0)";
+                    } else if (f32) {
+                        r.text = "((" + pred(0) + " ? 0xffffffffULL : 0) |"
+                                 " ((" + pred(1) + " ? 0xffffffffULL : 0)"
+                                 " << 32))";
+                    } else {
+                        r.text = "(" + pred(0) +
+                                 " ? 0xffffffffffffffffULL : 0)";
+                    }
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_UNPACK: {
+                    // punpckl*/punpckh* (and SSE float unpcklps/hps/lpd/hpd):
+                    // interleave lanes from two sources.  aux encodes
+                    // laneBits | (high ? 0x8000 : 0).  The generated C
+                    // carries the observable low 64-bit window as an
+                    // integer expression (RecoveredVector converts
+                    // implicitly).
+                    const CExpr left = exprOfV(pi.find(op.in0));
+                    const CExpr right = exprOfV(pi.find(op.in1));
+                    const std::string a = stripParens(left.text);
+                    const std::string b = stripParens(right.text);
+                    const int laneBits = op.aux & 0x7fff;
+                    const bool high = (op.aux & 0x8000) != 0;
+                    if (laneBits >= 64) {
+                        // punpcklqdq: window = first source lane; hqdq
+                        // = first source's upper lane.
+                        r.text = high ? "((" + a + ") >> 32)" : a;
+                    } else {
+                        const uint64_t mask =
+                            (uint64_t{1} << laneBits) - 1;
+                        const int per = 32 / laneBits;
+                        std::string expr = "(";
+                        for (int i = 0; i < per; ++i) {
+                            const int srcShift =
+                                (high ? 32 : 0) + i * laneBits;
+                            const std::string ai =
+                                "(((" + a + ") >> " +
+                                std::to_string(srcShift) + ") & " +
+                                std::to_string(mask) + "ULL)";
+                            const std::string bi =
+                                "(((" + b + ") >> " +
+                                std::to_string(srcShift) + ") & " +
+                                std::to_string(mask) + "ULL)";
+                            if (i) expr += " | ";
+                            expr += ai + " << " +
+                                    std::to_string(2 * i * laneBits) +
+                                    " | " + bi + " << " +
+                                    std::to_string((2 * i + 1) * laneBits);
+                        }
+                        expr += ")";
+                        r.text = expr;
+                    }
+                    r.size = vo->size;
+                    break;
+                }
                 case POp::SIMD_SHUFFLE: {
                     // SHUFPS is the form currently reaching the project
                     // emitter in the Blender corpus.  Its low two result
@@ -1998,6 +2202,10 @@ public:
                 default:
                     r.text = "0 /* unknown */";
                     r.size = vo->size;
+                    if (getenv("CENTRIFUGE_DBG_OP")) {
+                        fprintf(stderr, "[DBG-OP] %s\n",
+                                pOpName(op.op));
+                    }
                     break;
                 }
                 // Propagate register dependencies through UNIQUE expression
@@ -2141,10 +2349,25 @@ public:
                         reg.empty()) {
                         uint64_t base = kv.first;
                         unsigned shift = 0;
-                        if (!x86GprSlice(architecture, kv.first,
-                                         kv.second.size, base, shift) ||
-                            kv.second.size == 8 ||
-                            (kv.second.size == 4 && shift == 0)) {
+                        const bool x86Slice = x86GprSlice(
+                            architecture, kv.first, kv.second.size, base,
+                            shift);
+                        // x86: only full-width/32-bit GPR writes enter the
+                        // constant table.  Wide or non-GPR targets (XMM,
+                        // flags, memory temps) must erase instead: x86
+                        // aliases XMM0's storage offset with RAX, so
+                        // recording "xmm0 = 0" there would poison a later
+                        // indirect-call target resolution (CALL [RAX+0x70]
+                        // folding RAX to 0 and yielding FUN_70).
+                        // Non-x86 keeps the original broad rule so RISC-V
+                        // auipc+jalr constant tracking still works.
+                        const bool gprConstantWrite =
+                            architecture.rfind("x86", 0) == 0
+                                ? (x86Slice &&
+                                   (kv.second.size == 8 ||
+                                    (kv.second.size == 4 && shift == 0)))
+                                : true;
+                        if (gprConstantWrite) {
                             if (kv.second.size == 4)
                                 k = static_cast<uint32_t>(k);
                             regConst[storage] = k;

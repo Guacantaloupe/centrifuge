@@ -1,0 +1,24 @@
+{
+ "schema": 1,
+ "name": "krita-windows-x64",
+ "version": "6.0.3",
+ "binary": "libkritaui.dll",
+ "official_url": "https://download.kde.org/stable/krita/6.0.3/",
+ "binary_sha256": "e4e5d5caeb14dd4c18bfd9ff52e20c37ad8339b4b18f867c2723509890f203ae",
+ "spec": "sleigh/x86-64.slaspec",
+ "abi": "win64",
+ "maximum_functions": 16204,
+ "maximum_unresolved_markers": 0,
+ "minimum_knowledge_nodes": 6000,
+ "minimum_imported_libraries": 30,
+ "minimum_imported_symbols": 2000,
+ "minimum_data_regions": 5,
+ "minimum_resources": 0,
+ "requirements": {
+  "project_generation": true,
+  "recovered_project_compiles": true,
+  "recovered_verifier_runs": true,
+  "semantic_equivalence_required": false
+ },
+ "notes": "Krita 6.0.3 portable (krita-x64-6.0.3.zip). Main logic lives in libkritaui.dll (16k functions, 14k symbols). DLL fixture: recovered project builds a verifier from the recovered DllMain/entry code."
+}

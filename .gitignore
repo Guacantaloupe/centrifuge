@@ -2,3 +2,4 @@ build*/
 corpus/
 *.o
 *.obj
+krita-dl/

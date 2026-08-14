@@ -990,13 +990,43 @@ public:
                             target = registerName(architecture, storageOffset64,
                                                   8);
                         }
-                        line(op.op == POp::CALLIND
-                                 ? (registerName(architecture,
-                                                 returnRegisterOffset(architecture)) +
-                                    " = ((uint64_t (*)(void))(uintptr_t)" +
-                                    target + ")();")
-                                 : ("/* call " + target + " */"));
-                    }
+                        if (op.op == POp::CALLIND) {
+                            // An indirect call must forward the current ABI
+                            // argument registers as parameters; the C++
+                            // compiler treats the values as dead otherwise
+                            // and the callee observes stale register
+                            // contents (e.g. rcx left over from a
+                            // recovered_load).  Variadic forwarding keeps
+                            // every live register visible to the call.
+                            const auto& abiRegs =
+                                defaultArgumentRegisters(architecture);
+                            std::string forwardArgs;
+                            for (size_t ai = 0; ai < abiRegs.size(); ++ai) {
+                                forwardArgs +=
+                                    (ai ? ", " : "") +
+                                    registerName(architecture, abiRegs[ai]);
+                            }
+                            if (useRecoveredRuntime) {
+                                // Route through the recovered dispatch
+                                // table: the target is an original-image
+                                // address (vtable/init-table slot value)
+                                // that must reach the recovered C++
+                                // function, not mapped image data.
+                                line(registerName(
+                                         architecture,
+                                         returnRegisterOffset(architecture)) +
+                                     " = recovered_dispatch(" + target + ", " +
+                                     forwardArgs + ", 0, 0, 0, 0);");
+                            } else {
+                                line(registerName(
+                                         architecture,
+                                         returnRegisterOffset(architecture)) +
+                                     " = ((uint64_t (*)(...))(uintptr_t)" +
+                                     target + ")(" + forwardArgs + ");");
+                            }
+                        } else {
+                            line("/* call " + target + " */");
+                        }                    }
                     continue;
                 }
                 const Varnode* vo = pi.find(op.out);
@@ -1605,6 +1635,133 @@ public:
                     r.size = vo->size;
                     break;
                 }
+                case POp::SIMD_BLEND: {
+                    // blendps/blendpd: imm8 selects per-lane whether the
+                    // result lane comes from src (bit 1) or stays base.
+                    // aux = laneBits (32/64).
+                    const CExpr baseExpr = exprOfV(pi.find(op.in0));
+                    const CExpr srcExpr = exprOfV(pi.find(op.in1));
+                    const std::string base = stripParens(baseExpr.text);
+                    const std::string src = stripParens(srcExpr.text);
+                    const int laneBits = op.aux & 0xff;
+                    const int lanes = 16 / (laneBits / 8);
+                    int mask = 0;
+                    if (op.in2) {
+                        const Varnode* immNode = pi.find(op.in2);
+                        if (immNode && immNode->kind == Varnode::CONST)
+                            mask = static_cast<int>(immNode->offset & 0xff);
+                    }
+                    const std::string lane =
+                        laneBits == 64 ? "double" : "float";
+                    std::string result = base;
+                    for (int i = 0; i < lanes; ++i) {
+                        if ((mask >> i) & 1) {
+                            result =
+                                "recovered_vector_replace_scalar<" + lane +
+                                ">(" + result +
+                                ", recovered_vector_extract<" + lane +
+                                ">(" + src + ", " + std::to_string(i) +
+                                "))";
+                        }
+                    }
+                    r.text = result;
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_ABS: {
+                    // pabsb/pabsw/pabsd: per-lane absolute value.  aux =
+                    // laneBits (8/16/32).  Rebuild the full 128-bit vector
+                    // with insert chains.
+                    const CExpr a = exprOfV(pi.find(op.in0));
+                    const std::string source = stripParens(a.text);
+                    const int laneBits = op.aux & 0xff;
+                    const std::string lane =
+                        laneBits == 8   ? "int8_t"
+                        : laneBits == 16 ? "int16_t"
+                                         : "int32_t";
+                    const int lanes = 16 / (laneBits / 8);
+                    std::string result = "RecoveredVector<16>{}";
+                    for (int i = 0; i < lanes; ++i) {
+                        const std::string value =
+                            "std::abs(recovered_vector_extract<" + lane +
+                            ">(" + source + ", " + std::to_string(i) +
+                            "))";
+                        result = "recovered_vector_insert<" + lane + ">(" +
+                                 result + ", " + value + ", " +
+                                 std::to_string(i) + ")";
+                    }
+                    r.text = result;
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_TEST: {
+                    // ptest: aux=0 -> ZF ((a & b) == 0), aux=1 -> CF
+                    // ((~a & b) == 0).  Both 64-bit halves must be zero.
+                    const CExpr lhs = exprOfV(pi.find(op.in0));
+                    const CExpr rhs = exprOfV(pi.find(op.in1));
+                    const std::string a = stripParens(lhs.text);
+                    const std::string b = stripParens(rhs.text);
+                    const bool cf = op.aux != 0;
+                    const std::string notPrefix = cf ? "~" : "";
+                    const std::string h0 =
+                        "(" + notPrefix +
+                        "recovered_vector_extract<uint64_t>(" + a +
+                        ", 0) & recovered_vector_extract<uint64_t>(" + b +
+                        ", 0))";
+                    const std::string h1 =
+                        "(" + notPrefix +
+                        "recovered_vector_extract<uint64_t>(" + a +
+                        ", 1) & recovered_vector_extract<uint64_t>(" + b +
+                        ", 1))";
+                    r.text = "((" + h0 + " == 0) && (" + h1 + " == 0))";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::SIMD_ROUND: {
+                    // roundsd/roundss/roundpd/roundps: lane-wise rounding
+                    // with an explicit x86 mode.  aux = laneBits |
+                    // (scalar ? 0x8000 : 0); op.in0 = value, op.in1 =
+                    // base (unmodified lanes preserved), op.in2 = mode
+                    // immediate (0/8 nearest-even, 1/9 floor, 2/10 ceil,
+                    // 3/11 truncate).
+                    const CExpr valueExpr = exprOfV(pi.find(op.in0));
+                    const CExpr baseExpr = exprOfV(pi.find(op.in1));
+                    const std::string value = stripParens(valueExpr.text);
+                    const std::string base = stripParens(baseExpr.text);
+                    const int laneBits = op.aux & 0xff;
+                    const bool scalar = (op.aux & 0x8000) != 0;
+                    int mode = 0;
+                    if (op.in2) {
+                        const Varnode* immNode = pi.find(op.in2);
+                        if (immNode && immNode->kind == Varnode::CONST)
+                            mode = static_cast<int>(immNode->offset & 0x1f);
+                    }
+                    std::string fn = "std::rint";
+                    if (mode == 1 || mode == 9) fn = "std::floor";
+                    else if (mode == 2 || mode == 10) fn = "std::ceil";
+                    else if (mode == 3 || mode == 11) fn = "std::trunc";
+                    const std::string lane =
+                        laneBits == 64 ? "double" : "float";
+                    if (scalar) {
+                        r.text = "recovered_vector_replace_scalar<" + lane +
+                                 ">(" + base + ", " + fn +
+                                 "(recovered_vector_scalar<" + lane + ">(" +
+                                 value + ")))";
+                    } else {
+                        const int lanes = 16 / (laneBits / 8);
+                        std::string result = base;
+                        for (int i = 0; i < lanes; ++i) {
+                            result =
+                                "recovered_vector_replace_scalar<" + lane +
+                                ">(" + result + ", " + fn +
+                                "(recovered_vector_extract<" + lane + ">(" +
+                                value + ", " + std::to_string(i) + ")))";
+                        }
+                        r.text = result;
+                    }
+                    r.size = vo->size;
+                    break;
+                }
                 case POp::SIMD_FLOAT2INT: {
                     // cvtps2dq/cvttps2dq/cvtpd2dq/cvttpd2dq: float lanes to
                     // int32 lanes.  The low 64-bit window carries the first
@@ -2202,10 +2359,6 @@ public:
                 default:
                     r.text = "0 /* unknown */";
                     r.size = vo->size;
-                    if (getenv("CENTRIFUGE_DBG_OP")) {
-                        fprintf(stderr, "[DBG-OP] %s\n",
-                                pOpName(op.op));
-                    }
                     break;
                 }
                 // Propagate register dependencies through UNIQUE expression
@@ -2288,6 +2441,15 @@ public:
             if (foldedSpWrite) {
                 // The output rsp does not change, so no stale definition may
                 // be inlined as if the adjustment had been emitted.
+                regExpr.erase(written);
+                continue;
+            }
+            if (write.second.registerRefs.count(written)) {
+                // Self-referential definition (rcx = rcx + K, rcx = rcx ^ rcx):
+                // the C variable is updated once at this statement, so inlining
+                // the recorded expression at a later call site would re-apply
+                // the operation on top of the already-updated value.  Keep the
+                // plain register name (runtime value) instead of the text.
                 regExpr.erase(written);
                 continue;
             }

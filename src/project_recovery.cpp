@@ -478,9 +478,40 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
                      "std::uint64_t a6, std::uint64_t a7) {\n";
         const auto imported = importByIat.find(external.first);
         if (imported == importByIat.end()) {
-            externals << "    (void)a0; (void)a1; (void)a2; (void)a3; "
-                         "(void)a4; (void)a5; (void)a6; (void)a7;\n"
-                      << "    return 0;\n";
+            // A callee that lands in a data region is almost always a
+            // slot (IAT/function table) holding the real target address;
+            // the machine does call qword ptr [.data+0x...].  Read the
+            // slot through the recovered image and dispatch through it so
+            // the indirect callee is actually invoked instead of returning
+            // 0 (which makes CRT init write through a NULL buffer).
+            bool inData = false;
+            for (const DataRegion& region : program.dataRegions) {
+                if (external.first >= region.address &&
+                    external.first - region.address < region.size) {
+                    inData = true;
+                    break;
+                }
+            }
+            if (inData) {
+                externals << "    auto function = "
+                             "reinterpret_cast<RecoveredExternal>("
+                             "recovered_load<std::uint64_t>("
+                          << "0x" << std::hex << external.first << std::dec
+                          << "));\n"
+                          << "    return function ? function("
+                             "recovered_external_argument(a0), "
+                             "recovered_external_argument(a1), "
+                             "recovered_external_argument(a2), "
+                             "recovered_external_argument(a3), "
+                             "recovered_external_argument(a4), "
+                             "recovered_external_argument(a5), "
+                             "recovered_external_argument(a6), "
+                             "recovered_external_argument(a7)) : 0;\n";
+            } else {
+                externals << "    (void)a0; (void)a1; (void)a2; (void)a3; "
+                             "(void)a4; (void)a5; (void)a6; (void)a7;\n"
+                          << "    return 0;\n";
+            }
         } else {
             const ImportSymbol& symbol = program.imports[imported->second];
             if (!symbol.byOrdinal &&

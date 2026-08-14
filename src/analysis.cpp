@@ -170,6 +170,103 @@ std::vector<Function> findFunctions(const Program& prog, Disassembler* disasm) {
         addFunc(unwind.first, funName(unwind.first, is64), Function::UNWIND,
                 unwind.second);
 
+    // Seed 4: pointer scan over readable data blocks.  Stripped images
+    // routinely call functions only through IAT/global slots (call
+    // qword ptr [.data+0x...]); recursive descent never sees those
+    // targets.  Any 8-byte-aligned data value that lands on executable
+    // memory and looks like a function prologue is promoted to a
+    // SCAN function so the indirect callee is recovered too.
+    {
+        const auto& blocks = prog.memory.blocks();
+        auto isPrologue = [&](uint64_t address) {
+            uint8_t b[8] = {0};
+            for (size_t n = 0; n < sizeof(b); ++n)
+                if (!prog.memory.read(address + n, &b[n], 1)) return false;
+            // push r64 (single byte 0x50-0x57, REX.W 40/41 + 0x50-0x57)
+            if (b[0] >= 0x50 && b[0] <= 0x57) return true;
+            if ((b[0] == 0x40 || b[0] == 0x41 || b[0] == 0x44 ||
+                 b[0] == 0x45) &&
+                b[1] >= 0x50 && b[1] <= 0x57)
+                return true;
+            // sub rsp, imm8/imm32
+            if (b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC) return true;
+            if (b[0] == 0x48 && b[1] == 0x81 && b[2] == 0xEC) return true;
+            // mov [rsp+disp8], reg (frame setup)
+            if (b[0] == 0x48 && b[1] == 0x89 && b[2] == 0x5C &&
+                b[3] == 0x24)
+                return true;
+            // movaps/movdqa store to stack, common in large frames
+            if ((b[0] == 0x0F && b[1] == 0x29) ||
+                (b[0] == 0x66 && b[1] == 0x0F && b[2] == 0x29))
+                return true;
+            return false;
+        };
+        std::vector<uint64_t> promoted;
+        for (const MemoryBlock& block : blocks) {
+            if (block.perm & static_cast<int>(Perm::X)) continue;
+            if (!(block.perm & static_cast<int>(Perm::R))) continue;
+            const uint64_t start = block.base;
+            const uint64_t end = block.end();
+            for (uint64_t address = start;
+                 address + 8 <= end && address + 8 >= address;
+                 address += 8) {
+                uint64_t value = 0;
+                if (!prog.memory.read(address, &value, 8)) continue;
+                if (!prog.memory.isExecutable(value)) continue;
+                if (funcs.count(value)) continue;
+                if (!isPrologue(value)) continue;
+                const auto unwind = unwindSizes.find(value);
+                addFunc(value, funName(value, is64), Function::SCAN,
+                        unwind != unwindSizes.end() ? unwind->second : 0);
+                promoted.push_back(value);
+            }
+        }
+        // Re-run recursive descent from the promoted starts so their
+        // bodies and direct callees are discovered as well.
+        std::vector<uint64_t> seedWorklist = promoted;
+        for (size_t wi = 0; wi < seedWorklist.size(); ++wi) {
+            const uint64_t functionStart = seedWorklist[wi];
+            uint64_t cur = functionStart;
+            bool first = true;
+            std::set<uint64_t> localVisited;
+            while (true) {
+                if (!first && funcs.count(cur)) break;
+                if (localVisited.count(cur)) break;
+                if (!prog.memory.isExecutable(cur)) break;
+                first = false;
+                Insn insn;
+                if (!disasm || !disasm->disasmOne(prog.memory, cur, insn)) break;
+                localVisited.insert(cur);
+                if (insn.kind == Insn::RET) break;
+                if (insn.kind == Insn::CALL) {
+                    if (insn.targetKnown &&
+                        prog.memory.isExecutable(insn.target) &&
+                        !funcs.count(insn.target)) {
+                        const auto unwind = unwindSizes.find(insn.target);
+                        if (unwind != unwindSizes.end()) {
+                            addFunc(insn.target, funName(insn.target, is64),
+                                    Function::UNWIND, unwind->second);
+                        } else {
+                            addFunc(insn.target, funName(insn.target, is64),
+                                    Function::SCAN);
+                            seedWorklist.push_back(insn.target);
+                        }
+                    }
+                    cur += insn.size;
+                } else if (insn.kind == Insn::JMP) {
+                    if (insn.targetKnown &&
+                        prog.memory.isExecutable(insn.target)) {
+                        cur = insn.target;
+                    } else {
+                        break;
+                    }
+                } else {
+                    cur += insn.size;
+                }
+            }
+        }
+    }
+
     // Sizes: distance to next function start, clamped to the containing block.
     std::vector<Function> out;
     out.reserve(funcs.size());

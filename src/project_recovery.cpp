@@ -471,6 +471,13 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
               << "using RecoveredExternal = std::uint64_t (*)(std::uint64_t, "
                  "std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, "
                  "std::uint64_t, std::uint64_t, std::uint64_t);\n";
+    uint64_t stubImageBegin = std::numeric_limits<uint64_t>::max();
+    uint64_t stubImageEnd = 0;
+    for (const MemoryBlock& block : program.memory.blocks()) {
+        stubImageBegin = std::min(stubImageBegin, block.base);
+        stubImageEnd = std::max(stubImageEnd, block.end());
+    }
+    if (program.memory.blocks().empty()) stubImageBegin = 0;
     for (const auto& external : externalNames) {
         externals << "std::uint64_t " << external.second
                   << "(std::uint64_t a0, std::uint64_t a1, std::uint64_t a2, "
@@ -493,11 +500,17 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
                 }
             }
             if (inData) {
-                externals << "    auto function = "
-                             "reinterpret_cast<RecoveredExternal>("
+                externals << "    const auto target = "
                              "recovered_load<std::uint64_t>("
                           << "0x" << std::hex << external.first << std::dec
-                          << "));\n"
+                          << ");\n"
+                          << "    if (target >= " << stubImageBegin
+                          << "ULL && target < " << stubImageEnd
+                          << "ULL)\n"
+                          << "        return recovered_dispatch(target, "
+                             "a0, a1, a2, a3, a4, a5, a6, a7);\n"
+                          << "    auto function = "
+                             "reinterpret_cast<RecoveredExternal>(target);\n"
                           << "    return function ? function("
                              "recovered_external_argument(a0), "
                              "recovered_external_argument(a1), "

@@ -9,7 +9,7 @@
   "archive_bytes": 0,
   "spec": "sleigh/x86-64.slaspec",
   "abi": "win64",
-  "maximum_functions": 2000,
+  "maximum_functions": 3000,
   "maximum_unresolved_markers": 0,
   "minimum_knowledge_nodes": 6000,
   "minimum_imported_libraries": 60,

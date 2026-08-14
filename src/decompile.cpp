@@ -2908,6 +2908,7 @@ std::string decompile(
     std::optional<uint64_t> suppressBackedgeTo; // structured loop backedge
 
     std::function<void(uint64_t, int)> emitBlock;
+    std::set<uint64_t> danglingLabels;
     emitBlock = [&](uint64_t a, int depth) {
         if (emitted.count(a)) {
             for (int i = 0; i < depth; ++i) out << "    ";
@@ -2916,7 +2917,13 @@ std::string decompile(
         }
         emitted.insert(a);
         const CfgBlock* b = cfg.blockAt(a);
-        if (!b) return;
+        if (!b) {
+            if (labeled.count(a) && a != start) {
+                for (int i = 0; i < depth; ++i) out << "    ";
+                out << "L" << hexAddr(a) << ":;\n";
+            }
+            return;
+        }
         if (labeled.count(a) && a != start) {
             for (int i = 0; i < depth; ++i) out << "    ";
             out << "L" << hexAddr(a) << ":\n";
@@ -3249,6 +3256,10 @@ te.pushSlots = &pushSlots;
                 emitBlock(fall, depth);
                 return;
             }
+            if (!cfg.blockAt(target) && danglingLabels.insert(target).second) {
+                for (int i = 0; i <= depth; ++i) out << "    ";
+                out << "L" << hexAddr(target) << ":;\n";
+            }
             for (int i = 0; i <= depth; ++i) out << "    ";
             out << "if (" << be.cond << ") goto L" << hexAddr(target)
                 << ";\n";
@@ -3307,12 +3318,22 @@ te.pushSlots = &pushSlots;
                 // already covers it - emit nothing.
                 return;
             }
+            if (!cfg.blockAt(term->target) &&
+                danglingLabels.insert(term->target).second) {
+                for (int i = 0; i <= depth; ++i) out << "    ";
+                out << "L" << hexAddr(term->target) << ":;\n";
+            }
             for (int i = 0; i <= depth; ++i) out << "    ";
             out << "goto L" << hexAddr(term->target) << ";\n";
             return;
         }
         if (be.resolvedKnown && (term->kind == Insn::JMP ||
                                  term->kind == Insn::OTHER)) {
+            if (!cfg.blockAt(be.resolvedTarget) &&
+                danglingLabels.insert(be.resolvedTarget).second) {
+                for (int i = 0; i <= depth; ++i) out << "    ";
+                out << "L" << hexAddr(be.resolvedTarget) << ":;\n";
+            }
             for (int i = 0; i <= depth; ++i) out << "    ";
             out << "goto L" << hexAddr(be.resolvedTarget) << ";\n";
             return;

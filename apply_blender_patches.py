@@ -239,6 +239,114 @@ def main():
         else:
             print('recovered_main.cpp crash handler already present')
 
+    # 8. FUN_0B0C970 aligned-free: native aborts with "Attempt to free nullptr
+    #    pointer" when handed NULL (state drift hands it 0 from FUN_0471D80's
+    #    clear loop); free(NULL) is legal, so no-op instead of fastfail.
+    for path in sorted(glob.glob(src_dir + '/recovered_*.cpp')):
+        src = load(path)
+        if 'uint64_t FUN_0000000140B0C970(' in src and 'free(nullptr): no-op' not in src:
+            src = src.replace(
+                'uint64_t FUN_0000000140B0C970(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3) {\n',
+                'uint64_t FUN_0000000140B0C970(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3) {\n'
+                '    if (arg0 == 0) return 0;  // free(nullptr): no-op (native reports "Attempt to free nullptr" and aborts)\n',
+                1)
+            save(path, src)
+            print('FUN_0B0C970 nullptr guard applied')
+            break
+    else:
+        print('FUN_0B0C970 not found')
+
+    # 9. FUN_05083D0: native is an LCG RNG (state*0x5DEECE66D+0xB & 0xFFFFFFFFFFFF
+    #    + SSE float transform).  Recovery produced garbage hashing (constant
+    #    shifted 16 bits, SSE dropped) that indexes a .rdata table with a huge
+    #    value and SIGSEGVs.  No-op (returns 0).
+    for path in sorted(glob.glob(src_dir + '/recovered_*.cpp')):
+        src = load(path)
+        if 'uint64_t FUN_00000001405083D0(' in src and 'LCG RNG' not in src:
+            i = src.find('uint64_t FUN_00000001405083D0(')
+            nl = src.find('\n', i)
+            head = src[i:nl+1]
+            src = src[:i] + ('uint64_t FUN_00000001405083D0(uint64_t arg0, uint64_t arg1, uint64_t arg2) {\n'
+                             '    (void)arg0; (void)arg1; (void)arg2;\n'
+                             '    return 0;  // native LCG RNG; recovery was garbage hashing; no-op\n')
+            save(path, src)
+            print('FUN_05083D0 no-op applied')
+            break
+    else:
+        print('FUN_05083D0 not found')
+
+    # 10. FUN_0508330: native ID-generator wrapper (call 0x508500, (eax<<16)|0x330E
+    #    with GS check).  Recovery was the same garbage hashing.  No-op.
+    for path in sorted(glob.glob(src_dir + '/recovered_*.cpp')):
+        src = load(path)
+        if 'uint64_t FUN_0000000140508330(' in src and 'ID generator wrapper' not in src:
+            i = src.find('uint64_t FUN_0000000140508330(')
+            nl = src.find('\n', i)
+            head = src[i:nl+1]
+            src = src[:i] + ('uint64_t FUN_0000000140508330(uint64_t arg0, uint64_t arg1, uint64_t arg3) {\n'
+                             '    (void)arg0; (void)arg1; (void)arg3;\n'
+                             '    return 0;  // native ID generator (call 0x508500, (eax<<16)|0x330E); recovery was garbage; no-op\n')
+            save(path, src)
+            print('FUN_0508330 no-op applied')
+            break
+    else:
+        print('FUN_0508330 not found')
+
+    # 11. FUN_041F210 allocator thunk: dispatch target returning 0 (calloc
+    #    failure path in FUN_0B0D210) made FUN_003C670's rsi null; fall back to
+    #    host allocation so callers always get a writable pointer.
+    for path in sorted(glob.glob(src_dir + '/recovered_*.cpp')):
+        src = load(path)
+        if 'uint64_t FUN_000000014041F210(' in src and 'fallback' not in src:
+            pat = re.compile(r'uint64_t FUN_000000014041F210\([^)]*\) \{(?:(?!\n\}\n).)*?\n\}\n', re.S)
+            m = pat.search(src)
+            if m:
+                new = ('uint64_t FUN_000000014041F210(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {\n'
+                       '    uint64_t rax = recovered_load<uint64_t>(5475174752);\n'
+                       '    uint64_t r = 0;\n'
+                       '    const std::uint64_t size = (a0 ? a0 : 1) + 16;  // allocator fallback (native calloc failure path returns 0)\n'
+                       '    if (rax >= 5368709120ULL && rax < 5494044672ULL)\n'
+                       '        r = recovered_dispatch(rax, a0, a1, a2, a3, 0, 0, 0, 0);\n'
+                       '    else\n'
+                       '        r = reinterpret_cast<std::uint64_t>(::operator new(size));\n'
+                       '    if (r == 0 || r < 0x10000)\n'
+                       '        r = reinterpret_cast<std::uint64_t>(::calloc(1, size));\n'
+                       '    return r;\n}\n')
+                save(path, src[:m.start()] + new + src[m.end():])
+                print('FUN_041F210 fallback applied')
+            else:
+                print('FUN_041F210 pattern not matched')
+            break
+    else:
+        print('FUN_041F210 not found')
+
+    # 12. FUN_003C670: when the object lookup fails (rsi=0) the recovery's
+    #    load(rsi+400) null-check reads mirror code bytes for low addresses and
+    #    falls through to write [rsi+42..] (crash).  Native returns without
+    #    writing; guard the strncpy write.
+    for path in sorted(glob.glob(src_dir + '/recovered_*.cpp')):
+        src = load(path)
+        if 'FUN_000000014003C670(' in src and 'lookup/allocation failed' not in src:
+            old = ('L0x14003c730:\n'
+                   '    rcx = rsi + 42;\n'
+                   '    r8 = (uint32_t)(256);\n'
+                   '    rdx = r14;\n'
+                   '    rax = FUN_0000000140386AF0(rsi + 42, r14, 256, r9);')
+            new = ('L0x14003c730:\n'
+                   '    if (rsi < 0x10000) return 0;  // lookup/allocation failed (rsi null/low): native returns without writing\n'
+                   '    rcx = rsi + 42;\n'
+                   '    r8 = (uint32_t)(256);\n'
+                   '    rdx = r14;\n'
+                   '    rax = FUN_0000000140386AF0(rsi + 42, r14, 256, r9);')
+            if old in src:
+                save(path, src.replace(old, new))
+                print('FUN_003C670 low-rsi guard applied')
+            else:
+                print('FUN_003C670 strncpy block not matched (already patched?)')
+            break
+    else:
+        print('FUN_003C670 not found')
+
     print('done')
 
 if __name__ == '__main__':

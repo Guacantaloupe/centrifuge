@@ -14,8 +14,12 @@ in ProgramAnalysis::build, so external stub special-casing is NOT applied):
    __security_check_cookie is a transparent void call.
 2. _Mtx_lock/_Mtx_unlock no-op in the single-threaded recovered runtime
    (MSVCP140 locks abort in a non-MSVC-CRT process).
+3. FUN_04E2830 (UTF-8 decode precondition check) was inferred as uint32_t but
+   returns a pointer (arg1 or the transcoded result of FUN_04E2120); the
+   uint32_t return truncates the pointer and FUN_0389480 crashes reading
+   0x46624658 == (uint32_t)r15.  Native returns RAX full width.
 """
-import glob, io, re, sys
+import glob, io, os, re, sys
 
 def load(p):
     with open(p, 'rb') as f:
@@ -61,6 +65,179 @@ def main():
                     break
         if not found:
             print(f'!! FUN_{target} not found with import body')
+
+    # 3. FUN_04E2830 must return uint64_t (pointer-returning; uint32_t truncated
+    #    the source pointer passed to FUN_0389480, crashing on 0x46624658)
+    ret_fixed = 0
+    for path in sorted(glob.glob(src_dir + '/recovered_*.cpp')):
+        src = load(path)
+        if 'uint32_t FUN_00000001404E2830(' in src:
+            src = src.replace('uint32_t FUN_00000001404E2830(',
+                              'uint64_t FUN_00000001404E2830(')
+            save(path, src)
+            ret_fixed += 1
+    hpp = sorted(glob.glob(src_dir + '/../include/recovered.hpp'))
+    if hpp:
+        src = load(hpp[0])
+        if 'uint32_t FUN_00000001404E2830(' in src:
+            src = src.replace('uint32_t FUN_00000001404E2830(',
+                              'uint64_t FUN_00000001404E2830(')
+            save(hpp[0], src)
+            ret_fixed += 1
+    print(f'FUN_04E2830 return type fixed: {ret_fixed} sites')
+
+    # 4. external_140dd1820 ... already applied above ...
+    stub_path = src_dir + '/external_stubs.cpp'
+    if os.path.exists(stub_path):
+        src = load(stub_path)
+        old = ('std::uint64_t external_140dd1820(std::uint64_t a0, std::uint64_t a1, '
+               'std::uint64_t a2, std::uint64_t a3, std::uint64_t a4, std::uint64_t a5, '
+               'std::uint64_t a6, std::uint64_t a7) {\n'
+               '    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; '
+               '(void)a6; (void)a7;\n'
+               '    return 0;\n}')  # exactly the generated plain stub
+        if old in src:
+            new = ('std::uint64_t external_140dd1820(std::uint64_t a0, std::uint64_t a1, '
+                   'std::uint64_t a2, std::uint64_t a3, std::uint64_t a4, std::uint64_t a5, '
+                   'std::uint64_t a6, std::uint64_t a7) {\n'
+                   '    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; '
+                   '(void)a6; (void)a7;\n'
+                   '    // Native: delayed-init singleton accessor returning a global\n'
+                   '    // BSS object (RVA 0x7022F08); the plain stub returned 0 and\n'
+                   '    // FUN_0458430 used 0+64 as a container pointer.  Return a\n'
+                   '    // persistent zero-initialized host buffer (mirror BSS tail may\n'
+                   '    // be uncommitted; object state must survive across calls).\n'
+                   '    static std::uint64_t singleton_obj[512] = {};\n'
+                   '    return reinterpret_cast<std::uint64_t>(singleton_obj);\n}')
+            save(stub_path, src.replace(old, new))
+            print('external_140dd1820 host-object patch applied')
+        else:
+            print('external_140dd1820 stub not plain (already patched or recovered)')
+
+    # 5. Free slot (data slot 0x146588940 -> aligned_free chain): upstream
+    #    state drift hands it pointers that were never host-allocated, so a
+    #    real free crashes RtlFreeHeap.  Leak instead of crashing.
+    if os.path.exists(stub_path):
+        src = load(stub_path)
+        old = ('external_146588940(std::uint64_t a0, std::uint64_t a1, std::uint64_t a2, '
+               'std::uint64_t a3, std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, '
+               'std::uint64_t a7) {\n'
+               '    const auto target = recovered_load<std::uint64_t>(0x146588940);\n'
+               '    if (target >= 5368709120ULL && target < 5494044672ULL)\n'
+               '        return recovered_dispatch(target, a0, a1, a2, a3, a4, a5, a6, a7);\n'
+               '    auto function = reinterpret_cast<RecoveredExternal>(target);\n'
+               '    return function ? function(recovered_external_argument(a0), '
+               'recovered_external_argument(a1), recovered_external_argument(a2), '
+               'recovered_external_argument(a3), recovered_external_argument(a4), '
+               'recovered_external_argument(a5), recovered_external_argument(a6), '
+               'recovered_external_argument(a7)) : 0;\n}')
+        if old in src:
+            new = ('external_146588940(std::uint64_t a0, std::uint64_t a1, std::uint64_t a2, '
+                   'std::uint64_t a3, std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, '
+                   'std::uint64_t a7) {\n'
+                   '    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; '
+                   '(void)a6; (void)a7;\n'
+                   '    // Free slot: leak instead of crashing on never-host-allocated '
+                   'pointers.\n'
+                   '    return 0;\n}')
+            save(stub_path, src.replace(old, new))
+            print('external_146588940 free no-op applied')
+        else:
+            print('external_146588940 stub not plain (already patched or recovered)')
+
+    # 6. FUN_0B0D4E0 alloca-style stack allocator: recovery returns the
+    #    aligned size (e.g. 0x800) instead of a writable pointer; hand back
+    #    host memory so GetModuleFileNameW's buffer is real.
+    for path in sorted(glob.glob(src_dir + '/recovered_*.cpp')):
+        src = load(path)
+        pat = re.compile(
+            r'uint64_t FUN_0000000140B0D4E0\([^)]*\) \{(?:(?!\n\}\n).)*?\n\}\n', re.S)
+        m = pat.search(src)
+        if m and 'alloca-style' not in src[m.start():m.end()]:
+            new = ('uint64_t FUN_0000000140B0D4E0(uint64_t arg0, uint64_t arg1, '
+                   'uint64_t arg2, uint64_t arg3) {\n'
+                   '    (void)arg1; (void)arg2; (void)arg3;\n'
+                   '    // Native: alloca-style stack allocator (alignment computation '
+                   '+ stack\n'
+                   '    // bump returning a stack pointer).  Recovery lost the '
+                   'stack-pointer return\n'
+                   '    // (returned the aligned size, e.g. 0x800, not writable).  '
+                   'Return host memory.\n'
+                   '    return reinterpret_cast<std::uint64_t>(::operator '
+                   'new(arg0 ? arg0 : 1));\n}\n')
+            save(path, src[:m.start()] + new + src[m.end():])
+            print(f'FUN_0B0D4E0 alloca host-ized in {path}')
+            break
+    else:
+        print('FUN_0B0D4E0 not found')
+
+    # 7. recovered_main.cpp: vectored crash handler writing crash_report.txt
+    #    (fast crash diagnostics without gdb, which is unusably slow here).
+    main_path = src_dir + '/recovered_main.cpp'
+    if os.path.exists(main_path):
+        src = load(main_path)
+        if 'recovered_crash_handler' not in src:
+            guard = ('#ifdef _WIN32\n#include <windows.h>\n#endif\n'
+                     'int main(int argc, char** argv) {')
+            if guard in src:
+                new = ('#ifdef _WIN32\n#include <windows.h>\n#include <dbghelp.h>\n'
+                       'static LONG WINAPI recovered_crash_handler(EXCEPTION_POINTERS* ep) {\n'
+                       '    if (ep->ExceptionRecord->ExceptionCode != '
+                       'EXCEPTION_ACCESS_VIOLATION &&\n'
+                       '        ep->ExceptionRecord->ExceptionCode != '
+                       'EXCEPTION_STACK_OVERFLOW &&\n'
+                       '        ep->ExceptionRecord->ExceptionCode != 0xC0000409)\n'
+                       '        return EXCEPTION_CONTINUE_SEARCH;\n'
+                       '    HANDLE hf = CreateFileA("crash_report.txt", GENERIC_WRITE, '
+                       'FILE_SHARE_READ,\n'
+                       '        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);\n'
+                       '    if (hf != INVALID_HANDLE_VALUE) {\n'
+                       '        DWORD wrote = 0;\n'
+                       '        SetFilePointer(hf, 0, nullptr, FILE_END);\n'
+                       '        char buf[512];\n'
+                       '        int bl = std::snprintf(buf, sizeof(buf),\n'
+                       '            "CRASH code=%08lx rip=%p rax=%p rcx=%p rdx=%p rbx=%p '
+                       'rsi=%p rdi=%p r8=%p r9=%p r12=%p r13=%p r14=%p r15=%p\\n",\n'
+                       '            (unsigned long)ep->ExceptionRecord->ExceptionCode,\n'
+                       '            (void*)ep->ContextRecord->Rip, (void*)ep->ContextRecord->Rax,\n'
+                       '            (void*)ep->ContextRecord->Rcx, (void*)ep->ContextRecord->Rdx,\n'
+                       '            (void*)ep->ContextRecord->Rbx, (void*)ep->ContextRecord->Rsi,\n'
+                       '            (void*)ep->ContextRecord->Rdi, (void*)ep->ContextRecord->R8,\n'
+                       '            (void*)ep->ContextRecord->R9, (void*)ep->ContextRecord->R12,\n'
+                       '            (void*)ep->ContextRecord->R13, (void*)ep->ContextRecord->R14,\n'
+                       '            (void*)ep->ContextRecord->R15);\n'
+                       '        if (bl > 0) WriteFile(hf, buf, (DWORD)bl, &wrote, nullptr);\n'
+                       '        const std::uintptr_t crsp = '
+                       'reinterpret_cast<std::uintptr_t>(ep->ContextRecord->Rsp);\n'
+                       '        HMODULE exe = GetModuleHandleA(nullptr);\n'
+                       '        const std::uintptr_t exeb = '
+                       'reinterpret_cast<std::uintptr_t>(exe);\n'
+                       '        for (int i = 0; i < 16; ++i) {\n'
+                       '            std::uintptr_t v = 0; SIZE_T got = 0;\n'
+                       '            if (ReadProcessMemory(GetCurrentProcess(), '
+                       'reinterpret_cast<void*>(crsp + i*8), &v, 8, &got) && got == 8) {\n'
+                       '                char fb[96];\n'
+                       '                int fl = std::snprintf(fb, sizeof(fb),\n'
+                       '                    "  stack[%d] = %p (exe off 0x%llx)\\n", i, '
+                       '(void*)v, (unsigned long long)(v - exeb));\n'
+                       '                if (fl > 0) WriteFile(hf, fb, (DWORD)fl, &wrote, nullptr);\n'
+                       '            }\n'
+                       '        }\n'
+                       '        CloseHandle(hf);\n'
+                       '    }\n'
+                       '    return EXCEPTION_EXECUTE_HANDLER;\n'
+                       '}\n#endif\n'
+                       'int main(int argc, char** argv) {\n'
+                       '#ifdef _WIN32\n'
+                       '    AddVectoredExceptionHandler(1, recovered_crash_handler);\n'
+                       '    SetUnhandledExceptionFilter(recovered_crash_handler);\n'
+                       '#endif')
+                save(main_path, src.replace(guard, new))
+                print('recovered_main.cpp crash handler installed')
+            else:
+                print('recovered_main.cpp guard not found')
+        else:
+            print('recovered_main.cpp crash handler already present')
 
     print('done')
 

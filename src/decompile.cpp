@@ -3447,6 +3447,20 @@ std::string decompileTyped(
     const std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
                                        architecture, useRecoveredRuntime,
                                        stackModel, globals);
+    // A data-slot trampoline (indirect tail call) forwards the callee's
+    // return value through rax, so it must never decompile to void: the
+    // typed wrapper's void-return rewrite would turn the dispatch into a
+    // bare statement and the recovered dispatch case would return 0,
+    // breaking allocator jump boards (callers observe NULL and memset(0)
+    // crashes downstream).  Promote the signature to a 64-bit value return
+    // when the body carries a tail-call dispatch.
+    FunctionSignature effectiveSignature = signature;
+    if (effectiveSignature.returnType.kind == TypeKind::VOID_TYPE &&
+        (body.find("return recovered_dispatch(") != std::string::npos ||
+         body.find("return ((uint64_t (*)(...))(uintptr_t)") !=
+             std::string::npos))
+        effectiveSignature.returnType =
+            DataType{TypeKind::UNSIGNED_INT, 64, 1};
     std::set<std::string> locals;
     std::map<std::string, std::vector<std::string>> typedLocals;
     if (stackModel) {
@@ -3482,7 +3496,7 @@ std::string decompileTyped(
         if (!promoted) locals.insert(name);
         at = finish;
     }
-    for (const FunctionParameter& parameter : signature.parameters)
+    for (const FunctionParameter& parameter : effectiveSignature.parameters)
         if (parameter.onStack && !useRecoveredRuntime)
             locals.insert(localName(parameter.stackOffset));
     auto identifierUsed = [&](const std::string& identifier) {
@@ -3500,17 +3514,17 @@ std::string decompileTyped(
         return false;
     };
     std::ostringstream out;
-    out << signature.declaration(functionName) << " {\n";
+    out << effectiveSignature.declaration(functionName) << " {\n";
     {
         const int registerCount = architecture.rfind("x86", 0) == 0 ? 16 : 32;
         std::vector<std::string> usedRegisters;
         for (int index = 0; index < registerCount; ++index) {
             const std::string name = registerName(architecture, index * 8);
             bool parameterRegister = false;
-            for (const FunctionParameter& parameter : signature.parameters)
+            for (const FunctionParameter& parameter : effectiveSignature.parameters)
                 parameterRegister |= parameter.registerOffset ==
                                      static_cast<uint64_t>(index * 8);
-            if (signature.returnComponents.size() > 1)
+            if (effectiveSignature.returnComponents.size() > 1)
                 parameterRegister |= secondaryReturnRegisterOffset(architecture) ==
                                      static_cast<uint64_t>(index * 8);
             if (name != "zero" && (identifierUsed(name) || parameterRegister))
@@ -3591,7 +3605,7 @@ std::string decompileTyped(
             if (identifierUsed("gsbase"))
                 out << "    gsbase = recovered_gs_base();\n";
         }
-        for (const FunctionParameter& parameter : signature.parameters) {
+        for (const FunctionParameter& parameter : effectiveSignature.parameters) {
             if (parameter.onStack) continue;
             const std::string name = registerName(architecture,
                                                   parameter.registerOffset);
@@ -3611,7 +3625,7 @@ std::string decompileTyped(
             for (const std::string& name : kv.second)
                 out << "    " << kv.first << " " << name << " = 0;\n";
     }
-    for (const FunctionParameter& parameter : signature.parameters)
+    for (const FunctionParameter& parameter : effectiveSignature.parameters)
         if (parameter.onStack) {
             if (useRecoveredRuntime)
                 out << "    recovered_store<std::uint64_t>(rsp + "
@@ -3628,41 +3642,41 @@ std::string decompileTyped(
         const size_t first = line.find_first_not_of(' ');
         const std::string machineReturn = "return " +
             registerName(architecture, returnRegisterOffset(architecture)) + ";";
-        if (signature.returnType.kind == TypeKind::VOID_TYPE &&
+        if (effectiveSignature.returnType.kind == TypeKind::VOID_TYPE &&
             first != std::string::npos && line.substr(first) == machineReturn)
             line = line.substr(0, first) + "return;";
-        else if (signature.returnType.kind == TypeKind::VOID_TYPE &&
+        else if (effectiveSignature.returnType.kind == TypeKind::VOID_TYPE &&
                  first != std::string::npos &&
                  line.compare(first, 7, "return ") == 0) {
             const std::string indentation = line.substr(0, first);
             line = indentation + line.substr(first + 7) + "\n" +
                    indentation + "return;";
         }
-        else if (signature.returnType.kind == TypeKind::POINTER &&
+        else if (effectiveSignature.returnType.kind == TypeKind::POINTER &&
                  first != std::string::npos && line.substr(first) == machineReturn)
             line = line.substr(0, first) + "return (void *)(uintptr_t)" +
                    registerName(architecture,
                                 returnRegisterOffset(architecture)) + ";";
-        else if (signature.returnComponents.size() > 1 &&
-                 signature.returnType.kind == TypeKind::STRUCT &&
-                 signature.returnType.detail &&
+        else if (effectiveSignature.returnComponents.size() > 1 &&
+                 effectiveSignature.returnType.kind == TypeKind::STRUCT &&
+                 effectiveSignature.returnType.detail &&
                  first != std::string::npos && line.substr(first) == machineReturn)
             line = line.substr(0, first) + "return (struct " +
-                   signature.returnType.detail->name + "){ " +
+                   effectiveSignature.returnType.detail->name + "){ " +
                    registerName(architecture, returnRegisterOffset(architecture)) +
                    ", " + registerName(architecture,
                                         secondaryReturnRegisterOffset(architecture)) +
                    " };";
         out << line << "\n";
     }
-    if (signature.returnType.kind == TypeKind::VOID_TYPE)
+    if (effectiveSignature.returnType.kind == TypeKind::VOID_TYPE)
         out << "    return;\n";
-    else if (signature.returnType.kind == TypeKind::FLOAT)
+    else if (effectiveSignature.returnType.kind == TypeKind::FLOAT)
         out << "    return 0.0;\n";
-    else if ((signature.returnType.kind == TypeKind::STRUCT ||
-              signature.returnType.kind == TypeKind::UNION) &&
-             signature.returnType.detail)
-        out << "    return (" << signature.returnType.name() << "){0};\n";
+    else if ((effectiveSignature.returnType.kind == TypeKind::STRUCT ||
+              effectiveSignature.returnType.kind == TypeKind::UNION) &&
+             effectiveSignature.returnType.detail)
+        out << "    return (" << effectiveSignature.returnType.name() << "){0};\n";
     else
         out << "    return 0;\n";
     out << "}\n";

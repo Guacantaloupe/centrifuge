@@ -5,7 +5,7 @@ from collections import Counter
 
 BIN = sys.argv[1]
 SPEC = "sleigh/x86-64.slaspec"
-GHR = "./build/centrifuge.exe"
+GHR = os.environ.get("CENTRIFUGE", "./build/centrifuge.exe")
 
 r = subprocess.run(["objdump", "-d", BIN], capture_output=True, text=True, errors='replace')
 lines = r.stdout.splitlines()

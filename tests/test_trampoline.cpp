@@ -67,6 +67,7 @@ int main(int argc, char** argv) {
     }
 
     const std::string architecture = "x86-64-win64";
+    const uint64_t win64ArgRegisters[] = {8, 16, 64, 72}; // rcx rdx r8 r9
 
     {
         // Recovered runtime: dispatch through the loaded slot value.
@@ -123,6 +124,43 @@ int main(int argc, char** argv) {
         std::printf("--- bare jmp ---\n%s\n", output.c_str());
         CHECK(output.find("recovered_dispatch") == std::string::npos,
               "bare jmp: no fabricated dispatch");
+    }
+
+    {
+        // A data-slot trampoline whose inferred signature is void must be
+        // promoted to a value-returning function: the tail-call dispatch
+        // forwards the callee's return value (rax), and dropping it turns
+        // allocator jump boards into "return 0" stubs (downstream memset(0)
+        // crashes).  The typed wrapper must keep `return recovered_dispatch`
+        // instead of rewriting it into a bare statement + return.
+        Image img;
+        std::memcpy(img.bytes.data(), trampoline().data(),
+                    trampoline().size());
+        auto read = [&](uint64_t a, void* b, size_t n) {
+            return img.read(a, b, n);
+        };
+        FunctionSignature voidSignature;
+        voidSignature.returnType = DataType{TypeKind::VOID_TYPE, 0, 1};
+        for (int i = 0; i < 4; ++i) {
+            FunctionParameter parameter;
+            parameter.name = "param" + std::to_string(i + 1);
+            parameter.type = DataType{TypeKind::UNSIGNED_INT, 64, 1};
+            parameter.registerOffset = win64ArgRegisters[i];
+            voidSignature.parameters.push_back(parameter);
+        }
+        const std::string typed = decompileTyped(
+            eng, read, 0x1000, 0x1100, architecture, "FUN_0000000140000000",
+            voidSignature,
+            [](uint64_t) { return std::string(); }, nullptr,
+            /*useRecoveredRuntime=*/true);
+        std::printf("--- typed void-signature trampoline ---\n%s\n",
+                    typed.c_str());
+        CHECK(typed.find("uint64_t FUN_0000000140000000(") !=
+                  std::string::npos,
+              "void trampoline: return type promoted to uint64_t");
+        CHECK(typed.find("return recovered_dispatch(rax, rcx, rdx, r8, "
+                          "r9, 0, 0, 0, 0);") != std::string::npos,
+              "void trampoline: dispatch kept as return (value forwarded)");
     }
 
     if (failures == 0) {

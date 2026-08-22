@@ -62,7 +62,7 @@ define register offset=8 size=8 [ rcx ];
 define register offset=8 size=4 [ ecx ];
 token t8 (1) { op = (7:0); }
 :mixed is op=1 { p = rcx + 248; wide = load(p, 8); narrow = ecx + 1; rax = wide + narrow; return; };
-:narrow_read is op=2 { value = al & al; rcx = zext(value); return; };
+:narrow_read is op=2 { value = al & al; rax = zext(value); return; };
 :write_al is op=3 { al = 0x12; return; };
 :write_ah is op=4 { ah = 0x34; return; };
 :write_eax is op=5 { eax = 0xffffffff; return; };

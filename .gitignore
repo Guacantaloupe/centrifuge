@@ -5,3 +5,4 @@ corpus/
 krita-dl/
 crash_report.txt
 crash_report.json
+*.log

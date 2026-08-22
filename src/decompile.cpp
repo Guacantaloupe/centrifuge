@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <regex>
 #include <set>
 #include <sstream>
 
@@ -2652,7 +2653,7 @@ std::string decompile(
 
     std::set<uint64_t> labeled;
     for (const auto& b : cfg.blocks())
-        if (b.start != start) labeled.insert(b.start); // all goto targets
+        labeled.insert(b.start); // incl. start: loops jump back to the header
 
     // Phase 10g: collect x86 flag registers (r4096..r4101) that are read
     // anywhere in the function, so dead flag writes can be dropped.
@@ -2918,13 +2919,13 @@ std::string decompile(
         emitted.insert(a);
         const CfgBlock* b = cfg.blockAt(a);
         if (!b) {
-            if (labeled.count(a) && a != start) {
+            if (labeled.count(a)) {
                 for (int i = 0; i < depth; ++i) out << "    ";
                 out << "L" << hexAddr(a) << ":;\n";
             }
             return;
         }
-        if (labeled.count(a) && a != start) {
+        if (labeled.count(a)) {
             for (int i = 0; i < depth; ++i) out << "    ";
             out << "L" << hexAddr(a) << ":\n";
         }
@@ -3481,6 +3482,32 @@ te.pushSlots = &pushSlots;
     // path), so every label is defined
     for (const auto& b : cfg.blocks())
         if (!emitted.count(b.start)) emitBlock(b.start, 0);
+    // Safety net: when function-boundary analysis merges blocks from an
+    // adjacent function into this CFG, a branch can reference a label that
+    // never got emitted (the block sits before `start` or was pruned).
+    // Undefined labels break compilation, so append a dangling definition
+    // for every referenced-but-missing label.
+    {
+        const std::string text = out.str();
+        std::set<uint64_t> referenced, defined;
+        const std::regex gotoPattern(
+            R"(goto L(0x[0-9a-fA-F]+);)");
+        const std::regex labelPattern(R"(L(0x[0-9a-fA-F]+):)");
+        for (std::sregex_iterator it(text.begin(), text.end(), gotoPattern),
+             end;
+             it != end; ++it)
+            referenced.insert(
+                static_cast<uint64_t>(std::stoull((*it)[1].str(), nullptr, 16)));
+        for (std::sregex_iterator it(text.begin(), text.end(), labelPattern),
+             end;
+             it != end; ++it)
+            defined.insert(
+                static_cast<uint64_t>(std::stoull((*it)[1].str(), nullptr, 16)));
+        for (uint64_t missing : referenced) {
+            if (defined.count(missing)) continue;
+            out << "L" << hexAddr(missing) << ":;\n";
+        }
+    }
     return out.str();
 }
 

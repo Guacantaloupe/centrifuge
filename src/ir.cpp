@@ -1502,6 +1502,78 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
     if (program.tls)
         for (uint64_t callback : program.tls->callbacks)
             queueFunction(ensureDiscovered(callback));
+    auto isPrologueLike = [&](uint64_t address) {
+        uint8_t b[8] = {0};
+        for (size_t n = 0; n < sizeof(b); ++n)
+            if (!read(address + n, &b[n], 1)) return false;
+        if (b[0] >= 0x50 && b[0] <= 0x57) return true;
+        if ((b[0] == 0x40 || b[0] == 0x41 || b[0] == 0x44 ||
+             b[0] == 0x45) &&
+            b[1] >= 0x50 && b[1] <= 0x57)
+            return true;
+        if (b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC) return true;
+        if (b[0] == 0x48 && b[1] == 0x81 && b[2] == 0xEC) return true;
+        if (b[0] == 0x48 && b[1] == 0x89 && b[2] == 0x5C &&
+            b[3] == 0x24)
+            return true;
+        if ((b[0] == 0x0F && b[1] == 0x29) ||
+            (b[0] == 0x66 && b[1] == 0x0F && b[2] == 0x29))
+            return true;
+        return false;
+    };
+    // Allocator-table initializers write function addresses into data slots
+    // via `lea rax,[addr]; mov [slot],rax`; the slot bytes are uninitialized
+    // garbage, so no data pointer references the target and the pointer scan
+    // below never promotes it.  Scanning each queued function's first
+    // instructions for rip-relative lea targets promotes prologue-like ones
+    // so allocator chains stay inside the bounded selection (dispatch of the
+    // slot value then hits instead of returning 0 and crashing memsets).
+    auto scanLeaTargets = [&](const Function* queuedFunction) {
+        uint64_t cur = queuedFunction->addr;
+        unsigned scannedInsns = 0;
+        std::set<uint64_t> visited;
+        while (scannedInsns++ < 16 && program.memory.isExecutable(cur)) {
+            if (!visited.insert(cur).second) break;
+            Insn insn;
+            if (!disassembler.disasmOne(program.memory, cur, insn)) break;
+            const std::vector<uint8_t>& raw = insn.bytes;
+            for (size_t i = 0; i + 7 <= raw.size(); ++i) {
+                if (raw[i] != 0x48 || raw[i + 1] != 0x8D) continue;
+                const uint8_t modrm = raw[i + 2];
+                if ((modrm & 0xC7) != 0x05) continue;
+                int32_t disp = 0;
+                std::memcpy(&disp, &raw[i + 3], 4);
+                const uint64_t target =
+                    cur + i + 7 + static_cast<uint64_t>(disp);
+                if (!executable(target)) continue;
+                if (queued.count(target)) continue;
+                if (!isPrologueLike(target)) continue;
+                queueFunction(ensureDiscovered(target));
+            }
+            if (insn.kind == Insn::RET) break;
+            if (insn.kind == Insn::JMP && insn.targetKnown &&
+                executable(insn.target)) {
+                cur = insn.target;
+            } else {
+                cur += insn.size;
+            }
+        }
+    };
+    // .pdata (unwind) entries are authoritative compiler-generated function
+    // boundaries.  Allocator/CRT helpers (e.g. Blender's 0x140B0xxxx operator
+    // new chain) usually appear here with no .data/.rdata pointer to them, so
+    // the data-slot scan below never promotes them and a bounded selection
+    // drops them - then dispatch of the allocator-table slot values misses
+    // and returns 0, crashing downstream memsets.  Queue unwind-discovered
+    // functions before the ordinary closure so bounded runs keep them.
+    if (bounded) {
+        for (const Function& function : discovered) {
+            if (function.src != Function::UNWIND) continue;
+            if (selected.size() >= maximumFunctions) break;
+            queueFunction(&function);
+            scanLeaTargets(&function);
+        }
+    }
     // Stripped PE images routinely call through global function-pointer slots
     // (call qword ptr [.data+0x...]).  Those indirect targets are invisible to
     // the direct-call closure but frequently sit on the startup path
@@ -1512,25 +1584,6 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
     // (Unbounded analyses already include every discovered function, so the
     // extra scan is only meaningful when the selection is bounded.)
     if (bounded) {
-        auto isPrologueLike = [&](uint64_t address) {
-            uint8_t b[8] = {0};
-            for (size_t n = 0; n < sizeof(b); ++n)
-                if (!read(address + n, &b[n], 1)) return false;
-            if (b[0] >= 0x50 && b[0] <= 0x57) return true;
-            if ((b[0] == 0x40 || b[0] == 0x41 || b[0] == 0x44 ||
-                 b[0] == 0x45) &&
-                b[1] >= 0x50 && b[1] <= 0x57)
-                return true;
-            if (b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC) return true;
-            if (b[0] == 0x48 && b[1] == 0x81 && b[2] == 0xEC) return true;
-            if (b[0] == 0x48 && b[1] == 0x89 && b[2] == 0x5C &&
-                b[3] == 0x24)
-                return true;
-            if ((b[0] == 0x0F && b[1] == 0x29) ||
-                (b[0] == 0x66 && b[1] == 0x0F && b[2] == 0x29))
-                return true;
-            return false;
-        };
         const size_t promotedRootLimit =
             bounded ? std::max<size_t>(1, maximumFunctions / 10)
                     : std::numeric_limits<size_t>::max();

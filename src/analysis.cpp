@@ -1,9 +1,10 @@
-// centrifuge - a Ghidra reimplementation in C++17
+﻿// centrifuge - a Ghidra reimplementation in C++17
 // analysis.cpp - function discovery
 #include "centrifuge/analysis.hpp"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <set>
 
@@ -176,31 +177,31 @@ std::vector<Function> findFunctions(const Program& prog, Disassembler* disasm) {
     // targets.  Any 8-byte-aligned data value that lands on executable
     // memory and looks like a function prologue is promoted to a
     // SCAN function so the indirect callee is recovered too.
+    auto isPrologue = [&](uint64_t address) {
+        uint8_t b[8] = {0};
+        for (size_t n = 0; n < sizeof(b); ++n)
+            if (!prog.memory.read(address + n, &b[n], 1)) return false;
+        // push r64 (single byte 0x50-0x57, REX.W 40/41 + 0x50-0x57)
+        if (b[0] >= 0x50 && b[0] <= 0x57) return true;
+        if ((b[0] == 0x40 || b[0] == 0x41 || b[0] == 0x44 ||
+             b[0] == 0x45) &&
+            b[1] >= 0x50 && b[1] <= 0x57)
+            return true;
+        // sub rsp, imm8/imm32
+        if (b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC) return true;
+        if (b[0] == 0x48 && b[1] == 0x81 && b[2] == 0xEC) return true;
+        // mov [rsp+disp8], reg (frame setup)
+        if (b[0] == 0x48 && b[1] == 0x89 && b[2] == 0x5C &&
+            b[3] == 0x24)
+            return true;
+        // movaps/movdqa store to stack, common in large frames
+        if ((b[0] == 0x0F && b[1] == 0x29) ||
+            (b[0] == 0x66 && b[1] == 0x0F && b[2] == 0x29))
+            return true;
+        return false;
+    };
     {
         const auto& blocks = prog.memory.blocks();
-        auto isPrologue = [&](uint64_t address) {
-            uint8_t b[8] = {0};
-            for (size_t n = 0; n < sizeof(b); ++n)
-                if (!prog.memory.read(address + n, &b[n], 1)) return false;
-            // push r64 (single byte 0x50-0x57, REX.W 40/41 + 0x50-0x57)
-            if (b[0] >= 0x50 && b[0] <= 0x57) return true;
-            if ((b[0] == 0x40 || b[0] == 0x41 || b[0] == 0x44 ||
-                 b[0] == 0x45) &&
-                b[1] >= 0x50 && b[1] <= 0x57)
-                return true;
-            // sub rsp, imm8/imm32
-            if (b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC) return true;
-            if (b[0] == 0x48 && b[1] == 0x81 && b[2] == 0xEC) return true;
-            // mov [rsp+disp8], reg (frame setup)
-            if (b[0] == 0x48 && b[1] == 0x89 && b[2] == 0x5C &&
-                b[3] == 0x24)
-                return true;
-            // movaps/movdqa store to stack, common in large frames
-            if ((b[0] == 0x0F && b[1] == 0x29) ||
-                (b[0] == 0x66 && b[1] == 0x0F && b[2] == 0x29))
-                return true;
-            return false;
-        };
         std::vector<uint64_t> promoted;
         for (const MemoryBlock& block : blocks) {
             if (block.perm & static_cast<int>(Perm::X)) continue;

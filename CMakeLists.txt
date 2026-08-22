@@ -137,6 +137,9 @@ target_link_libraries(test_global_recovery PRIVATE centrifuge_core)
 add_executable(test_control_flow tests/test_control_flow.cpp)
 target_link_libraries(test_control_flow PRIVATE centrifuge_core)
 
+add_executable(test_trampoline tests/test_trampoline.cpp)
+target_link_libraries(test_trampoline PRIVATE centrifuge_core)
+
 if(CENTRIFUGE_BUILD_FUZZERS)
   add_executable(fuzz_loader fuzz/loader_fuzz.cpp)
   target_link_libraries(fuzz_loader PRIVATE centrifuge_core)
@@ -198,6 +201,13 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/sleigh/riscv64.slaspec"
   )
   set_tests_properties(control_flow PROPERTIES LABELS "unit;riscv")
+
+  add_test(
+    NAME trampoline
+    COMMAND test_trampoline
+            "${CMAKE_CURRENT_SOURCE_DIR}/sleigh/x86-64.slaspec"
+  )
+  set_tests_properties(trampoline PROPERTIES LABELS "unit;x86")
 
   add_test(
     NAME loader_malformed

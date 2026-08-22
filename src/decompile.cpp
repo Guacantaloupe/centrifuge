@@ -3338,6 +3338,80 @@ te.pushSlots = &pushSlots;
             out << "goto L" << hexAddr(be.resolvedTarget) << ";\n";
             return;
         }
+        // Indirect-jump trampoline: `mov reg, [rip+slot]; jmp *reg` (a
+        // data-slot jump board, common in recovered CRT/allocator thunks).
+        // The target is a runtime memory load, so it cannot be resolved
+        // statically - but the jump itself is a tail call.  Previously the
+        // BRANCHIND op was silently skipped and the function decompiled to
+        // a void body with a dead load, dropping the dispatch.  Emit a
+        // dispatch through the register holding the loaded value and
+        // forward the live ABI argument registers (native thunks forward
+        // the caller's registers untouched).
+        if ((term->kind == Insn::JMP || term->kind == Insn::OTHER) &&
+            !term->targetKnown && !be.resolvedKnown) {
+            std::string targetRegister;
+            for (const auto& op : term->ops) {
+                if (op.op != POp::BRANCHIND && op.op != POp::BRANCH)
+                    continue;
+                uint64_t storage = 0;
+                const Varnode* v = term->find(op.in0);
+                if (!v) continue;
+                if (v->kind == Varnode::REGISTER) {
+                    storage = registerStorageOffset(architecture, v->offset,
+                                                    v->size);
+                } else if (v->kind == Varnode::UNIQUE) {
+                    // Trace a temp back through a defining COPY to the
+                    // register that carries the loaded value.
+                    for (const auto& defining : term->ops) {
+                        if (defining.out != v->id ||
+                            defining.op != POp::COPY)
+                            continue;
+                        const Varnode* source = term->find(defining.in0);
+                        if (source && source->kind == Varnode::REGISTER) {
+                            storage = registerStorageOffset(
+                                architecture, source->offset, source->size);
+                        }
+                        break;
+                    }
+                }
+                // Only a jump whose target register was written in this
+                // block is a recognizable trampoline; a jump on an unknown
+                // incoming value (e.g. a switch dispatch) stays a plain
+                // fallthrough/return.
+                if (be.regExpr.find(storage) == be.regExpr.end()) continue;
+                targetRegister = registerName(architecture, storage, 8);
+                break;
+            }
+            if (!targetRegister.empty()) {
+                std::string args;
+                const std::vector<uint64_t> abi =
+                    defaultArgumentRegisters(architecture);
+                const size_t argumentCount =
+                    useRecoveredRuntime ? 8 : abi.size();
+                for (size_t i = 0; i < argumentCount; ++i) {
+                    std::string text = "0";
+                    if (i < abi.size()) {
+                        const uint64_t offset = abi[i];
+                        const uint64_t argStorage = registerStorageOffset(
+                            architecture, offset, 8);
+                        text = registerName(architecture, offset);
+                        const auto definition = be.regExpr.find(argStorage);
+                        if (definition != be.regExpr.end() &&
+                            inlineableExpression(definition->second))
+                            text = stripParens(definition->second.text);
+                    }
+                    args += (i ? ", " : "") + text;
+                }
+                for (int i = 0; i <= depth; ++i) out << "    ";
+                if (useRecoveredRuntime)
+                    out << "return recovered_dispatch(" << targetRegister
+                        << ", " << args << ");\n";
+                else
+                    out << "return ((uint64_t (*)(...))(uintptr_t)"
+                        << targetRegister << ")(" << args << ");\n";
+                return;
+            }
+        }
         if (!b->succs.empty()) emitBlock(b->succs[0], depth);
     };
 

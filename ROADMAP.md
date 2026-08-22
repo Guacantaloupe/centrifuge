@@ -170,3 +170,19 @@ recovered project) remains untouched.
   the simulated frame).  Prologue of 0x140001030: 16 lines -> 8 `saved_mX` lines;
   epilogue pops collapse to plain register restores.  Conservative fallback for
   slots with multiple readers/writers (e.g. mid-function frames).
+
+- 10i done (indirect-jump trampoline recognition): a block ending in an
+  unresolved indirect jump (BRANCHIND) whose target register was written in
+  the same block (the data-slot jump-board pattern `mov reg,[rip+slot];
+  jmp *reg`) is a tail call, not a fallthrough.  The terminator was
+  previously dropped and the function decompiled to a void body with a dead
+  load, losing the dispatch (Blender allocator/CRT thunks; thunk_fix.py
+  patched the output afterwards).  Now emits
+  `return recovered_dispatch(rax, rcx, rdx, r8, r9, 0, 0, 0, 0);` in
+  recovered-runtime mode and `return ((uint64_t (*)(...))(uintptr_t)rax)
+  (rcx, rdx, r8, r9);` in native view, forwarding the live ABI argument
+  registers (native thunks forward the caller's registers untouched).
+  A jump on an unknown incoming register (e.g. switch dispatch) stays
+  untouched.  Verified on real Blender 5.2 jump boards (0x14041F200/210/
+  230): recovered-runtime emits the dispatch, native view compiles clean
+  with g++ -O2 -Wall.  Test: tests/test_trampoline.cpp.

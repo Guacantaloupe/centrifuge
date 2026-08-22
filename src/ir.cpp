@@ -1528,7 +1528,8 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
     // instructions for rip-relative lea targets promotes prologue-like ones
     // so allocator chains stay inside the bounded selection (dispatch of the
     // slot value then hits instead of returning 0 and crashing memsets).
-    auto scanLeaTargets = [&](const Function* queuedFunction) {
+    auto scanLeaTargets = [&](const Function* queuedFunction,
+                              size_t insertAt) {
         uint64_t cur = queuedFunction->addr;
         unsigned scannedInsns = 0;
         std::set<uint64_t> visited;
@@ -1548,7 +1549,20 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                 if (!executable(target)) continue;
                 if (queued.count(target)) continue;
                 if (!isPrologueLike(target)) continue;
-                queueFunction(ensureDiscovered(target));
+                const Function* promoted = ensureDiscovered(target);
+                if (!promoted) continue;
+                queued.insert(target);
+                if (insertAt != static_cast<size_t>(-1)) {
+                    // Insert right after the current analysis slot so the
+                    // allocator target is analyzed in this bounded run;
+                    // pop the tail (a low-priority unwind helper) to stay
+                    // within maximumFunctions.
+                    selected.insert(selected.begin() + insertAt, promoted);
+                    if (selected.size() > maximumFunctions)
+                        selected.pop_back();
+                } else {
+                    selected.push_back(promoted);
+                }
             }
             if (insn.kind == Insn::RET) break;
             if (insn.kind == Insn::JMP && insn.targetKnown &&
@@ -1571,7 +1585,7 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
             if (function.src != Function::UNWIND) continue;
             if (selected.size() >= maximumFunctions) break;
             queueFunction(&function);
-            scanLeaTargets(&function);
+            scanLeaTargets(&function, static_cast<size_t>(-1));
         }
     }
     // Stripped PE images routinely call through global function-pointer slots
@@ -1683,6 +1697,12 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
             std::fflush(stderr);
         }
         const Function* selectedFunction = selected[selectedIndex];
+        // Allocator-table lea promotion for every analyzed function (not just
+        // unwind roots): initializers like FUN_14041F270 are SCAN-discovered
+        // and write allocator addresses into data slots via lea+store; the
+        // promoted targets are inserted right after this slot so they are
+        // analyzed in the same bounded run.
+        scanLeaTargets(selectedFunction, selectedIndex + 1);
         const Function& function = *selectedFunction;
         const auto functionStarted = std::chrono::steady_clock::now();
         if (reportProgress) {
@@ -1775,12 +1795,16 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                 const Function* target = ensureDiscovered(callee);
                 if (!target || functions_.count(target->addr)) continue;
                 if (!queued.insert(target->addr).second) continue;
-                if (previouslyDiscovered)
+                if (previouslyDiscovered && !bounded)
                     selected.push_back(target);
-                else
-                    selected.insert(selected.begin() +
-                                        static_cast<std::ptrdiff_t>(insertion++),
-                                    target);
+                else {
+                    selected.insert(
+                        selected.begin() +
+                            static_cast<std::ptrdiff_t>(insertion++),
+                        target);
+                    if (bounded && selected.size() > maximumFunctions)
+                        selected.pop_back();
+                }
             }
             functions_.emplace(function.addr, std::move(analyzed));
             if (reportProgress) {
@@ -2171,12 +2195,16 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                 const Function* target = ensureDiscovered(callee);
                 if (!target || functions_.count(target->addr)) continue;
                 if (!queued.insert(target->addr).second) continue;
-                if (previouslyDiscovered)
+                if (previouslyDiscovered && !bounded)
                     selected.push_back(target);
-                else
-                    selected.insert(selected.begin() +
-                                        static_cast<std::ptrdiff_t>(insertion++),
-                                    target);
+                else {
+                    selected.insert(
+                        selected.begin() +
+                            static_cast<std::ptrdiff_t>(insertion++),
+                        target);
+                    if (bounded && selected.size() > maximumFunctions)
+                        selected.pop_back();
+                }
             }
         }
         // MSVC's _initterm/_initterm_e receive half-open arrays of function

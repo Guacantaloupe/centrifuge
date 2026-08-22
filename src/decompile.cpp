@@ -3350,26 +3350,74 @@ te.pushSlots = &pushSlots;
         if ((term->kind == Insn::JMP || term->kind == Insn::OTHER) &&
             !term->targetKnown && !be.resolvedKnown) {
             std::string targetRegister;
+            std::optional<std::string> memoryTarget;
             for (const auto& op : term->ops) {
                 if (op.op != POp::BRANCHIND && op.op != POp::BRANCH)
                     continue;
                 uint64_t storage = 0;
+                bool storageValid = false;
                 const Varnode* v = term->find(op.in0);
                 if (!v) continue;
                 if (v->kind == Varnode::REGISTER) {
                     storage = registerStorageOffset(architecture, v->offset,
                                                     v->size);
+                    storageValid = true;
                 } else if (v->kind == Varnode::UNIQUE) {
-                    // Trace a temp back through a defining COPY to the
-                    // register that carries the loaded value.
+                    // Trace a temp back to its defining op: a COPY carries
+                    // a register value (`mov reg,[slot]; jmp *reg`); an
+                    // INT_ADD/INT_SUB of a register and a constant is a
+                    // memory-indirect jump (`jmp qword ptr [reg+K]`, e.g.
+                    // vtable tail calls) whose target is the loaded value.
                     for (const auto& defining : term->ops) {
-                        if (defining.out != v->id ||
-                            defining.op != POp::COPY)
-                            continue;
-                        const Varnode* source = term->find(defining.in0);
-                        if (source && source->kind == Varnode::REGISTER) {
-                            storage = registerStorageOffset(
-                                architecture, source->offset, source->size);
+                        if (defining.out != v->id) continue;
+                        if (defining.op == POp::COPY) {
+                            const Varnode* source =
+                                term->find(defining.in0);
+                            if (source &&
+                                source->kind == Varnode::REGISTER) {
+                                storage = registerStorageOffset(
+                                    architecture, source->offset,
+                                    source->size);
+                                storageValid = true;
+                            }
+                        } else if (defining.op == POp::INT_ADD ||
+                                   defining.op == POp::INT_SUB) {
+                            const Varnode* a = term->find(defining.in0);
+                            const Varnode* b = term->find(defining.in1);
+                            uint64_t regStorage = 0;
+                            int64_t k = 0;
+                            bool haveReg = false, haveK = false;
+                            for (const Varnode* candidate : {a, b}) {
+                                if (!candidate) continue;
+                                if (candidate->kind == Varnode::REGISTER) {
+                                    regStorage = registerStorageOffset(
+                                        architecture, candidate->offset,
+                                        candidate->size);
+                                    haveReg = true;
+                                } else if (candidate->kind ==
+                                           Varnode::CONST) {
+                                    k = static_cast<int64_t>(
+                                        candidate->offset);
+                                    haveK = true;
+                                }
+                            }
+                            if (haveReg) {
+                                std::string address =
+                                    registerName(architecture, regStorage, 8);
+                                const auto definition =
+                                    be.regExpr.find(regStorage);
+                                if (definition != be.regExpr.end() &&
+                                    inlineableExpression(
+                                        definition->second))
+                                    address = stripParens(
+                                        definition->second.text);
+                                if (haveK)
+                                    address += (defining.op == POp::INT_ADD
+                                                    ? " + "
+                                                    : " - ") +
+                                               std::to_string(k);
+                                memoryTarget = address;
+                            }
                         }
                         break;
                     }
@@ -3378,11 +3426,13 @@ te.pushSlots = &pushSlots;
                 // block is a recognizable trampoline; a jump on an unknown
                 // incoming value (e.g. a switch dispatch) stays a plain
                 // fallthrough/return.
+                if (memoryTarget) break;
+                if (!storageValid) continue;
                 if (be.regExpr.find(storage) == be.regExpr.end()) continue;
                 targetRegister = registerName(architecture, storage, 8);
                 break;
             }
-            if (!targetRegister.empty()) {
+            if (!targetRegister.empty() || memoryTarget) {
                 std::string args;
                 const std::vector<uint64_t> abi =
                     defaultArgumentRegisters(architecture);
@@ -3403,12 +3453,23 @@ te.pushSlots = &pushSlots;
                     args += (i ? ", " : "") + text;
                 }
                 for (int i = 0; i <= depth; ++i) out << "    ";
-                if (useRecoveredRuntime)
-                    out << "return recovered_dispatch(" << targetRegister
-                        << ", " << args << ");\n";
-                else
-                    out << "return ((uint64_t (*)(...))(uintptr_t)"
-                        << targetRegister << ")(" << args << ");\n";
+                if (useRecoveredRuntime) {
+                    if (memoryTarget)
+                        out << "return recovered_dispatch(recovered_load<"
+                               "std::uint64_t>(" << *memoryTarget << "), "
+                            << args << ");\n";
+                    else
+                        out << "return recovered_dispatch(" << targetRegister
+                            << ", " << args << ");\n";
+                } else {
+                    if (memoryTarget)
+                        out << "return ((uint64_t (*)(...))(uintptr_t)(*"
+                               "(uint64_t *)(uintptr_t)(" << *memoryTarget
+                            << ")))(" << args << ");\n";
+                    else
+                        out << "return ((uint64_t (*)(...))(uintptr_t)"
+                            << targetRegister << ")(" << args << ");\n";
+                }
                 return;
             }
         }

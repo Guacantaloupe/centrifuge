@@ -201,6 +201,81 @@ bool FunctionIR::build(const CfgBuilder& cfg, const std::string& architecture,
     for (const auto& block : cfg.blocks()) {
         containsCall |= block.isTailCall();
         hasTailCall_ |= block.isTailCall();
+        // An indirect tail call (data-slot jump board: `mov reg,[slot];
+        // jmp *reg`) has no statically known target, so cfg.tailCallTarget
+        // is unset.  Recognize a block ending in an unresolved indirect
+        // branch whose target register is written earlier in the same
+        // block: the jump forwards the callee's return value, so the
+        // function must not infer as void (the recovered dispatch case
+        // would then return 0 and allocator boards would hand callers
+        // NULL).
+        const PcodeInsn* terminator = block.terminator();
+        if (terminator &&
+            (terminator->kind == Insn::JMP ||
+             terminator->kind == Insn::OTHER) &&
+            !terminator->targetKnown) {
+            for (const PcodeOp& operation : terminator->ops) {
+                if (operation.op != POp::BRANCHIND &&
+                    operation.op != POp::BRANCH)
+                    continue;
+                const Varnode* target = terminator->find(operation.in0);
+                if (!target) continue;
+                uint64_t targetOffset = 0;
+                bool registerTarget = false;
+                if (target->kind == Varnode::REGISTER) {
+                    targetOffset = target->offset;
+                    registerTarget = true;
+                } else if (target->kind == Varnode::UNIQUE) {
+                    // Trace a temp back to its defining op.  A COPY
+                    // carries a register (`mov reg,[slot]; jmp *reg`); an
+                    // INT_ADD/INT_SUB of a register and a constant is a
+                    // memory-indirect jump (`jmp qword ptr [reg+K]`).
+                    for (const PcodeOp& defining : terminator->ops) {
+                        if (defining.out != target->id) continue;
+                        if (defining.op == POp::COPY) {
+                            const Varnode* source =
+                                terminator->find(defining.in0);
+                            if (source &&
+                                source->kind == Varnode::REGISTER) {
+                                targetOffset = source->offset;
+                                registerTarget = true;
+                            }
+                        } else if (defining.op == POp::INT_ADD ||
+                                   defining.op == POp::INT_SUB) {
+                            for (const uint64_t input :
+                                 {defining.in0, defining.in1}) {
+                                const Varnode* operand =
+                                    terminator->find(input);
+                                if (operand &&
+                                    operand->kind == Varnode::REGISTER) {
+                                    targetOffset = operand->offset;
+                                    registerTarget = true;
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    if (!registerTarget) continue;
+                } else {
+                    continue;
+                }
+                bool writtenHere = false;
+                for (const auto& insn : block.insns)
+                    for (const PcodeOp& inner : insn.ops) {
+                        const Varnode* out = insn.find(inner.out);
+                        if (out && out->kind == Varnode::REGISTER &&
+                            out->offset == targetOffset) {
+                            writtenHere = true;
+                            break;
+                        }
+                    }
+                if (writtenHere) {
+                    hasTailCall_ = true;
+                    break;
+                }
+            }
+        }
         for (const auto& insn : block.insns)
             for (const PcodeOp& operation : insn.ops) {
                 containsCall |= operation.op == POp::CALL ||
@@ -1028,6 +1103,28 @@ FunctionSignature FunctionIR::inferSignature() const {
         sig.parameters.push_back({"stack_arg" +
                                       std::to_string(sig.parameters.size()),
                                   0, stack.second, type, true, stack.first});
+    }
+
+    if (hasTailCall_) {
+        // A tail-call board (`mov reg,[slot]; jmp *reg`) never reads its
+        // ABI argument registers in its own body, so the usage scan above
+        // drops them and the function is inferred with no parameters.  The
+        // dispatch then forwards zeros instead of the caller's registers:
+        // an allocator board called with its size in rcx would allocate 0
+        // bytes (or dispatch with a NULL first argument).  Preserve every
+        // ABI argument register that the body does not already declare so
+        // the tail call forwards the caller's original arguments.
+        for (const auto& arg : abiArgs) {
+            const bool already = std::any_of(
+                sig.parameters.begin(), sig.parameters.end(),
+                [&](const FunctionParameter& p) {
+                    return p.registerOffset == arg.first;
+                });
+            if (!already)
+                sig.parameters.push_back(
+                    {arg.second, arg.first, 0,
+                     DataType{TypeKind::UNSIGNED_INT, 64, 1}});
+        }
     }
 
     std::map<uint64_t, DataType> returnedComponents;

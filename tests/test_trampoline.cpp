@@ -163,6 +163,38 @@ int main(int argc, char** argv) {
               "void trampoline: dispatch kept as return (value forwarded)");
     }
 
+    {
+        // A memory-indirect tail jump (`jmp qword ptr [reg+K]`, e.g. a
+        // vtable tail call) must dispatch through the *loaded* slot value,
+        // not the register holding the address: `jmp [rax+0x18]` forwards
+        // *(rax+0x18), so the trampoline is
+        //   recovered_dispatch(recovered_load<uint64_t>(rax + 24), ...).
+        Image img;
+        const std::vector<uint8_t> memoryTrampoline = {
+            0x48, 0x85, 0xC9, 0x74, 0x07, 0x48, 0x8B, 0x01, // test; je+7; mov rax,[rcx]
+            0x48, 0xFF, 0x60, 0x18, 0xC3};                  // jmp [rax+0x18]; ret
+        std::memcpy(img.bytes.data(), memoryTrampoline.data(),
+                    memoryTrampoline.size());
+        auto read = [&](uint64_t a, void* b, size_t n) {
+            return img.read(a, b, n);
+        };
+        const std::string output =
+            decompile(eng, read, 0x1000, 0x1100,
+                      [](uint64_t) { return std::string(); }, nullptr,
+                      architecture, /*useRecoveredRuntime=*/true);
+        std::printf("--- memory-indirect trampoline ---\n%s\n",
+                    output.c_str());
+        CHECK(output.find("return recovered_dispatch(recovered_load<") !=
+                  std::string::npos,
+              "memory trampoline: dispatch loads the slot value");
+        CHECK(output.find("+ 24") != std::string::npos ||
+                  output.find("0x18") != std::string::npos,
+              "memory trampoline: address carries the +0x18 offset");
+        CHECK(output.find("return recovered_dispatch(rax,") ==
+                  std::string::npos,
+              "memory trampoline: never dispatches the raw register");
+    }
+
     if (failures == 0) {
         std::printf("test_trampoline: all checks passed\n");
         return 0;

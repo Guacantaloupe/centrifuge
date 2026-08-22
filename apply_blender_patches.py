@@ -265,10 +265,15 @@ def main():
         if 'uint64_t FUN_00000001405083D0(' in src and 'LCG RNG' not in src:
             i = src.find('uint64_t FUN_00000001405083D0(')
             nl = src.find('\n', i)
-            head = src[i:nl+1]
+            j = src.find('\n}\n', nl)
+            if j < 0:
+                j = len(src)
+                tail = ''
+            else:
+                tail = src[j+2:]
             src = src[:i] + ('uint64_t FUN_00000001405083D0(uint64_t arg0, uint64_t arg1, uint64_t arg2) {\n'
                              '    (void)arg0; (void)arg1; (void)arg2;\n'
-                             '    return 0;  // native LCG RNG; recovery was garbage hashing; no-op\n')
+                             '    return 0;  // native LCG RNG; recovery was garbage hashing; no-op\n}\n') + tail
             save(path, src)
             print('FUN_05083D0 no-op applied')
             break
@@ -279,13 +284,18 @@ def main():
     #    with GS check).  Recovery was the same garbage hashing.  No-op.
     for path in sorted(glob.glob(src_dir + '/recovered_*.cpp')):
         src = load(path)
-        if 'uint64_t FUN_0000000140508330(' in src and 'ID generator wrapper' not in src:
+        if 'uint64_t FUN_0000000140508330(' in src and 'ID generator wrapper (no-op)' not in src:
             i = src.find('uint64_t FUN_0000000140508330(')
             nl = src.find('\n', i)
-            head = src[i:nl+1]
+            j = src.find('\n}\n', nl)
+            if j < 0:
+                j = len(src)
+                tail = ''
+            else:
+                tail = src[j+2:]  # keep the closing newline + anything after
             src = src[:i] + ('uint64_t FUN_0000000140508330(uint64_t arg0, uint64_t arg1, uint64_t arg3) {\n'
                              '    (void)arg0; (void)arg1; (void)arg3;\n'
-                             '    return 0;  // native ID generator (call 0x508500, (eax<<16)|0x330E); recovery was garbage; no-op\n')
+                             '    return 0;  // ID generator wrapper (no-op): recovery was garbage; no-op\n}\n') + tail
             save(path, src)
             print('FUN_0508330 no-op applied')
             break

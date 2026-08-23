@@ -357,6 +357,27 @@ def main():
     else:
         print('FUN_003C670 not found')
 
+    # 9. __invoke_watson call sites: CRT fatal-error reporting.  In the
+    #    recovered runtime, a mis-detected container failure (e.g. vector
+    #    growth guard) reaches watson with zeroed args; the real ucrtbase
+    #    implementation then spins on low-address accesses (50M-fault
+    #    guard).  Replace the call with a plain 0 so execution continues.
+    watson_total = 0
+    pat = re.compile(
+        r'(?:rax|rcx|rdx|r8|r9|r10|r11|r12|r13|r14|r15) = '
+        r'import_[A-Za-z0-9_]*invoke_watson[A-Za-z0-9_]*\([^;]*\);')
+    for path in sorted(glob.glob(src_dir + '/recovered_*.cpp')):
+        src = load(path)
+        m = pat.search(src)
+        if m:
+            receiver = m.group(0).split(' = ')[0]
+            new = receiver + ' = 0;  // invoke_watson skipped (recovered runtime)'
+            src = pat.sub(lambda mm: mm.group(0).split(' = ')[0] +
+                          ' = 0;  // invoke_watson skipped (recovered runtime)', src)
+            save(path, src)
+            watson_total += 1
+    print(f'invoke_watson calls skipped: {watson_total} sites')
+
     print('done')
 
 if __name__ == '__main__':

@@ -1013,17 +1013,43 @@ public:
                                 // address (vtable/init-table slot value)
                                 // that must reach the recovered C++
                                 // function, not mapped image data.
+                                // Forward stack-argument slots recorded by
+                                // preceding recovered_store(rsp + K, v)
+                                // writes as a4..a7; x64 passes the 5th+
+                                // argument on the stack and the callee
+                                // would otherwise read garbage.
+                                std::string stackArgs;
+                                static const int64_t argOffsets[] = {
+                                    32, 40, 48, 56};
+                                for (const int64_t off : argOffsets) {
+                                    const auto it = callArgSlots_.find(off);
+                                    stackArgs += ", " +
+                                        (it != callArgSlots_.end()
+                                             ? it->second : std::string("0"));
+                                }
+                                callArgSlots_.clear();
                                 line(registerName(
                                          architecture,
                                          returnRegisterOffset(architecture)) +
                                      " = recovered_dispatch(" + target + ", " +
-                                     forwardArgs + ", 0, 0, 0, 0);");
+                                     forwardArgs + stackArgs + ");");
                             } else {
+                                std::string stackArgs;
+                                static const int64_t argOffsets[] = {
+                                    32, 40, 48, 56};
+                                for (const int64_t off : argOffsets) {
+                                    const auto it = callArgSlots_.find(off);
+                                    stackArgs += ", " +
+                                        (it != callArgSlots_.end()
+                                             ? it->second : std::string("0"));
+                                }
+                                callArgSlots_.clear();
                                 line(registerName(
                                          architecture,
                                          returnRegisterOffset(architecture)) +
                                      " = ((uint64_t (*)(...))(uintptr_t)" +
-                                     target + ")(" + forwardArgs + ");");
+                                     target + ")(" + forwardArgs + stackArgs +
+                                     ");");
                             }
                         } else {
                             line("/* call " + target + " */");
@@ -1072,6 +1098,20 @@ public:
                                      std::string(uCast(stored ? stored->size : 8)) +
                                      ">(" + stripParens(a.text) + ", " +
                                      stripParens(v.text) + ");");
+                                // Track writes to x64 stack-argument slots
+                                // (rsp+0x20..0x38) so a following CALLIND can
+                                // forward them as a4..a7 instead of 0s.
+                                if (useRecoveredRuntime) {
+                                    static const int64_t argOffsets[] = {
+                                        32, 40, 48, 56};
+                                    const std::string addr = stripParens(a.text);
+                                    for (const int64_t off : argOffsets) {
+                                        if (addr == "rsp + " +
+                                            std::to_string(off))
+                                            callArgSlots_[off] =
+                                                stripParens(v.text);
+                                    }
+                                }
                             }
                         } else {
                             const CExpr a = exprOfV(pi.find(op.in0));
@@ -2625,6 +2665,12 @@ public:
 
 private:
     const CfgBlock& blk_;
+    // Phase: stack argument slots written before a CALLIND.  x64 passes the
+    // 5th+ argument on the caller's stack at rsp+0x20..0x38; recovered code
+    // simulates those writes with recovered_store(rsp + K, ...) which the
+    // callee never sees (simulated stack != hardware stack).  Record the
+    // values and forward them as dispatch arguments a4..a7 instead of 0s.
+    std::map<int64_t, std::string> callArgSlots_;
     void lineRaw(const std::string& s) {
         for (int i = 0; i < indent; ++i) out << "    ";
         out << s << "\n";

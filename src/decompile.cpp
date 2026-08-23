@@ -1453,7 +1453,8 @@ public:
                                          : op.op == POp::FLOAT_SUB ? "-"
                                          : op.op == POp::FLOAT_MULT ? "*"
                                          : op.op == POp::FLOAT_DIV ? "/" : "";
-                    if (vo->size > 8 && (op.aux & 0x8000)) {
+                    if ((vo->size == 16 || vo->size == 32 || vo->size == 64) &&
+                        (op.aux & 0x8000)) {
                         const std::string x = scalarFloat(a, pi.find(op.in0), laneBits);
                         const std::string y = scalarFloat(b, pi.find(op.in1), laneBits);
                         const std::string computed =
@@ -1462,7 +1463,8 @@ public:
                             : "(" + x + " " + symbol + " " + y + ")";
                         r.text = "recovered_vector_replace_scalar<" + scalarType +
                                  ">(" + stripParens(a.text) + ", " + computed + ")";
-                    } else if (vo->size > 8) {
+                    } else if (vo->size == 16 || vo->size == 32 ||
+                               vo->size == 64) {
                         const std::string suffix = (op.aux & 0x7fff) == 64 ? "f64" : "f32";
                         r.text = "simd_" + std::string(op.op == POp::FLOAT_ADD ? "add_"
                                                       : op.op == POp::FLOAT_SUB ? "sub_"
@@ -1493,7 +1495,8 @@ public:
                         ? "(-(" + x + "))"
                         : op.op == POp::FLOAT_ABS ? "std::fabs(" + x + ")"
                                                   : "std::sqrt(" + x + ")";
-                    if (vo->size > 8 && (op.aux & 0x8000)) {
+                    if ((vo->size == 16 || vo->size == 32 || vo->size == 64) &&
+                        (op.aux & 0x8000)) {
                         const CExpr base = op.in1 ? exprOfV(pi.find(op.in1)) : a;
                         r.text = "recovered_vector_replace_scalar<" + scalarType +
                                  ">(" + stripParens(base.text) + ", " + computed + ")";
@@ -3729,6 +3732,20 @@ std::string decompileTyped(
             for (size_t index = 0; index < used.size(); ++index)
                 out << (index ? ", " : "") << used[index] << "{}";
             out << ";\n";
+        }
+        if (architecture.rfind("x86", 0) == 0) {
+            std::vector<std::string> usedSt;
+            for (int index = 0; index < 8; ++index) {
+                const std::string name = "st" + std::to_string(index);
+                if (identifierUsed(name))
+                    usedSt.push_back(name);
+            }
+            if (!usedSt.empty()) {
+                out << "    uint64_t ";
+                for (size_t index = 0; index < usedSt.size(); ++index)
+                    out << (index ? ", " : "") << usedSt[index] << " = 0";
+                out << ";\n";
+            }
         }
         if (useRecoveredRuntime && architecture.rfind("x86", 0) == 0 &&
             identifierUsed("rsp")) {

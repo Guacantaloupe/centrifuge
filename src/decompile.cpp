@@ -83,6 +83,8 @@ std::string registerName(const std::string& architecture, uint64_t offset,
             return "mm" + std::to_string((offset - 16384) / 8);
         if (offset >= 8192 && offset < 8192 + 8 * 8)
             return "k" + std::to_string((offset - 8192) / 8);
+        if (offset >= 24576 && offset < 24576 + 8 * 16)
+            return "st" + std::to_string((offset - 24576) / 16);
         static const char* names[16] = {
             "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
             "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"

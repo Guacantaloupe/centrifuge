@@ -2930,9 +2930,14 @@ bool SleighEngine::disassemble(
                              name != "fs";
         if (!x86Handled && x87Name) {
             std::vector<uint64_t> st(8);
+            // x87 logical stack lives at 24576+i*16; 12288..12304 is the
+            // FS/GS segment-base register space (X86_FS_BASE_OFFSET).  They
+            // used to collide (ST(0)==FS), so every x87 multiply in MSVC
+            // builds decompiled into simd_mul_f32(fsbase, ...) with a scalar
+            // second operand and failed to compile.
             for (size_t i = 0; i < st.size(); ++i) {
                 Varnode* value = makeVarnode(
-                    out, Varnode::REGISTER, 12288 + i * 16, 10,
+                    out, Varnode::REGISTER, 24576 + i * 16, 10,
                     "st" + std::to_string(i));
                 st[i] = value->id;
             }

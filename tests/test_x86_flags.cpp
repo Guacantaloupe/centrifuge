@@ -1059,7 +1059,7 @@ int main(int argc, char** argv) {
         uint64_t st0 = 0;
         for (const auto& entry : insn.varnodes)
             if (entry.second.kind == Varnode::REGISTER &&
-                entry.second.offset == 12288 && entry.second.size == 10)
+                entry.second.offset == 24576 && entry.second.size == 10)
                 st0 = entry.first;
         PcodeEvaluator ev(insn);
         ev.run();
@@ -1079,14 +1079,14 @@ int main(int argc, char** argv) {
         uint64_t st0 = 0;
         for (const auto& entry : insn.varnodes)
             if (entry.second.kind == Varnode::REGISTER &&
-                entry.second.offset == 12288 && entry.second.size == 10)
+                entry.second.offset == 24576 && entry.second.size == 10)
                 st0 = entry.first;
         PcodeEvaluator ev(insn);
-        ev.wideRegs[12288].resize(10);
+        ev.wideRegs[24576].resize(10);
         const uint64_t oneSignificand = 0x8000000000000000ULL;
         const uint16_t oneExponent = 0x3fff;
-        std::memcpy(ev.wideRegs[12288].data(), &oneSignificand, 8);
-        std::memcpy(ev.wideRegs[12288].data() + 8, &oneExponent, 2);
+        std::memcpy(ev.wideRegs[24576].data(), &oneSignificand, 8);
+        std::memcpy(ev.wideRegs[24576].data() + 8, &oneExponent, 2);
         ev.run();
         const auto result = ev.wideValue(st0);
         uint64_t significand = 0;
@@ -1189,11 +1189,11 @@ int main(int argc, char** argv) {
         PcodeEvaluator ev(insn);
         ev.regs[RAX] = 0x600;
         ev.regs[12418] = 0;
-        ev.wideRegs[12288].resize(10);
+        ev.wideRegs[24576].resize(10);
         const uint64_t oneSignificand = 0x8000000000000000ULL;
         const uint16_t oneExponent = 0x3fff;
-        std::memcpy(ev.wideRegs[12288].data(), &oneSignificand, 8);
-        std::memcpy(ev.wideRegs[12288].data() + 8, &oneExponent, 2);
+        std::memcpy(ev.wideRegs[24576].data(), &oneSignificand, 8);
+        std::memcpy(ev.wideRegs[24576].data() + 8, &oneExponent, 2);
         const float two = 2.0f;
         const auto* bytes = reinterpret_cast<const uint8_t*>(&two);
         for (size_t i = 0; i < sizeof(two); ++i) ev.ram[0x600 + i] = bytes[i];
@@ -1399,16 +1399,16 @@ int main(int argc, char** argv) {
                           }), "FRNDINT lowers with the architectural control word");
         PcodeEvaluator rounded(roundedInsn);
         rounded.regs[12416] = 0x077f; // RC=01, round toward -infinity
-        rounded.wideRegs[12288].resize(10);
+        rounded.wideRegs[24576].resize(10);
         const uint64_t onePointSevenFive = 0xe000000000000000ULL;
         const uint16_t exponent = 0x3fff;
-        std::memcpy(rounded.wideRegs[12288].data(), &onePointSevenFive, 8);
-        std::memcpy(rounded.wideRegs[12288].data() + 8, &exponent, 2);
+        std::memcpy(rounded.wideRegs[24576].data(), &onePointSevenFive, 8);
+        std::memcpy(rounded.wideRegs[24576].data() + 8, &exponent, 2);
         rounded.run();
         uint64_t st0 = 0;
         for (const auto& entry : roundedInsn.varnodes)
             if (entry.second.kind == Varnode::REGISTER &&
-                entry.second.offset == 12288 && entry.second.size == 10)
+                entry.second.offset == 24576 && entry.second.size == 10)
                 st0 = entry.first;
         const auto result = rounded.wideValue(st0);
         uint64_t roundedSignificand = 0;
@@ -1730,15 +1730,15 @@ int main(int argc, char** argv) {
         };
         PcodeEvaluator invalid(disassemble(0x4D0));
         invalid.regs[12416] = 0x037f; // all exceptions masked
-        invalid.wideRegs[12288] = ext80(-1.0L);
+        invalid.wideRegs[24576] = ext80(-1.0L);
         invalid.run();
         CHECK((invalid.regValue(12418).value_or(0) & 1U) != 0,
               "FSQRT of a negative finite value records x87 invalid-operation");
 
         PcodeEvaluator precision(disassemble(0x4E0));
         precision.regs[12416] = 0x007f; // PC=24, round-to-nearest, masked
-        precision.wideRegs[12288] = ext80(1.0L);
-        precision.wideRegs[12288 + 16] = ext80(std::ldexp(1.0L, -30));
+        precision.wideRegs[24576] = ext80(1.0L);
+        precision.wideRegs[24576 + 16] = ext80(std::ldexp(1.0L, -30));
         precision.run();
         CHECK((precision.regValue(12418).value_or(0) & (1U << 5)) != 0,
               "24-bit x87 precision control rounds the significand and sets PE");
@@ -1954,7 +1954,7 @@ int main(int argc, char** argv) {
         PcodeEvaluator pi(fldpi);
         pi.regs[12420] = 0xffff;
         pi.run();
-        const auto piValue = pi.wideRegs.find(12288);
+        const auto piValue = pi.wideRegs.find(24576);
         CHECK(piValue != pi.wideRegs.end() &&
                   std::fabs(decode80(piValue->second) - std::acos(-1.0L)) < 1e-18L &&
                   (pi.regValue(12420).value_or(0) & 3U) == 0,
@@ -1962,7 +1962,7 @@ int main(int argc, char** argv) {
 
         PcodeEvaluator zero(disassemble(0x610));
         zero.regs[12420] = 0xfffd; // ST0 zero, remaining entries empty
-        zero.wideRegs[12288] = ext80(0.0L);
+        zero.wideRegs[24576] = ext80(0.0L);
         zero.run();
         const uint64_t zeroStatus = zero.regValue(12418).value_or(0);
         CHECK((zeroStatus & (1U << 14)) != 0 &&
@@ -1972,26 +1972,26 @@ int main(int argc, char** argv) {
         PcodeEvaluator rotateDown(disassemble(0x650));
         rotateDown.regs[12418] = 0;
         rotateDown.regs[12420] = 0x3ffc; // ST0/ST7 valid, middle empty
-        rotateDown.wideRegs[12288] = ext80(1.0L);
-        rotateDown.wideRegs[12288 + 7 * 16] = ext80(8.0L);
+        rotateDown.wideRegs[24576] = ext80(1.0L);
+        rotateDown.wideRegs[24576 + 7 * 16] = ext80(8.0L);
         rotateDown.run();
         CHECK(((rotateDown.regValue(12418).value_or(0) >> 11) & 7U) == 7 &&
-                  std::fabs(decode80(rotateDown.wideRegs[12288]) - 8.0L) < 1e-18L,
+                  std::fabs(decode80(rotateDown.wideRegs[24576]) - 8.0L) < 1e-18L,
               "FDECSTP rotates logical x87 values/tags and decrements TOP");
         PcodeEvaluator rotateUp(disassemble(0x660));
         rotateUp.regs = rotateDown.regs;
         rotateUp.wideRegs = rotateDown.wideRegs;
         rotateUp.run();
         CHECK(((rotateUp.regValue(12418).value_or(0) >> 11) & 7U) == 0 &&
-                  std::fabs(decode80(rotateUp.wideRegs[12288]) - 1.0L) < 1e-18L,
+                  std::fabs(decode80(rotateUp.wideRegs[24576]) - 1.0L) < 1e-18L,
               "FINCSTP reverses the logical stack rotation and increments TOP");
 
         PcodeEvaluator addPop(disassemble(0x680));
         addPop.regs[12416] = 0x037f; addPop.regs[12420] = 0xfff0;
-        addPop.wideRegs[12288] = ext80(1.0L);
-        addPop.wideRegs[12288 + 16] = ext80(2.0L);
+        addPop.wideRegs[24576] = ext80(1.0L);
+        addPop.wideRegs[24576 + 16] = ext80(2.0L);
         addPop.run();
-        CHECK(std::fabs(decode80(addPop.wideRegs[12288]) - 3.0L) < 1e-18L &&
+        CHECK(std::fabs(decode80(addPop.wideRegs[24576]) - 3.0L) < 1e-18L &&
                   ((addPop.regValue(12418).value_or(0) >> 11) & 7U) == 1,
               "FADDP writes ST(i), updates its tag, and pops exactly once");
 
@@ -2002,15 +2002,15 @@ int main(int argc, char** argv) {
         std::memcpy(quietNan.data() + 8, &nanExponent, 2);
         PcodeEvaluator ordered(disassemble(0x690));
         ordered.regs[12416] = 0x037f; ordered.regs[12420] = 0xfffa;
-        ordered.wideRegs[12288] = quietNan;
-        ordered.wideRegs[12288 + 16] = ext80(1.0L);
+        ordered.wideRegs[24576] = quietNan;
+        ordered.wideRegs[24576 + 16] = ext80(1.0L);
         ordered.run();
         CHECK((ordered.regValue(12418).value_or(0) & 1U) != 0,
               "FCOMPP raises invalid-operation for a quiet NaN");
         PcodeEvaluator unordered(disassemble(0x6A0));
         unordered.regs[12416] = 0x037f; unordered.regs[12420] = 0xfffa;
-        unordered.wideRegs[12288] = quietNan;
-        unordered.wideRegs[12288 + 16] = ext80(1.0L);
+        unordered.wideRegs[24576] = quietNan;
+        unordered.wideRegs[24576 + 16] = ext80(1.0L);
         unordered.run();
         CHECK((unordered.regValue(12418).value_or(0) & 1U) == 0,
               "FUCOMPP accepts a quiet NaN without invalid-operation");

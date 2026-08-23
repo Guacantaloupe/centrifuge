@@ -1502,7 +1502,7 @@ std::optional<uint64_t> PcodeEvaluator::evalOp(const PcodeOp& op) {
     case POp::X87_EXAMINE:
     case POp::X87_ROTATE:
     case POp::X87_COMPARE_CHECK: {
-        constexpr uint64_t stBase = 12288;
+        constexpr uint64_t stBase = 24576;  // x87 logical stack; 12288..12304 is FS/GS base
         constexpr uint64_t controlOffset = 12416;
         constexpr uint64_t statusOffset = 12418;
         constexpr uint64_t tagOffset = 12420;

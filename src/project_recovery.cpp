@@ -1718,6 +1718,7 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
                << "#include <cstring>\n#include <cstdlib>\n#include <iostream>\n"
                << "#ifdef _WIN32\n#include <windows.h>\n#endif\n"
                << "int main(int argc, char** argv) {\n"
+               << "    std::fprintf(stderr, \"\");  // warm CRT stderr so exit cleanup cannot corrupt the heap\n"
                << "#ifdef _WIN32\n"
 << "    {\n"
 << "        // Warm every RNG provider before any delay-load import\n"

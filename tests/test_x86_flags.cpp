@@ -1442,9 +1442,9 @@ int main(int argc, char** argv) {
         save.regs[RAX] = 0x800;
         save.regs[12416] = 0x027f;
         save.regs[12424] = 0x1f40;
-        save.wideRegs[0].resize(16);
+        save.wideRegs[32768].resize(16);
         for (size_t byte = 0; byte < 16; ++byte)
-            save.wideRegs[0][byte] = static_cast<uint8_t>(byte + 1);
+            save.wideRegs[32768][byte] = static_cast<uint8_t>(byte + 1);
         save.run();
         CHECK(save.ram[0x800] == 0x7f && save.ram[0x801] == 0x02 &&
                   save.ram[0x800 + 160] == 1 &&
@@ -1456,8 +1456,9 @@ int main(int argc, char** argv) {
         restore.ram = save.ram;
         restore.run();
         CHECK(restore.regs[12416] == 0x027f &&
-                  restore.wideRegs[0].size() >= 16 &&
-                  restore.wideRegs[0][0] == 1 && restore.wideRegs[0][15] == 16,
+                  restore.wideRegs[32768].size() >= 16 &&
+                  restore.wideRegs[32768][0] == 1 &&
+                  restore.wideRegs[32768][15] == 16,
               "FXRSTOR restores legacy x87 and SSE state components");
     }
     {

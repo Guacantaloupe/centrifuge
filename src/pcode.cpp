@@ -630,9 +630,10 @@ std::optional<uint64_t> PcodeEvaluator::evalOp(const PcodeOp& op) {
             writeInteger(24, regValue(12424).value_or(0x1f80), 4);
             for (size_t index = 0; index < 8; ++index)
                 writeBytes(32 + index * 16,
-                           wideRegs[12288 + index * 16], 0, 10);
+                           wideRegs[24576 + index * 16], 0, 10);
             for (size_t index = 0; index < 16; ++index)
-                writeBytes(160 + index * 16, wideRegs[index * 8], 0, 16);
+                writeBytes(160 + index * 16,
+                           wideRegs[32768 + index * 16], 0, 16);
             if (!legacyOnly) {
                 writeInteger(512, components, 8);
                 writeInteger(520, compacted ? (components | (1ULL << 63)) : 0,
@@ -648,7 +649,7 @@ std::optional<uint64_t> PcodeEvaluator::evalOp(const PcodeOp& op) {
                 if (components & (1ULL << 2))
                     for (size_t index = 0; index < 16; ++index)
                         writeBytes(avxOffset + index * 16,
-                                   wideRegs[index * 8], 16, 16);
+                                   wideRegs[32768 + index * 16], 16, 16);
                 if (components & (1ULL << 5))
                     for (size_t index = 0; index < 8; ++index)
                         writeInteger(opmaskOffset + index * 8,
@@ -656,11 +657,11 @@ std::optional<uint64_t> PcodeEvaluator::evalOp(const PcodeOp& op) {
                 if (components & (1ULL << 6))
                     for (size_t index = 0; index < 16; ++index)
                         writeBytes(zmmHighOffset + index * 32,
-                                   wideRegs[index * 8], 32, 32);
+                                   wideRegs[32768 + index * 16], 32, 32);
                 if (components & (1ULL << 7))
                     for (size_t index = 16; index < 32; ++index)
                         writeBytes(high16Offset + (index - 16) * 64,
-                                   wideRegs[index * 8], 0, 64);
+                                   wideRegs[32768 + index * 16], 0, 64);
             }
         } else {
             regs[12416] = readInteger(0, 2);
@@ -668,9 +669,9 @@ std::optional<uint64_t> PcodeEvaluator::evalOp(const PcodeOp& op) {
             regs[12420] = readInteger(4, 1);
             regs[12424] = readInteger(24, 4);
             for (size_t index = 0; index < 8; ++index)
-                readBytes(32 + index * 16, wideRegs[12288 + index * 16], 0, 10);
+                readBytes(32 + index * 16, wideRegs[24576 + index * 16], 0, 10);
             for (size_t index = 0; index < 16; ++index)
-                readBytes(160 + index * 16, wideRegs[index * 8], 0, 16);
+                readBytes(160 + index * 16, wideRegs[32768 + index * 16], 0, 16);
             if (!legacyOnly) {
                 const uint64_t saved = readInteger(512, 8) & components;
                 const bool savedCompacted = (readInteger(520, 8) >> 63) != 0;
@@ -684,7 +685,7 @@ std::optional<uint64_t> PcodeEvaluator::evalOp(const PcodeOp& op) {
                 if (saved & (1ULL << 2))
                     for (size_t index = 0; index < 16; ++index)
                         readBytes(avxOffset + index * 16,
-                                  wideRegs[index * 8], 16, 16);
+                                  wideRegs[32768 + index * 16], 16, 16);
                 if (saved & (1ULL << 5))
                     for (size_t index = 0; index < 8; ++index)
                         regs[8192 + index * 8] =
@@ -692,11 +693,11 @@ std::optional<uint64_t> PcodeEvaluator::evalOp(const PcodeOp& op) {
                 if (saved & (1ULL << 6))
                     for (size_t index = 0; index < 16; ++index)
                         readBytes(zmmHighOffset + index * 32,
-                                  wideRegs[index * 8], 32, 32);
+                                  wideRegs[32768 + index * 16], 32, 32);
                 if (saved & (1ULL << 7))
                     for (size_t index = 16; index < 32; ++index)
                         readBytes(high16Offset + (index - 16) * 64,
-                                  wideRegs[index * 8], 0, 64);
+                                  wideRegs[32768 + index * 16], 0, 64);
             }
         }
         return std::nullopt;

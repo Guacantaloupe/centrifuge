@@ -67,7 +67,7 @@ with tempfile.TemporaryDirectory(prefix="centrifuge-project-") as temporary:
     assert (output / "dependencies").is_dir()
     assert "address < runtime_iat_slots.begin()->first" in runtime_source
     assert "MEM_RESERVE, PAGE_NOACCESS" in runtime_source
-    assert "MEM_COMMIT, PAGE_READWRITE" in runtime_source
+    assert "MEM_COMMIT, PAGE_EXECUTE_READWRITE" in runtime_source
     assert "region.mapped" in runtime_source
     assert "VirtualFree(reservation, 0, MEM_RELEASE)" in runtime_source
     assert "runtime_tls_template" in runtime_source

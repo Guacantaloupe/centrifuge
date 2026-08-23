@@ -1775,8 +1775,7 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                         break;
                     if ((instruction.kind == Insn::CALL ||
                          instruction.kind == Insn::JMP) &&
-                        instruction.targetKnown &&
-                        discoveredByAddress.count(instruction.target))
+                        instruction.targetKnown)
                         callees.insert(instruction.target);
                     if (cursor > std::numeric_limits<uint64_t>::max() -
                                      instruction.size)

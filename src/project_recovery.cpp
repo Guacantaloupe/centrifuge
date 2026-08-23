@@ -520,6 +520,28 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
                              "recovered_external_argument(a5), "
                              "recovered_external_argument(a6), "
                              "recovered_external_argument(a7)) : 0;\n";
+            } else if (external.first >= stubImageBegin &&
+                       external.first < stubImageEnd &&
+                       program.memory.isExecutable(external.first)) {
+                // Unrecovered helper inside the image (e.g. an MSVC
+                // std::string comparator used by map containers).  The fixed
+                // address scheme keeps the original machine code readable at
+                // its image address, so invoke it directly: returning 0
+                // corrupts container logic downstream (map walks see a null
+                // node pointer and loop forever).
+                externals << "    auto function = "
+                             "reinterpret_cast<RecoveredExternal>("
+                          << "0x" << std::hex << external.first << std::dec
+                          << "ULL);\n"
+                          << "    return function ? function("
+                             "recovered_external_argument(a0), "
+                             "recovered_external_argument(a1), "
+                             "recovered_external_argument(a2), "
+                             "recovered_external_argument(a3), "
+                             "recovered_external_argument(a4), "
+                             "recovered_external_argument(a5), "
+                             "recovered_external_argument(a6), "
+                             "recovered_external_argument(a7)) : 0;\n";
             } else {
                 externals << "    (void)a0; (void)a1; (void)a2; (void)a3; "
                              "(void)a4; (void)a5; (void)a6; (void)a7;\n"
@@ -1281,7 +1303,7 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
         << "                    (regionEnd + pageSize - 1U) & ~(pageSize - 1U);\n"
         << "                void* committed = VirtualAlloc(\n"
         << "                    reinterpret_cast<void*>(pageBegin), pageEnd - pageBegin,\n"
-        << "                    MEM_COMMIT, PAGE_READWRITE);\n"
+        << "                    MEM_COMMIT, PAGE_EXECUTE_READWRITE);\n"
         << "                if (!committed) { mapped = false; break; }\n"
         << "            }\n"
         << "            // Commit inter-region gaps: PE sections whose\n"
@@ -1301,7 +1323,7 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
         << "                    ge = (ge + pageSize - 1U) & ~(pageSize - 1U);\n"
         << "                    if (ge <= gb) return true;\n"
         << "                    void* c = VirtualAlloc(reinterpret_cast<void*>(gb), ge - gb,\n"
-        << "                        MEM_COMMIT, PAGE_READWRITE);\n"
+        << "                        MEM_COMMIT, PAGE_EXECUTE_READWRITE);\n"
         << "                    return c != nullptr;\n"
         << "                };\n"
         << "                for (std::size_t si = 1; si < spans.size() && mapped; ++si)\n"

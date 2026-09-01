@@ -1,0 +1,6 @@
+run --run-entry
+bt 8
+info registers rip rax rcx rdx rsi r8 r9 rsp
+x/gx 0x146f86ef8
+x/8gx 0x146f86ef8
+quit

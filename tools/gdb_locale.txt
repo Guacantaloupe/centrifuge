@@ -1,0 +1,11 @@
+run --run-entry
+# 在 _Mtx_lock 调用前断点: 0x144c0c730 是 IAT 槽, 真实入口未知; 改在 0x140b0f36c (mov rcx,rsi) 
+break *0x140b0f36c
+continue
+info registers rsi rax rcx rdx
+# 读 TLS 块 +0x10
+set $tls = *(unsigned long long*)($gs_base + 0x58)
+set $tlsarray = *(unsigned long long*)($gs_base + 0x58)
+info registers rsi
+x/8gx $rsi
+quit

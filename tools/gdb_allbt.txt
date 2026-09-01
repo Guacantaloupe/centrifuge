@@ -1,0 +1,3 @@
+run --run-entry
+thread apply all bt 6
+quit

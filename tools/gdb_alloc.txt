@@ -1,0 +1,8 @@
+run --run-entry
+# 在崩溃前断在 0x144707537 (call malloc 前) 看 rbx 来源
+break *0x14470753c
+continue
+info registers rcx rdi rsi r14
+x/6gx $rdi
+bt 8
+quit

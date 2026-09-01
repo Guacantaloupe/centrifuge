@@ -1,0 +1,3 @@
+run --run-entry
+info symbol 0x7ff68a151642
+quit

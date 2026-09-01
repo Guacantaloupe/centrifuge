@@ -1,0 +1,7 @@
+break _Thrd_abort
+run --run-entry
+info registers rcx rdx r8
+bt 10
+x/4gx $rsp
+continue
+quit

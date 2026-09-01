@@ -1,0 +1,6 @@
+handle SIGILL nostop pass
+handle SIGSEGV stop
+run --run-entry
+bt 8
+info registers rip rsp
+quit

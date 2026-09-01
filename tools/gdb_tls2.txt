@@ -1,0 +1,13 @@
+run --run-entry
+break *0x140b0f344
+continue
+info registers rax rcx
+# Windows: gs base = TEB. gdb 的 $gs 段寄存器值不可读, 但可以通过 NtCurrentTeb() 调用
+# 用 call 不行, 直接读: MSYS2 gdb 支持 $_tls_index? 试试汇编
+# 最简单: 打印 eax (guard) 然后单步到 0x140b0f350 读 gs:0x58 后的值
+stepi
+stepi
+stepi
+info registers rdx rcx rax
+x/4gx $rdx+$rcx*8
+quit

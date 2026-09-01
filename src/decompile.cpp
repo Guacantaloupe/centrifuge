@@ -489,6 +489,12 @@ public:
     // resolves a call target address to a function name ("" = indirect)
     std::function<std::string(uint64_t)> nameOf;
     std::function<std::optional<FunctionSignature>(uint64_t)> signatureOf;
+    // True for data-segment slots whose value is a `jmp rax` trampoline
+    // (MSVC /guard:cf __guard_dispatch_icall_fptr).  The machine does
+    // mov rax, <real target>; call [slot]; the trampoline jumps to rax.
+    // Recovered calls to such slots must forward the rax expression as
+    // the first argument (the stub treats a0 as the call target).
+    std::function<bool(uint64_t)> guardSlotOf;
     std::string architecture = "riscv64";
     bool useRecoveredRuntime = false;
     const StackFrameModel* stackModel = nullptr; // Native Source Backend
@@ -577,20 +583,38 @@ public:
         std::string fname = nameOf(static_cast<uint64_t>(target));
         if (fname.empty()) return false;
         std::string args;
+        const bool guardSlot = guardSlotOf && guardSlotOf(static_cast<uint64_t>(target));
+        if (guardSlot) {
+            // Forward the pointer the machine loaded into rax as the
+            // call target (a0 of the stub).  The remaining ABI arguments
+            // shift to a1..a7.  rax's defining expression lives in
+            // regExpr; if unavailable, fall back to the register name so
+            // the emitted call still compiles.
+            const uint64_t raxOffset =
+                registerStorageOffset(architecture, 0, 8);
+            std::string targetExpr = registerName(architecture, 0);
+            const auto raxDef = regExpr.find(raxOffset);
+            if (raxDef != regExpr.end() &&
+                inlineableExpression(raxDef->second))
+                targetExpr = stripParens(raxDef->second.text);
+            args = targetExpr;
+        }
         const auto signature = signatureOf
                                    ? signatureOf(static_cast<uint64_t>(target))
                                    : std::optional<FunctionSignature>{};
         const size_t argumentCount = signature ? signature->parameters.size() : 8;
-        for (size_t i = 0; i < argumentCount; ++i) {
+        const size_t guardShift = guardSlot ? 1 : 0;
+        for (size_t i = guardShift; i < argumentCount; ++i) {
+            const size_t p = i - guardShift;  // stub arg index (a1..) for guard slots
             const std::vector<uint64_t> fallback =
                 defaultArgumentRegisters(architecture);
             const bool fallbackStackArgument =
-                !signature && i >= fallback.size();
+                !signature && p >= fallback.size();
             const uint64_t offset = signature
-                ? signature->parameters[i].registerOffset
-                : fallbackStackArgument ? 0 : fallback[i];
+                ? signature->parameters[p].registerOffset
+                : fallbackStackArgument ? 0 : fallback[p];
             const bool stackArgument =
-                (signature && signature->parameters[i].onStack) ||
+                (signature && signature->parameters[p].onStack) ||
                 fallbackStackArgument;
             std::string argument;
             if (stackArgument) {
@@ -600,17 +624,17 @@ public:
                 // stack coordinate when reading an outgoing argument.
                 int64_t callerStackOffset = 0;
                 if (signature) {
-                    callerStackOffset = signature->parameters[i].stackOffset;
+                    callerStackOffset = signature->parameters[p].stackOffset;
                 } else if (architecture.rfind("x86", 0) == 0) {
                     const bool win64 = architecture.find("win64") !=
                                        std::string::npos;
                     const int64_t word = architecture == "x86" ? 4 : 8;
                     const int64_t firstStackAtEntry = win64 ? 5 * word : word;
                     callerStackOffset = firstStackAtEntry +
-                        static_cast<int64_t>(i - fallback.size()) * word;
+                        static_cast<int64_t>(p - fallback.size()) * word;
                 } else {
                     callerStackOffset = static_cast<int64_t>(
-                        i - fallback.size()) * 8;
+                        p - fallback.size()) * 8;
                 }
                 if (architecture.rfind("x86", 0) == 0)
                     callerStackOffset -= architecture == "x86" ? 4 : 8;
@@ -630,7 +654,7 @@ public:
                     text = stripParens(definition->second.text);
                 argument = text;
             }
-            if (signature && signature->parameters[i].type.kind == TypeKind::POINTER)
+            if (signature && signature->parameters[p].type.kind == TypeKind::POINTER)
                 argument = "(void *)(uintptr_t)" + argument;
             // Phase 10h: a bare constant argument that points at a printable
             // data-segment C string reads naturally as a string literal.
@@ -2695,7 +2719,8 @@ std::string decompile(
     const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf,
     const std::string& architecture, bool useRecoveredRuntime,
     const StackFrameModel* stackModel,
-    const GlobalObjectRecovery* globals) {
+    const GlobalObjectRecovery* globals,
+    const std::function<bool(uint64_t)>& guardSlotOf) {
     CfgBuilder cfg;
     if (!cfg.build(eng, read, start, end)) return "// failed to build CFG\n";
 
@@ -2992,6 +3017,7 @@ std::string decompile(
                     BlockEmitter body(*b);
                     body.indent = depth + 2;
                     body.nameOf = nameOf;
+                    body.guardSlotOf = guardSlotOf;
                     body.signatureOf = signatureOf;
                     body.architecture = architecture;
                     body.useRecoveredRuntime = useRecoveredRuntime;
@@ -3031,6 +3057,7 @@ body.pushSlots = &pushSlots;
                 BlockEmitter body(*b);
                 body.indent = depth + 2;
                 body.nameOf = nameOf;
+                    body.guardSlotOf = guardSlotOf;
                 body.signatureOf = signatureOf;
                 body.architecture = architecture;
                 body.useRecoveredRuntime = useRecoveredRuntime;
@@ -3118,6 +3145,7 @@ body.pushSlots = &pushSlots;
                         BlockEmitter header(*b);
                         header.indent = depth + 1;
                         header.nameOf = nameOf;
+                    header.guardSlotOf = guardSlotOf;
                         header.signatureOf = signatureOf;
                         header.architecture = architecture;
                         header.useRecoveredRuntime = useRecoveredRuntime;
@@ -3172,6 +3200,7 @@ header.pushSlots = &pushSlots;
         BlockEmitter be(*b);
         be.indent = depth + 1;
         be.nameOf = nameOf;
+                    be.guardSlotOf = guardSlotOf;
         be.signatureOf = signatureOf;
         be.architecture = architecture;
         be.useRecoveredRuntime = useRecoveredRuntime;
@@ -3217,6 +3246,7 @@ be.pushSlots = &pushSlots;
                 BlockEmitter thenBody(*tb);
                 thenBody.indent = depth + 2;
                 thenBody.nameOf = nameOf;
+                    thenBody.guardSlotOf = guardSlotOf;
                 thenBody.signatureOf = signatureOf;
                 thenBody.architecture = architecture;
                 thenBody.useRecoveredRuntime = useRecoveredRuntime;
@@ -3240,6 +3270,7 @@ thenBody.pushSlots = &pushSlots;
                 BlockEmitter elseBody(*fb);
                 elseBody.indent = depth + 2;
                 elseBody.nameOf = nameOf;
+                    elseBody.guardSlotOf = guardSlotOf;
                 elseBody.signatureOf = signatureOf;
                 elseBody.architecture = architecture;
                 elseBody.useRecoveredRuntime = useRecoveredRuntime;
@@ -3279,6 +3310,7 @@ elseBody.pushSlots = &pushSlots;
                 BlockEmitter te(*tb);
                 te.indent = depth + 2;
                 te.nameOf = nameOf;
+                    te.guardSlotOf = guardSlotOf;
                 te.signatureOf = signatureOf;
                 te.architecture = architecture;
                 te.useRecoveredRuntime = useRecoveredRuntime;
@@ -3582,10 +3614,11 @@ std::string decompileTyped(
     const std::function<std::string(uint64_t)>& nameOf,
     const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf,
     bool useRecoveredRuntime, const StackFrameModel* stackModel,
-    const GlobalObjectRecovery* globals) {
+    const GlobalObjectRecovery* globals,
+    const std::function<bool(uint64_t)>& guardSlotOf) {
     const std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
                                        architecture, useRecoveredRuntime,
-                                       stackModel, globals);
+                                       stackModel, globals, guardSlotOf);
     // A data-slot trampoline (indirect tail call) forwards the callee's
     // return value through rax, so it must never decompile to void: the
     // typed wrapper's void-return rewrite would turn the dispatch into a

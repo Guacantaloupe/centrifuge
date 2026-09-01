@@ -1,0 +1,9 @@
+run --run-entry
+break *0x140b0f344
+continue
+info registers rax rcx rdx
+# gs base 从 MSR 读不到, 改用 gdb 的 $_thread 或者直接读 TEB: Windows TEB 在 gs base, gdb 有 $tcb
+# 用汇编执行 mov rdx, gs:0x58; mov rdx, [rdx+rcx*8]; x/gx rdx+0x10
+set $tlsarr = *(unsigned long long*)($gs_base + 0x58)
+printf "tlsarr=%p\n", $tlsarr
+quit

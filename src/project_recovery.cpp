@@ -447,7 +447,17 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
             const std::string body = decompileTyped(
                 engine, read, entry.first, end, emissionArchitecture,
                 names[entry.first],
-                signatures[entry.first], nameOf, signatureOf, true);
+                signatures[entry.first], nameOf, signatureOf, true,
+                nullptr, nullptr,
+                [&](uint64_t slot) {
+                    // MSVC /guard:cf indirect-call dispatcher:
+                    // data slot whose value is a `jmp rax` trampoline.
+                    uint64_t value = 0;
+                    if (!program.memory.read(slot, &value, 8)) return false;
+                    uint8_t bytes[2] = {0, 0};
+                    return program.memory.read(value, bytes, 2) &&
+                           bytes[0] == 0xFF && bytes[1] == 0xE0;
+                });
             source << body << "\n";
             report.unresolvedMarkers += countMarker(body, "UNIMPLEMENTED") +
                                         countMarker(body, "/* call ") +
@@ -500,26 +510,57 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
                 }
             }
             if (inData) {
-                externals << "    const auto target = "
-                             "recovered_load<std::uint64_t>("
-                          << "0x" << std::hex << external.first << std::dec
-                          << ");\n"
-                          << "    if (target >= " << stubImageBegin
-                          << "ULL && target < " << stubImageEnd
-                          << "ULL)\n"
-                          << "        return recovered_dispatch(target, "
-                             "a0, a1, a2, a3, a4, a5, a6, a7);\n"
-                          << "    auto function = "
-                             "reinterpret_cast<RecoveredExternal>(target);\n"
-                          << "    return function ? function("
-                             "recovered_external_argument(a0), "
-                             "recovered_external_argument(a1), "
-                             "recovered_external_argument(a2), "
-                             "recovered_external_argument(a3), "
-                             "recovered_external_argument(a4), "
-                             "recovered_external_argument(a5), "
-                             "recovered_external_argument(a6), "
-                             "recovered_external_argument(a7)) : 0;\n";
+                // A slot whose value is a `jmp rax` trampoline is an MSVC
+                // /guard:cf indirect-call dispatcher
+                // (__guard_dispatch_icall_fptr): the caller loads the real
+                // target into rax, then does call [slot].  The trampoline
+                // just jumps to rax, so invoking the slot value directly
+                // would jump to a garbage address (the C++ call clobbers
+                // rax).  Recover this pattern by having the stub call the
+                // pointer that the recovered call site forwarded as a0
+                // (emitCall pushes the rax expression into a0 for these
+                // slots); arguments shift to a1..a7.
+                bool guardTrampoline = false;
+                uint64_t slotValue = 0;
+                if (program.memory.read(external.first, &slotValue, 8)) {
+                    uint8_t stubBytes[2] = {0, 0};
+                    if (program.memory.read(slotValue, stubBytes, 2))
+                        guardTrampoline = stubBytes[0] == 0xFF &&
+                                          stubBytes[1] == 0xE0;
+                }
+                if (guardTrampoline) {
+                    externals << "    auto function = "
+                                 "reinterpret_cast<RecoveredExternal>(a0);\n"
+                              << "    return function ? function("
+                                 "recovered_external_argument(a1), "
+                                 "recovered_external_argument(a2), "
+                                 "recovered_external_argument(a3), "
+                                 "recovered_external_argument(a4), "
+                                 "recovered_external_argument(a5), "
+                                 "recovered_external_argument(a6), "
+                                 "recovered_external_argument(a7), 0) : 0;\n";
+                } else {
+                    externals << "    const auto target = "
+                                 "recovered_load<std::uint64_t>("
+                              << "0x" << std::hex << external.first << std::dec
+                              << ");\n"
+                              << "    if (target >= " << stubImageBegin
+                              << "ULL && target < " << stubImageEnd
+                              << "ULL)\n"
+                              << "        return recovered_dispatch(target, "
+                                 "a0, a1, a2, a3, a4, a5, a6, a7);\n"
+                              << "    auto function = "
+                                 "reinterpret_cast<RecoveredExternal>(target);\n"
+                              << "    return function ? function("
+                                 "recovered_external_argument(a0), "
+                                 "recovered_external_argument(a1), "
+                                 "recovered_external_argument(a2), "
+                                 "recovered_external_argument(a3), "
+                                 "recovered_external_argument(a4), "
+                                 "recovered_external_argument(a5), "
+                                 "recovered_external_argument(a6), "
+                                 "recovered_external_argument(a7)) : 0;\n";
+                }
             } else if (external.first >= stubImageBegin &&
                        external.first < stubImageEnd &&
                        program.memory.isExecutable(external.first)) {
@@ -1040,6 +1081,9 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
         << "inline constexpr std::uintptr_t recovered_iat_end = "
         << lastIat << "ULL;\n"
         << "std::uintptr_t recovered_external_argument(std::uintptr_t value);\n"
+        << "std::uintptr_t recovered_image_begin();\n"
+        << "std::uintptr_t recovered_image_end();\n"
+        << "bool recovered_image_executable(std::uintptr_t address);\n"
         << "std::uint64_t recovered_runtime_fault_count();\n\n"
         << "std::uint64_t recovered_heap_malloc(std::uint64_t size);\n"
         << "std::uint64_t recovered_heap_calloc(std::uint64_t count, std::uint64_t size);\n"
@@ -1186,7 +1230,7 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
         << "thread_local std::vector<std::uint8_t> runtime_tls_block;\n"
         << "thread_local std::array<std::uintptr_t, 1> runtime_tls_slots{};\n"
         << "thread_local bool runtime_tls_initialized = false;\n"
-        << "thread_local std::vector<std::uintptr_t> runtime_tls_atexit_callbacks;\n"
+        << "std::vector<std::uintptr_t> runtime_tls_atexit_callbacks;\n"
         << "}\n\n"
         << "bool recovered_runtime_initialize(const char* executable_or_root) {\n"
         << "    if (runtime_ready.load(std::memory_order_acquire)) return true;\n"
@@ -1368,6 +1412,22 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
            "\"CENTRIFUGE_RUNTIME_STRICT_HEAP\");\n"
         << "    runtime_strict_heap_bounds = strictHeap && *strictHeap && "
            "std::strcmp(strictHeap, \"0\") != 0;\n"
+        << "    // Pre-construct the MSVC std::locale guard object (FUN_140B0FBA0)\n"
+        << "    // so the 18 locale entry points (FUN_140B0F330 family) find a\n"
+        << "    // valid lock pointer at 0x146f86ef8 instead of _Mtx_lock(0) ->\n"
+        << "    // _Thrd_abort.  Mark the guard -1 so double-checked-lock paths\n"
+        << "    // skip the _Init_thread_header wait.  Addresses are image-specific\n"
+        << "    // and only applied when the image actually maps them.\n"
+        << "    {\n"
+        << "        constexpr std::uintptr_t kLocaleCtor = 0x140b0fba0ULL;\n"
+        << "        constexpr std::uintptr_t kLocaleGuard = 0x146f86f08ULL;\n"
+        << "        if (recovered_image_executable(kLocaleCtor)) {\n"
+        << "            using LocaleCtor = std::uint64_t(*)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);\n"
+        << "            const auto locale_ctor = reinterpret_cast<LocaleCtor>(kLocaleCtor);\n"
+        << "            if (locale_ctor) locale_ctor(0, 0, 0, 0, 0, 0, 0, 0);\n"
+        << "            *reinterpret_cast<std::uint32_t*>(kLocaleGuard) = 0xFFFFFFFFu;\n"
+        << "        }\n"
+        << "    }\n"
         << "    runtime_ready.store(true, std::memory_order_release);\n"
         << "    return true;\n}\n\n"
         << "std::uint64_t recovered_heap_malloc(std::uint64_t requested) {\n"
@@ -1488,6 +1548,18 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
         << "                : region.bytes.data() + static_cast<std::size_t>(offset));\n"
         << "    }\n"
         << "    return value;\n}\n\n"
+        << "std::uintptr_t recovered_image_begin() { return original_image_begin; }\n"
+        << "std::uintptr_t recovered_image_end() { return original_image_end; }\n"
+        << "bool recovered_image_executable(std::uintptr_t address) {\n"
+        << "    if (address < original_image_begin || address >= original_image_end)\n"
+        << "        return false;\n"
+        << "    for (auto& region : runtime_regions) {\n"
+        << "        if (address < region.address) continue;\n"
+        << "        const std::uint64_t offset = address - region.address;\n"
+        << "        if (offset < region.bytes.size())\n"
+        << "            return region.mapped != nullptr;\n"
+        << "    }\n"
+        << "    return false;\n}\n\n"
         << "std::uint64_t recovered_runtime_fault_count() { return runtime_faults.load(); }\n\n"
         << "std::uint64_t recovered_unresolved_dispatch(std::uintptr_t address) {\n"
         << "    ++runtime_faults; ++runtime_dispatch_misses;\n"
@@ -1731,8 +1803,34 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
                      << names[address] << "(" << arguments << "));\n";
         }
     }
-    metadata << "    default: return recovered_unresolved_dispatch(address);\n"
-             << "    }\n}\n";
+    metadata << "    default: {\n"
+             << "        // Unrecovered target inside the image (e.g. an MSVC\n"
+             << "        // locale/iostream static initializer that the function\n"
+             << "        // budget did not select).  The fixed-address scheme keeps\n"
+             << "        // original machine code readable/executable at its image\n"
+             << "        // address, so invoke it natively: returning 0 silently\n"
+             << "        // skips the initializer and later native code faults\n"
+             << "        // (e.g. _Mtx_lock(0) in a locale guard).\n"
+             << "        if (address >= recovered_image_begin() &&\n"
+             << "            address < recovered_image_end() &&\n"
+             << "            recovered_image_executable(address)) {\n"
+             << "            using RecoveredExternal = std::uint64_t (*)("
+                "std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, "
+                "std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);\n"
+             << "            auto function = reinterpret_cast<RecoveredExternal>("
+                "address);\n"
+             << "            return function ? function("
+                "recovered_external_argument(a0), "
+                "recovered_external_argument(a1), "
+                "recovered_external_argument(a2), "
+                "recovered_external_argument(a3), "
+                "recovered_external_argument(a4), "
+                "recovered_external_argument(a5), "
+                "recovered_external_argument(a6), "
+                "recovered_external_argument(a7)) : 0;\n"
+             << "        }\n"
+             << "        return recovered_unresolved_dispatch(address);\n"
+             << "    }\n    }\n}\n";
     if (!writeFile(sourceDirectory / "recovered_metadata.cpp", metadata.str(),
                    error)) return false;
     sourceFiles.push_back("src/recovered_metadata.cpp");
@@ -1750,8 +1848,31 @@ bool recoverSourceProject(const Program& program, const SleighEngine& engine,
                << "#include \"recovered_runtime.hpp\"\n"
                << "#include <cstring>\n#include <cstdlib>\n#include <iostream>\n"
                << "#ifdef _WIN32\n#include <windows.h>\n#endif\n"
-               << "int main(int argc, char** argv) {\n"
+               << "#ifdef _WIN32\n"
+               << "static LONG WINAPI recovered_exception_hook(PEXCEPTION_POINTERS info) {\n"
+               << "    if (!info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;\n"
+               << "    const auto code = info->ExceptionRecord->ExceptionCode;\n"
+               << "    auto* ctx = info->ContextRecord;\n"
+               << "    std::fprintf(stderr, \"[EXC] 0x%08lx rip=%p rsp=%p rcx=%p rdx=%p r8=%p r9=%p rbx=%p rdi=%p rsi=%p\\n\",\n"
+               << "                 (unsigned long)code,\n"
+               << "                 (void*)(ctx ? ctx->Rip : 0), (void*)(ctx ? ctx->Rsp : 0),\n"
+               << "                 (void*)(ctx ? ctx->Rcx : 0), (void*)(ctx ? ctx->Rdx : 0),\n"
+               << "                 (void*)(ctx ? ctx->R8 : 0), (void*)(ctx ? ctx->R9 : 0),\n"
+               << "                 (void*)(ctx ? ctx->Rbx : 0), (void*)(ctx ? ctx->Rdi : 0),\n"
+               << "                 (void*)(ctx ? ctx->Rsi : 0));\n"
+               << "    void* frames[12]{};\n"
+               << "    const auto count = CaptureStackBackTrace(0, 12, frames, nullptr);\n"
+               << "    std::fprintf(stderr, \"[BT]\");\n"
+               << "    for (std::size_t i = 0; i < count; ++i)\n"
+               << "        std::fprintf(stderr, \" %p\", frames[i]);\n"
+               << "    std::fprintf(stderr, \"\\n\");\n"
+               << "    return EXCEPTION_CONTINUE_SEARCH;\n"
+               << "}\n"
+               << "#endif\n"
                << "    std::fprintf(stderr, \"\");  // warm CRT stderr so exit cleanup cannot corrupt the heap\n"
+               << "#ifdef _WIN32\n"
+               << "    AddVectoredExceptionHandler(1, recovered_exception_hook);\n"
+               << "#endif\n"
                << "#ifdef _WIN32\n"
 << "    {\n"
 << "        // Warm every RNG provider before any delay-load import\n"

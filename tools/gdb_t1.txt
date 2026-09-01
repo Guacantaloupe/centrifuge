@@ -1,0 +1,5 @@
+run --run-entry
+bt 12
+info registers rip rax rcx rdx r8 r9 rsp
+x/12gx $rsp
+quit

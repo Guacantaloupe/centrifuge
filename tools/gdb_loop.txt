@@ -1,0 +1,8 @@
+run --run-entry
+break *0x144707410
+continue
+info registers rbx rdi rsi rax
+x/4gx $rbx
+x/4gx $rbx+8
+continue
+quit

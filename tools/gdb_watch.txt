@@ -1,0 +1,9 @@
+run --run-entry
+break *0x140000000+0x5d418c8
+# 用 watch 更好
+watch *(unsigned long long*)0x145d418c8
+continue
+info registers rip rax rcx rdx
+bt 6
+continue
+quit

@@ -1,0 +1,7 @@
+run --run-entry
+break recovered_guard_trampoline
+continue
+info registers rax rdx rcx rsp
+bt 8
+continue
+quit

@@ -675,6 +675,44 @@ std::string normalizeBranchCond(std::string cond) {
             changed = true;
         }
     }
+    // Boolean chains: "(cmp) | (cmp)" -> "(cmp) || (cmp)" (and & -> &&).
+    // Every operand is a single comparison here, hence 0/1, for which the
+    // bitwise and logical operators agree exactly.
+    const auto booleanize = [](std::string s, const char* bitOp,
+                               const char* boolOp) {
+        const std::string sep = std::string(" ") + bitOp + " ";
+        std::vector<std::string> parts;
+        int depth = 0;
+        size_t start = 0;
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '(') depth++;
+            else if (s[i] == ')') depth--;
+            else if (depth == 0 && s.compare(i, sep.size(), sep) == 0) {
+                parts.push_back(s.substr(start, i - start));
+                start = i + sep.size();
+                i += sep.size() - 1;
+            }
+        }
+        if (parts.empty()) return s; // no top-level operator
+        parts.push_back(s.substr(start));
+        const auto isComparisonGroup = [](std::string part) {
+            const size_t a = part.find_first_not_of(" \t");
+            if (a == std::string::npos) return false;
+            part = part.substr(a);
+            if (part.size() < 2 || part.front() != '(' ||
+                part.back() != ')')
+                return false;
+            return !topLevelComparison(part).empty();
+        };
+        for (const std::string& part : parts)
+            if (!isComparisonGroup(part)) return s;
+        std::string joined;
+        for (size_t i = 0; i < parts.size(); ++i)
+            joined += (i ? std::string(" ") + boolOp + " " : "") + parts[i];
+        return joined;
+    };
+    cond = booleanize(cond, "|", "||");
+    cond = booleanize(cond, "&", "&&");
     // The emitters wrap the condition in "if (...)" themselves, so a
     // single fully-wrapped group would print double parens; drop it.
     return stripParens(cond);

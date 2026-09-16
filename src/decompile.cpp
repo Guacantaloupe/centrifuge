@@ -1011,6 +1011,73 @@ std::string dropSubsumedRightTruncations(std::string text) {
     return text;
 }
 
+// Collapse "(T)(((T)(X)))" to "(T)(X)" for identical fixed-width T.
+// The outer cast re-converts a value already of type T - a no-op in C -
+// and the inner "((T)(X))" is its entire operand group.  Distinguished
+// from the truncating-binary-op shapes by the group close "))" right
+// after X (no operator follows).  X stays textually intact.
+std::string collapseSameTypeDoubleCasts(std::string text) {
+    const char* types[] = {"uint8_t",  "int8_t",  "uint16_t", "int16_t",
+                           "uint32_t", "int32_t", "uint64_t", "int64_t"};
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const char* tc : types) {
+            const std::string t = "(" + std::string(tc) + ")";
+            const std::string needle = t + "((" + t + "(";
+            size_t pos = 0;
+            while ((pos = text.find(needle, pos)) != std::string::npos) {
+                const size_t xOpen = pos + needle.size() - 1;
+                int depth = 0;
+                size_t j = xOpen;
+                for (; j < text.size(); ++j) {
+                    if (text[j] == '(')
+                        depth++;
+                    else if (text[j] == ')') {
+                        depth--;
+                        if (!depth) break;
+                    }
+                }
+                // X close j must be followed by wrapper close + group
+                // close and no operator (whole operand group is the cast).
+                if (j + 2 >= text.size() || text[j + 1] != ')' ||
+                    text[j + 2] != ')') {
+                    pos++;
+                    continue;
+                }
+                text.erase(pos + t.size() + 1, t.size() + 1);
+                text.erase(j - t.size(), 1);
+                changed = true;
+                break; // restart the scan
+            }
+        }
+    }
+    // Strip leftover double parens around plain identifiers: "((rdx))"
+    // -> "(rdx)".  An identifier is atomic, so one paren layer is enough
+    // in any context.
+    for (size_t i = 0; i + 4 < text.size();) {
+        if (text[i] == '(' && text[i + 1] == '(' &&
+            (std::isalpha(static_cast<unsigned char>(text[i + 2])) ||
+             text[i + 2] == '_')) {
+            size_t k = i + 2;
+            while (k < text.size() &&
+                   (std::isalnum(static_cast<unsigned char>(text[k])) ||
+                    text[k] == '_'))
+                k++;
+            if (k + 1 < text.size() && text[k] == ')' &&
+                text[k + 1] == ')') {
+                // "((id))" -> "(id)": drop the inner close and the
+                // duplicate open.
+                text.erase(k + 1, 1);
+                text.erase(i + 1, 1);
+                continue;
+            }
+        }
+        i++;
+    }
+    return text;
+}
+
 // Fold "v = <expr>; return v;" (adjacent lines) into "return <expr>;".
 // Adjacency guarantees no label, branch target, or intervening statement,
 // so the store is observed only by the return; "v" is a plain local
@@ -5157,6 +5224,7 @@ te.pushSlots = &pushSlots;
     std::string result = out.str();
     result = dropSubsumedTruncations(result);
     result = dropSubsumedRightTruncations(result);
+    result = collapseSameTypeDoubleCasts(result);
     result = rewriteSelfIncrements(result);
     if (!useRecoveredRuntime) {
         result = inlineAdjacentFlagBranches(result, architecture);

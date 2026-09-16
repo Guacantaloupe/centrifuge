@@ -4706,7 +4706,24 @@ std::string decompileTyped(
                    " };";
         out << line << "\n";
     }
-    if (effectiveSignature.returnType.kind == TypeKind::VOID_TYPE)
+    // The default return below is only reachable when control can fall
+    // off the end of the body.  With balanced braces, a body whose last
+    // line is a return statement cannot fall through (no label can sit
+    // between it and the appended return), so skip the dead default.
+    bool bodyEndsWithReturn = false;
+    {
+        const size_t end = body.find_last_not_of("\n");
+        if (end != std::string::npos) {
+            const size_t begin = body.rfind('\n', end);
+            const std::string last = body.substr(
+                begin == std::string::npos ? 0 : begin + 1, end - begin);
+            const std::string trimmed = last.substr(last.find_first_not_of(" \t"));
+            bodyEndsWithReturn = trimmed.rfind("return", 0) == 0;
+        }
+    }
+    if (bodyEndsWithReturn) {
+        // unreachable default: nothing to append
+    } else if (effectiveSignature.returnType.kind == TypeKind::VOID_TYPE)
         out << "    return;\n";
     else if (effectiveSignature.returnType.kind == TypeKind::FLOAT)
         out << "    return 0.0;\n";

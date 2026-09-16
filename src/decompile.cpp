@@ -1834,6 +1834,7 @@ public:
                     case POp::INT_XOR: c = "^"; break;
                     default: break;
                     }
+                    uint64_t zeroCheck = 0;
                     if ((op.op == POp::INT_ADD || op.op == POp::INT_SUB) &&
                         b.isConst && !a.isConst) {
                         uint64_t bv = 0;
@@ -1874,16 +1875,23 @@ public:
                             r.text = "(-9223372036854775807LL - 1)";
                             r.isConst = false; // not a single numeric token
                         }
-                    } else if (b.isConst && b.text == "0") {
+                    } else if (parseConstToken(stripParens(b.text), &zeroCheck) &&
+                               zeroCheck == 0) {
+                        // A pure literal zero operand (possibly
+                        // parenthesized, possibly without the isConst flag)
+                        // has no side effects to preserve.
                         if (op.op == POp::INT_MULT ||
-                            op.op == POp::INT_AND)
+                            op.op == POp::INT_AND) {
                             r = b;
-                        else
+                            r.text = "0"; // normalize a parenthesized zero
+                        } else
                             r = a;
-                    } else if (a.isConst && a.text == "0") {
+                    } else if (parseConstToken(stripParens(a.text), &zeroCheck) &&
+                               zeroCheck == 0) {
                         if (op.op == POp::INT_MULT ||
                             op.op == POp::INT_AND) {
                             r = a;
+                            r.text = "0"; // normalize a parenthesized zero
                         } else if (op.op == POp::INT_SUB) {
                             r.text = "-(" + stripParens(b.text) + ")";
                             r.size = vo->size;
@@ -2285,6 +2293,17 @@ public:
                     const int bits = (va ? va->size : 8) * 8;
                     const std::string x = stripParens(a.text);
                     const std::string y = stripParens(b.text);
+                    uint64_t yv = 0;
+                    if (parseConstToken(y, &yv) && yv == 0) {
+                        // Carry/borrow/overflow against a literal zero
+                        // operand is always 0: x+0 and x-0 cannot carry
+                        // out of any bit, and the OF formulas collapse
+                        // (x^0=x and x^x=0 / x-0=x and x^x=0).
+                        r.text = "0";
+                        r.isConst = true;
+                        r.size = 1;
+                        break;
+                    }
                     if (op.op == POp::INT_CARRY) {
                         r.text = "((" + std::string(uCast(va ? va->size : 8)) +
                                  ")((" + x + ") + (" + y + ")) < (" + x + "))";

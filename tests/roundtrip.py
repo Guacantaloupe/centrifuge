@@ -55,11 +55,13 @@ if args.large:
         ("sum_array", 0x800003E4, 2, "array", arrays),
     ]
 
-# all decompiled functions take 8 register args (calls pass a0..a7)
+# all decompiled functions take 8 register args; ABI-role names come from
+# the decompiler's rename pass (arg0..arg7 = a0..a7, stack_ptr = sp,
+# frame_ptr = s0).
 SIG = "int64_t %s(int64_t p0, int64_t p1, int64_t p2, int64_t p3, int64_t p4, int64_t p5, int64_t p6, int64_t p7)"
 REG_DECL = (
-    "int64_t zero=0, ra, sp, gp, tp, t0, t1, t2, s0, s1, "
-    "a0=p0, a1=p1, a2=p2, a3=p3, a4=p4, a5=p5, a6=p6, a7=p7, "
+    "int64_t zero=0, ra, stack_ptr, gp, tp, t0, t1, t2, frame_ptr, s1, "
+    "arg0=p0, arg1=p1, arg2=p2, arg3=p3, arg4=p4, arg5=p5, arg6=p6, arg7=p7, "
     "s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, t3, t4, t5, t6;"
 )
 

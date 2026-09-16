@@ -299,6 +299,44 @@ std::vector<uint64_t> defaultArgumentRegisters(const std::string& architecture) 
     return result;
 }
 
+// Whole-identifier replacement (defined below; boundary-aware so renaming
+// "a1" never touches "a11").
+std::string replaceIdentifier(std::string text, const std::string& from,
+                              const std::string& to);
+
+// Readability: the ABI role of an 8-byte architectural register, for
+// offsets that have one.  Argument registers are checked before the return
+// register because they coincide on some ABIs (riscv a0) and the
+// argument role is what a reader tracks at call sites.  Offsets without a
+// role keep their architectural name (t0, s1, r10, ...).
+std::string abiRoleName(const std::string& architecture, uint64_t offset) {
+    if (offset == stackPointerOffset(architecture)) return "stack_ptr";
+    if (offset == framePointerOffset(architecture)) return "frame_ptr";
+    const auto arguments = defaultArgumentRegisters(architecture);
+    for (size_t i = 0; i < arguments.size(); ++i)
+        if (arguments[i] == offset)
+            return "arg" + std::to_string(i);
+    if (offset == returnRegisterOffset(architecture)) return "ret_val";
+    return registerName(architecture, offset, 8);
+}
+
+// Whole-identifier rename of the ABI-role registers in emitted C text.
+// replaceIdentifier is boundary-aware, so renaming "a1" never touches
+// "a11" or "local_a1".  Applied to complete function bodies (and the
+// typed wrapper re-applies it to its declarations), so every reference
+// and every declaration stays in sync.
+std::string renameAbiRoles(std::string text, const std::string& architecture) {
+    const int registerCount =
+        architecture.rfind("x86", 0) == 0 ? 16 : 32;
+    for (int index = 0; index < registerCount; ++index) {
+        const uint64_t offset = static_cast<uint64_t>(index) * 8;
+        const std::string from = registerName(architecture, offset, 8);
+        const std::string to = abiRoleName(architecture, offset);
+        if (from != to) text = replaceIdentifier(text, from, to);
+    }
+    return text;
+}
+
 std::string hexAddr(uint64_t a) {
     char buf[24];
     std::snprintf(buf, sizeof(buf), "0x%llx",
@@ -3970,7 +4008,7 @@ te.pushSlots = &pushSlots;
             out << labelName(missing) << ":;\n";
         }
     }
-    return out.str();
+    return renameAbiRoles(out.str(), architecture);
 }
 
 std::string decompileTyped(
@@ -3995,9 +4033,9 @@ std::string decompileTyped(
     bool useRecoveredRuntime, const StackFrameModel* stackModel,
     const GlobalObjectRecovery* globals,
     const std::function<bool(uint64_t)>& guardSlotOf) {
-    const std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
-                                       architecture, useRecoveredRuntime,
-                                       stackModel, globals, guardSlotOf);
+    std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
+                                 architecture, useRecoveredRuntime,
+                                 stackModel, globals, guardSlotOf);
     // A data-slot trampoline (indirect tail call) forwards the callee's
     // return value through rax, so it must never decompile to void: the
     // typed wrapper's void-return rewrite would turn the dispatch into a
@@ -4006,6 +4044,35 @@ std::string decompileTyped(
     // crashes downstream).  Promote the signature to a 64-bit value return
     // when the body carries a tail-call dispatch.
     FunctionSignature effectiveSignature = signature;
+    // ABI-role register names (arg0, ret_val, ...) can collide with
+    // signature parameter names - inferSignature names parameters arg0..,
+    // which is exactly the riscv/win64 argument naming.  For any role
+    // that collides, revert the register to its architectural name in the
+    // body so the wrapper stays compilable (parameter arg0 + register a0).
+    {
+        std::set<std::string> parameterNames;
+        for (const FunctionParameter& parameter : effectiveSignature.parameters)
+            parameterNames.insert(parameter.name);
+        const int registerCount =
+            architecture.rfind("x86", 0) == 0 ? 16 : 32;
+        for (int index = 0; index < registerCount; ++index) {
+            const uint64_t offset = static_cast<uint64_t>(index) * 8;
+            const std::string role = abiRoleName(architecture, offset);
+            if (role != registerName(architecture, offset, 8) &&
+                parameterNames.count(role))
+                body = replaceIdentifier(body, role,
+                                         registerName(architecture, offset, 8));
+        }
+    }
+    // The register name to declare/bind for an offset: the ABI role, or the
+    // architectural name when the role collides with a parameter name.
+    auto registerDeclName = [&](uint64_t offset) {
+        const std::string role = abiRoleName(architecture, offset);
+        for (const FunctionParameter& parameter : effectiveSignature.parameters)
+            if (parameter.name == role)
+                return registerName(architecture, offset, 8);
+        return role;
+    };
     if (effectiveSignature.returnType.kind == TypeKind::VOID_TYPE &&
         (body.find("return recovered_dispatch(") != std::string::npos ||
          body.find("return ((uint64_t (*)(...))(uintptr_t)") !=
@@ -4070,7 +4137,8 @@ std::string decompileTyped(
         const int registerCount = architecture.rfind("x86", 0) == 0 ? 16 : 32;
         std::vector<std::string> usedRegisters;
         for (int index = 0; index < registerCount; ++index) {
-            const std::string name = registerName(architecture, index * 8);
+            const std::string name = registerDeclName(
+                static_cast<uint64_t>(index) * 8);
             bool parameterRegister = false;
             for (const FunctionParameter& parameter : effectiveSignature.parameters)
                 parameterRegister |= parameter.registerOffset ==
@@ -4172,8 +4240,7 @@ std::string decompileTyped(
         }
         for (const FunctionParameter& parameter : effectiveSignature.parameters) {
             if (parameter.onStack) continue;
-            const std::string name = registerName(architecture,
-                                                  parameter.registerOffset);
+            const std::string name = registerDeclName(parameter.registerOffset);
             out << "    " << name << " = (uint64_t)(uintptr_t)"
                 << parameter.name << ";\n";
         }
@@ -4193,9 +4260,10 @@ std::string decompileTyped(
     for (const FunctionParameter& parameter : effectiveSignature.parameters)
         if (parameter.onStack) {
             if (useRecoveredRuntime)
-                out << "    recovered_store<std::uint64_t>(rsp + "
-                    << parameter.stackOffset << ", " << parameter.name
-                    << ");\n";
+                out << "    recovered_store<std::uint64_t>(" +
+                           registerDeclName(stackPointerOffset(architecture)) +
+                           " + " + std::to_string(parameter.stackOffset) +
+                           ", " + parameter.name + ");\n";
             else
                 out << "    " << localName(parameter.stackOffset)
                     << " = (uint64_t)(uintptr_t)" << parameter.name << ";\n";
@@ -4206,7 +4274,7 @@ std::string decompileTyped(
         if (line.rfind("// decompiled", 0) == 0) continue;
         const size_t first = line.find_first_not_of(' ');
         const std::string machineReturn = "return " +
-            registerName(architecture, returnRegisterOffset(architecture)) + ";";
+            registerDeclName(returnRegisterOffset(architecture)) + ";";
         if (effectiveSignature.returnType.kind == TypeKind::VOID_TYPE &&
             first != std::string::npos && line.substr(first) == machineReturn)
             line = line.substr(0, first) + "return;";
@@ -4220,17 +4288,16 @@ std::string decompileTyped(
         else if (effectiveSignature.returnType.kind == TypeKind::POINTER &&
                  first != std::string::npos && line.substr(first) == machineReturn)
             line = line.substr(0, first) + "return (void *)(uintptr_t)" +
-                   registerName(architecture,
-                                returnRegisterOffset(architecture)) + ";";
+                   registerDeclName(returnRegisterOffset(architecture)) + ";";
         else if (effectiveSignature.returnComponents.size() > 1 &&
                  effectiveSignature.returnType.kind == TypeKind::STRUCT &&
                  effectiveSignature.returnType.detail &&
                  first != std::string::npos && line.substr(first) == machineReturn)
             line = line.substr(0, first) + "return (struct " +
                    effectiveSignature.returnType.detail->name + "){ " +
-                   registerName(architecture, returnRegisterOffset(architecture)) +
-                   ", " + registerName(architecture,
-                                        secondaryReturnRegisterOffset(architecture)) +
+                   registerDeclName(returnRegisterOffset(architecture)) +
+                   ", " + registerDeclName(
+                       secondaryReturnRegisterOffset(architecture)) +
                    " };";
         out << line << "\n";
     }

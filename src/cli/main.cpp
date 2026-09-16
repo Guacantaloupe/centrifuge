@@ -809,8 +809,15 @@ int cmdSpec(int argc, char** argv) {
         std::string entryName;
         for (const auto& s : prog->symbols)
             if (s.isFunction && s.addr == addr) { entryName = s.name; break; }
+        // Match decompile-native: pin the ABI so ABI-role naming (arg0..,
+        // ret_val, stack_ptr) reflects the binary's actual calling
+        // convention (PE x86-64 defaults to win64 register order).
+        const std::string abi = prog->arch.rfind("x86", 0) == 0 &&
+                                        prog->arch != "x86"
+                                    ? "win64"
+                                    : std::string();
         std::printf("%s", decompile(*eng, reader, addr, end, nameOf, nullptr,
-                                     prog->arch, false, nullptr, nullptr,
+                                     prog->arch + abi, false, nullptr, nullptr,
                                      nullptr, entryName).c_str());
         return 0;
     }

@@ -155,8 +155,8 @@ FN compiler_conditions(uint64_t x,uint64_t y,uint8_t *p) { p[0]=(x<y); return ((
             if result.returncode:
                 raise RuntimeError(result.stderr + result.stdout)
             source += [f'static uint64_t recovered_{name}(uint64_t x,uint64_t y,uint8_t *p) {{',
-                       'uint64_t rax=0,rbx=0,rcx=x,rdx=y,rsi=0,rdi=0,rsp=0,rbp=0,r8=(uintptr_t)p,r9=0,r10=0,r11=0,r12=0,r13=0,r14=0,r15=0;',
-                       'uint64_t param1=0,param2=0,param3=y,param4=x,param5=(uintptr_t)p,param6=0;',
+                       'uint64_t ret_val=0,rbx=0,arg0=x,arg1=y,rsi=0,rdi=0,stack_ptr=0,frame_ptr=0,arg2=(uintptr_t)p,arg3=0,r10=0,r11=0,r12=0,r13=0,r14=0,r15=0;',
+                       'uint64_t param1=x,param2=y,param3=(uintptr_t)p,param4=0,param5=0,param6=0;',
                        'uint8_t r4096=0,r4097=0,r4098=0,r4099=0,r4100=0,r4101=0,r4102=0;',
                        result.stdout, '}']
             source += [f'static const unsigned char code_{name}[]={{' + ','.join(str(b) for b in code) + '};']

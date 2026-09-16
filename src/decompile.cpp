@@ -471,6 +471,131 @@ std::string stripParens(const std::string& s) {
     return s;
 }
 
+// True when the expression text may carry evaluation side effects (a
+// function call other than a fixed-width conversion or sizeof).  Folds
+// that collapse "x & x" to "x" must not drop a second evaluation.
+// Hand-rolled (no std::regex) so there is no pattern-grammar dependence.
+bool mayHaveSideEffects(const std::string& text) {
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (!std::isalpha(static_cast<unsigned char>(text[i])) &&
+            text[i] != '_')
+            continue;
+        const size_t start = i;
+        while (i < text.size() &&
+               (std::isalnum(static_cast<unsigned char>(text[i])) ||
+                text[i] == '_'))
+            i++;
+        const std::string word = text.substr(start, i - start);
+        size_t j = i;
+        while (j < text.size() && text[j] == ' ') j++;
+        if (j >= text.size() || text[j] != '(') continue;
+        if (word == "uint8_t" || word == "int8_t" ||
+            word == "uint16_t" || word == "int16_t" ||
+            word == "uint32_t" || word == "int32_t" ||
+            word == "uint64_t" || word == "int64_t" ||
+            word == "uintptr_t" || word == "intptr_t" ||
+            word == "sizeof")
+            continue;
+        return true; // a call of some other function
+    }
+    return false;
+}
+
+// After removing redundant fully-wrapping paren layers, return the top
+// level comparison operator of `s` ("==", "!=", "<=", ">=", "<", ">"),
+// or "" when `s` is not a comparison.  Shift operators are skipped so a
+// bare "a << b" is not mistaken for a comparison.
+std::string topLevelComparison(std::string s) {
+    for (;;) {
+        const std::string t = stripParens(s);
+        if (t == s) break;
+        s = t;
+    }
+    int depth = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (c == '(') { depth++; continue; }
+        if (c == ')') { depth--; continue; }
+        if (depth != 0 || i + 1 >= s.size()) continue;
+        if (c == '=' && s[i + 1] == '=') return "==";
+        if (c == '!' && s[i + 1] == '=') return "!=";
+        if (c == '<' && s[i + 1] == '=') return "<=";
+        if (c == '>' && s[i + 1] == '=') return ">=";
+        if (c == '<' && s[i + 1] == '<') { i++; continue; }
+        if (c == '>' && s[i + 1] == '>') { i++; continue; }
+        if (c == '<') return "<";
+        if (c == '>') return ">";
+    }
+    return "";
+}
+
+// Normalize a CBRANCH condition for readability, preserving semantics:
+//   - "(cmp) != 0"  -> "(cmp)"      (a comparison already yields 0/1;
+//                                    the parenthesized group is kept
+//                                    verbatim so surrounding precedence
+//                                    cannot change)
+//   - "X == (0)" / "X != (0)" and the other comparison operators with a
+//     parenthesized pure-decimal literal operand drop the parens.
+std::string normalizeBranchCond(std::string cond) {
+    // "op (digits)" -> "op digits" for the comparison operators
+    // (hand-rolled; longest operators first so "<=" wins over "<").
+    static const char* ops[] = {"==", "!=", "<=", ">=", "<", ">"};
+    for (size_t i = 0; i < cond.size(); ++i) {
+        size_t len = 0;
+        for (const char* op : ops) {
+            const size_t l = std::strlen(op);
+            if (cond.compare(i, l, op) == 0) { len = l; break; }
+        }
+        if (len == 0) continue;
+        size_t k = i + len;
+        if (k >= cond.size() || cond[k] != ' ') continue;
+        if (++k >= cond.size() || cond[k] != '(') continue;
+        size_t d = k + 1;
+        while (d < cond.size() &&
+               std::isdigit(static_cast<unsigned char>(cond[d])))
+            d++;
+        if (d == k + 1 || d >= cond.size() || cond[d] != ')') continue;
+        cond.erase(d, 1);
+        cond.erase(k, 1);
+        i = d;
+    }
+    bool changed = true;
+    int guard = 0;
+    while (changed && guard++ < 64) {
+        changed = false;
+        for (size_t i = 0; i + 3 < cond.size() && !changed; ++i) {
+            if (cond[i] != '!' || cond[i + 1] != '=' ||
+                cond[i + 2] != ' ' || cond[i + 3] != '0')
+                continue;
+            const size_t zeroEnd = i + 4;
+            if (zeroEnd < cond.size() &&
+                std::isalnum(static_cast<unsigned char>(cond[zeroEnd])))
+                continue;
+            // The text before " != 0" must end with a balanced group.
+            size_t ge = i;
+            while (ge > 0 && cond[ge - 1] == ' ') --ge;
+            if (ge == 0 || cond[ge - 1] != ')') continue;
+            int depth = 1;
+            size_t gs = ge - 1;
+            while (gs > 0) {
+                --gs;
+                if (cond[gs] == ')') depth++;
+                else if (cond[gs] == '(') {
+                    if (--depth == 0) break;
+                }
+            }
+            if (depth != 0) continue;
+            const std::string group = cond.substr(gs, ge - gs);
+            if (topLevelComparison(group).empty()) continue;
+            cond.replace(gs, zeroEnd - gs, group);
+            changed = true;
+        }
+    }
+    // The emitters wrap the condition in "if (...)" themselves, so a
+    // single fully-wrapped group would print double parens; drop it.
+    return stripParens(cond);
+}
+
 // Byte width of a fixed-width integer type name (e.g. "uint32_t" -> 4);
 // 0 for anything else (floats, unknown names).
 int typeWidth(const std::string& type) {
@@ -1199,6 +1324,10 @@ public:
                             }
                         }
                     }
+                    // Substitution leaves "(cmp) != 0" wrappers around
+                    // inlined flag comparisons; a comparison already
+                    // yields 0/1, so unwrap them for readability.
+                    cond = normalizeBranchCond(cond);
                     hasCond = true;
                     continue;
                 }
@@ -1508,6 +1637,13 @@ public:
                         r.text = "0";
                         r.size = vo->size;
                         r.isConst = true;
+                    } else if (a.text == b.text && !a.text.empty() &&
+                               op.op == POp::INT_AND &&
+                               !mayHaveSideEffects(a.text)) {
+                        // x & x == x.  Restricted to side-effect-free
+                        // operands so the fold cannot drop a second
+                        // evaluation of a call.
+                        r = a;
                     } else {
                         r.text = "(" + a.text + " " + c + " " + b.text + ")";
                         if (op.op == POp::INT_MULT && vo->size <= 8) {

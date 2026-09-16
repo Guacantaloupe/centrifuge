@@ -917,6 +917,100 @@ std::string dropSubsumedTruncations(std::string text) {
     return text;
 }
 
+// Right-operand counterpart of dropSubsumedTruncations:
+// "(T)(lhs OP ((T)(X)))" -> "(T)(lhs OP (X))" for identical unsigned T
+// and OP in {+ - & | ^}.  Same distributivity argument; additionally the
+// enclosing "(T)(" is verified textually (the cast immediately before
+// the operand group), so standalone "((T)(X))" occurrences without a
+// subsuming outer truncation are never touched.
+std::string dropSubsumedRightTruncations(std::string text) {
+    const char* types[] = {"uint8_t", "uint16_t", "uint32_t"};
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const char* tc : types) {
+            const std::string t = "(" + std::string(tc) + ")";
+            const std::string needle = "(" + t + "(";
+            size_t pos = 0;
+            while ((pos = text.find(needle, pos)) != std::string::npos) {
+                // X opens at the needle's final '('.
+                const size_t xOpen = pos + needle.size() - 1;
+                // The wrapper must be exactly "((T)(X))": the char before
+                // the needle's wrapper open starts the context checks.
+                if (pos == 0) {
+                    pos++;
+                    continue;
+                }
+                int depth = 0;
+                size_t j = xOpen;
+                for (; j < text.size(); ++j) {
+                    if (text[j] == '(')
+                        depth++;
+                    else if (text[j] == ')') {
+                        depth--;
+                        if (!depth) break;
+                    }
+                }
+                if (j + 1 >= text.size() || text[j + 1] != ')') {
+                    pos++;
+                    continue; // wrapper close must follow X
+                }
+                // Context before the wrapper: " <op> " then lhs, and the
+                // enclosing group must open right after an identical cast.
+                bool ok = pos >= 4 && text[pos - 1] == ' ' &&
+                          text[pos - 3] == ' ' &&
+                          std::string("+-&|^").find(text[pos - 2]) !=
+                              std::string::npos;
+                size_t g = 0; // enclosing group open
+                if (ok) {
+                    int d = 0;
+                    size_t i = pos - 4;
+                    for (;;) {
+                        if (i == std::string::npos) {
+                            ok = false;
+                            break;
+                        }
+                        const char c = text[i];
+                        if (c == ')')
+                            d++;
+                        else if (c == '(') {
+                            if (d == 0) {
+                                g = i;
+                                break;
+                            }
+                            d--;
+                        }
+                        if (i == 0) {
+                            ok = false;
+                            break;
+                        }
+                        --i;
+                    }
+                }
+                if (ok && (g < t.size() + 1 ||
+                           text.compare(g - t.size(), t.size(), t) != 0 ||
+                           (g > t.size() &&
+                            (std::isalnum(
+                                 static_cast<unsigned char>(
+                                     text[g - t.size() - 1])) ||
+                             text[g - t.size() - 1] == '_'))))
+                    ok = false;
+                if (!ok) {
+                    pos++;
+                    continue;
+                }
+                // "((T)(X))" -> "(X)": erase wrapper open + cast, then the
+                // wrapper close that followed X.
+                text.erase(pos, t.size() + 1);
+                text.erase(j - t.size(), 1);
+                changed = true;
+                break; // restart the scan
+            }
+        }
+    }
+    return text;
+}
+
 // Fold "v = <expr>; return v;" (adjacent lines) into "return <expr>;".
 // Adjacency guarantees no label, branch target, or intervening statement,
 // so the store is observed only by the return; "v" is a plain local
@@ -5062,6 +5156,7 @@ te.pushSlots = &pushSlots;
     }
     std::string result = out.str();
     result = dropSubsumedTruncations(result);
+    result = dropSubsumedRightTruncations(result);
     result = rewriteSelfIncrements(result);
     if (!useRecoveredRuntime) {
         result = inlineAdjacentFlagBranches(result, architecture);

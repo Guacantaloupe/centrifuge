@@ -1186,7 +1186,10 @@ public:
                 argument = text;
             }
             if (signature && signature->parameters[p].type.kind == TypeKind::POINTER)
-                argument = "(void *)(uintptr_t)" + argument;
+                // The uintptr_t round-trip is redundant: the recovered
+                // register is already a uint64_t integer, and converting it
+                // straight to void* yields the same pointer.
+                argument = "(void *)" + argument;
             // Phase 10h: a bare constant argument that points at a printable
             // data-segment C string reads naturally as a string literal.
             // Constants may render as decimal or hex (fmtConst), so accept
@@ -4899,7 +4902,7 @@ std::string decompileTyped(
         }
         else if (effectiveSignature.returnType.kind == TypeKind::POINTER &&
                  first != std::string::npos && line.substr(first) == machineReturn)
-            line = line.substr(0, first) + "return (void *)(uintptr_t)" +
+            line = line.substr(0, first) + "return (void *)" +
                    registerDeclName(returnRegisterOffset(architecture)) + ";";
         else if (effectiveSignature.returnComponents.size() > 1 &&
                  effectiveSignature.returnType.kind == TypeKind::STRUCT &&

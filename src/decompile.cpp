@@ -2304,15 +2304,33 @@ public:
                         r.size = 1;
                         break;
                     }
+                    // Parenthesize template operands only when they are not
+                    // atomic: a register name or a literal binds tighter
+                    // than every operator used here, so "(x) ^ (y)" with
+                    // atomic operands is just noise.
+                    auto atom = [](const std::string& t) {
+                        uint64_t v = 0;
+                        if (parseConstToken(t, &v)) return t;
+                        bool ident = !t.empty() &&
+                            (std::isalpha(static_cast<unsigned char>(t[0])) ||
+                             t[0] == '_');
+                        for (size_t i = 1; ident && i < t.size(); ++i)
+                            if (!std::isalnum(static_cast<unsigned char>(t[i])) &&
+                                t[i] != '_')
+                                ident = false;
+                        return ident ? t : "(" + t + ")";
+                    };
+                    const std::string xa = atom(x);
+                    const std::string ya = atom(y);
                     if (op.op == POp::INT_CARRY) {
                         r.text = "((" + std::string(uCast(va ? va->size : 8)) +
-                                 ")((" + x + ") + (" + y + ")) < (" + x + "))";
+                                 ")(" + xa + " + " + ya + ") < " + xa + ")";
                     } else {
                         const char* arith = op.op == POp::INT_SCARRY ? "+" : "-";
                         const char* left = op.op == POp::INT_SCARRY ? "~" : "";
-                        r.text = "(((" + std::string(left) + "((" + x + ") ^ (" + y +
-                                 ")) & ((" + x + ") ^ ((" + x + ") " + arith +
-                                 " (" + y + ")))) >> " + std::to_string(bits - 1) +
+                        r.text = "(((" + std::string(left) + "(" + xa + " ^ " + ya +
+                                 ") & (" + xa + " ^ (" + xa + " " + arith +
+                                 " " + ya + "))) >> " + std::to_string(bits - 1) +
                                  ") & 1)";
                     }
                     r.size = 1;

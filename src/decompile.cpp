@@ -789,6 +789,51 @@ static int matchTopLevelZeroCompare(const std::string& cond, bool& negated) {
     return found;
 }
 
+// Rewrite "v = v + 1;" / "v = v - 1;" to "v++;" / "v--;" for plain
+// scalar identifiers.  The pseudo-registers are function-local uint64_t
+// C scalars, never address-taken, so value and side effects are
+// identical.  Longer forms ("v = v + 2;", "v = (v + x) + 1;") and
+// non-identifier operands are left untouched.
+std::string rewriteSelfIncrements(const std::string& body) {
+    std::vector<std::string> lines;
+    {
+        std::istringstream in(body);
+        std::string ln;
+        while (std::getline(in, ln)) lines.push_back(ln);
+    }
+    const auto trimmed = [](const std::string& s) {
+        const size_t a = s.find_first_not_of(" \t");
+        return a == std::string::npos ? std::string() : s.substr(a);
+    };
+    for (auto& ln : lines) {
+        const std::string t = trimmed(ln);
+        const size_t eq = t.find(" = ");
+        if (eq == std::string::npos || t.back() != ';') continue;
+        const std::string lhs = t.substr(0, eq);
+        const std::string rhs = t.substr(eq + 3, t.size() - 1 - (eq + 3));
+        if (lhs.empty() || rhs != lhs + " + 1" && rhs != lhs + " - 1")
+            continue;
+        // Whole-line plain identifier on both sides only.
+        const auto isPlainId = [](const std::string& s) {
+            return !s.empty() &&
+                   (std::isalpha(static_cast<unsigned char>(s[0])) ||
+                    s[0] == '_') &&
+                   std::all_of(s.begin(), s.end(), [](char c) {
+                       return std::isalnum(static_cast<unsigned char>(c)) ||
+                              c == '_';
+                   });
+        };
+        if (!isPlainId(lhs)) continue;
+        const char* op = rhs.back() == '1' && rhs[rhs.size() - 3] == '+'
+                             ? "++"
+                             : "--";
+        ln = ln.substr(0, ln.size() - t.size()) + lhs + op + ";";
+    }
+    std::ostringstream out;
+    for (const auto& l : lines) out << l << "\n";
+    return out.str();
+}
+
 // Phase 10i: when a flag store is immediately followed by a branch that
 // tests the same flag ("r4099 = <cond>;" then "if (r4099) goto L;"),
 // inline the stored condition into the branch.  Adjacency guarantees no
@@ -4890,6 +4935,7 @@ te.pushSlots = &pushSlots;
         }
     }
     std::string result = out.str();
+    result = rewriteSelfIncrements(result);
     if (!useRecoveredRuntime) {
         result = inlineAdjacentFlagBranches(result, architecture);
         result = removeDeadFlagStores(result, architecture);

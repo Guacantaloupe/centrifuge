@@ -739,6 +739,134 @@ std::string normalizeBranchCond(std::string cond) {
     return stripParens(cond);
 }
 
+// Match "r4096 = ...;" as a whole trimmed line: r + exactly 4 digits in
+// the x86 flag range, one assignment, one terminating ';'.  Returns the
+// flag variable ("r4096") and the RHS text without the ';'.
+static bool matchFlagStoreLine(const std::string& t, std::string& var,
+                               std::string& rhs) {
+    if (t.size() < 9 || t[0] != 'r') return false;
+    size_t i = 1;
+    while (i < t.size() && std::isdigit(static_cast<unsigned char>(t[i])))
+        i++;
+    if (i != 5) return false;
+    const uint64_t off = std::strtoull(t.substr(1, 4).c_str(), nullptr, 10);
+    if (off < 4096 || off > 4101) return false;
+    if (t.compare(i, 3, " = ") != 0) return false;
+    if (t.back() != ';') return false;
+    if (t.find(';', i) != t.size() - 1) return false;
+    var = t.substr(0, 5);
+    rhs = t.substr(i + 3, t.size() - 1 - (i + 3));
+    return true;
+}
+
+// Find the last top-level (paren-depth 0) occurrence of " == 0" or
+// " != 0" in `cond` that extends to the end of the string.  Returns 0
+// and sets `negated` when found (negated = true for " == 0"), -1 when
+// the condition does not end in such a comparison.
+static int matchTopLevelZeroCompare(const std::string& cond, bool& negated) {
+    int depth = 0;
+    int found = -1;
+    bool foundNeg = false;
+    for (size_t i = 0; i < cond.size(); ++i) {
+        if (cond[i] == '(') depth++;
+        else if (cond[i] == ')') depth--;
+        else if (depth == 0 && cond[i] == '=' && i + 3 < cond.size() &&
+                 cond[i + 1] == '=' && cond[i + 2] == ' ' &&
+                 cond[i + 3] == '0' &&
+                 cond.find_first_not_of(" \t", i + 4) == std::string::npos) {
+            found = static_cast<int>(i);
+            foundNeg = true;
+        } else if (depth == 0 && cond[i] == '!' && i + 3 < cond.size() &&
+                   cond[i + 1] == '=' && cond[i + 2] == ' ' &&
+                   cond[i + 3] == '0' &&
+                   cond.find_first_not_of(" \t", i + 4) ==
+                       std::string::npos) {
+            found = static_cast<int>(i);
+            foundNeg = false;
+        }
+    }
+    if (found >= 0) negated = foundNeg;
+    return found;
+}
+
+// Phase 10i: when a flag store is immediately followed by a branch that
+// tests the same flag ("r4099 = <cond>;" then "if (r4099) goto L;"),
+// inline the stored condition into the branch.  Adjacency guarantees no
+// label or intervening statement, so the condition's operands cannot be
+// redefined between the store and the branch, and both lines are in the
+// same basic block.  The store itself is left in place:
+// removeDeadFlagStores then drops it when no later textual read remains
+// (a later read keeps the store, which stays semantically correct).
+std::string inlineAdjacentFlagBranches(const std::string& body,
+                                       const std::string& architecture) {
+    if (architecture.rfind("x86", 0) != 0) return body;
+    std::vector<std::string> lines;
+    {
+        std::istringstream in(body);
+        std::string ln;
+        while (std::getline(in, ln)) lines.push_back(ln);
+    }
+    const auto trimmed = [](const std::string& s) {
+        const size_t a = s.find_first_not_of(" \t");
+        return a == std::string::npos ? std::string() : s.substr(a);
+    };
+    for (size_t i = 0; i + 1 < lines.size(); ++i) {
+        const std::string t = trimmed(lines[i]);
+        std::string var, cond;
+        if (!matchFlagStoreLine(t, var, cond)) continue;
+        // The stored condition must not reference the flag itself.
+        if (cond.find(var) != std::string::npos) continue;
+        const std::string b = trimmed(lines[i + 1]);
+        const std::string prefix = "if (";
+        if (b.rfind(prefix, 0) != 0) continue;
+        const size_t gotoPos = b.rfind(") goto ");
+        if (gotoPos == std::string::npos) continue;
+        std::string test = b.substr(prefix.size(), gotoPos - prefix.size());
+        const std::string rest = b.substr(gotoPos + 7);
+        if (rest.rfind("L0x", 0) != 0 || rest.back() != ';') continue;
+        // Drop one fully-wrapping paren group around the test, then match
+        // "var", "var != 0", or "var == 0".
+        if (test.size() >= 2 && test.front() == '(' &&
+            test.back() == ')')
+            test = test.substr(1, test.size() - 2);
+        bool negated = false;
+        bool matched = false;
+        if (test == var) {
+            matched = true;
+        } else if (test == var + " != 0") {
+            matched = true;
+        } else if (test == var + " == 0") {
+            matched = true;
+            negated = true;
+        }
+        if (!matched) continue;
+        std::string newCond = cond;
+        if (negated) {
+            bool zeroNeg = false;
+            if (matchTopLevelZeroCompare(cond, zeroNeg) >= 0) {
+                // Flip " == 0" <-> " != 0" at the top level.
+                std::string flipped = cond;
+                const int pos =
+                    matchTopLevelZeroCompare(flipped, zeroNeg);
+                // pos points at the first '=' of "== 0" / "!= 0"; the
+                // leading space is preserved, so replace the 4 chars
+                // "== 0" / "!= 0" with their opposite.
+                flipped.replace(static_cast<size_t>(pos), 4,
+                                zeroNeg ? "!= 0" : "== 0");
+                newCond = flipped;
+            } else {
+                newCond = "!(" + cond + ")";
+            }
+        }
+        const std::string indent = lines[i + 1].substr(
+            0, lines[i + 1].size() - b.size());
+        lines[i + 1] = indent + "if (" + newCond + ") goto " + rest;
+    }
+    std::ostringstream out;
+    for (const auto& l : lines) out << l << "\n";
+    return out.str();
+}
+
 // Phase 10h: drop flag-register stores ("r4096 = ...;") whose variable is
 // never read anywhere in the emitted function.  Flag registers are
 // function-local C scalars, never address-taken, so a store with no
@@ -776,24 +904,6 @@ std::string removeDeadFlagStores(const std::string& body,
         const size_t a = s.find_first_not_of(" \t");
         return a == std::string::npos ? std::string() : s.substr(a);
     };
-    const auto isFlagStore = [&trimmed](const std::string& t, std::string& var) {
-        // "r4096 = ...;" as a whole line: r + exactly 4 digits, one
-        // assignment, one terminating ';'.
-        if (t.size() < 9 || t[0] != 'r') return false;
-        size_t i = 1;
-        while (i < t.size() &&
-               std::isdigit(static_cast<unsigned char>(t[i])))
-            i++;
-        if (i != 5) return false;
-        const uint64_t off =
-            std::strtoull(t.substr(1, 4).c_str(), nullptr, 10);
-        if (off < 4096 || off > 4101) return false;
-        if (t.compare(i, 3, " = ") != 0) return false;
-        if (t.back() != ';') return false;
-        if (t.find(';', i) != t.size() - 1) return false;
-        var = t.substr(0, 5);
-        return true;
-    };
     const auto isDeclaration = [](const std::string& t) {
         if (t.rfind("uint64_t ", 0) == 0 || t.rfind("int64_t ", 0) == 0 ||
             t.rfind("uint32_t ", 0) == 0 || t.rfind("int32_t ", 0) == 0)
@@ -804,10 +914,9 @@ std::string removeDeadFlagStores(const std::string& body,
     std::set<std::string> used;
     for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
         const std::string t = trimmed(*it);
-        std::string var;
-        if (isFlagStore(t, var)) {
+        std::string var, rhs;
+        if (matchFlagStoreLine(t, var, rhs)) {
             if (used.count(var)) {
-                const std::string rhs = t.substr(t.find(" = ") + 3);
                 for (const auto& id : identifiers(rhs)) used.insert(id);
             } else {
                 it->clear(); // dead store: never read
@@ -4781,8 +4890,10 @@ te.pushSlots = &pushSlots;
         }
     }
     std::string result = out.str();
-    if (!useRecoveredRuntime)
+    if (!useRecoveredRuntime) {
+        result = inlineAdjacentFlagBranches(result, architecture);
         result = removeDeadFlagStores(result, architecture);
+    }
     return renameAbiRoles(result, architecture);
 }
 

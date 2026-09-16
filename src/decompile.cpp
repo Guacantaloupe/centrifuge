@@ -1058,6 +1058,9 @@ public:
     const std::set<uint64_t>* liveOutCall = nullptr;
     const std::set<uint64_t>* callArgsLocal = nullptr;
     const std::map<uint64_t, std::vector<int>>* readPos = nullptr;
+    // Phase 10g-2: same-block write positions for dead-overwritten-flag
+    // removal (blockWritePos).
+    const std::map<uint64_t, std::vector<int>>* writePos = nullptr;
     // Phase 10h: memory access for string-literal recovery at call sites.
     std::function<bool(uint64_t, void*, size_t)> memRead;
 
@@ -3587,6 +3590,14 @@ public:
                 if (liveFlags && storage >= 4096 && storage <= 4101 &&
                     !liveFlags->count(storage))
                     continue; // Phase 10g: dead flag write
+                // Phase 10g-2: a flag write that a later same-block write
+                // overwrites before any read observes the value is dead even
+                // when the flag is live elsewhere (cmp followed by constant
+                // flag materialization).  Side-effect-free RHS only.
+                if (storage >= 4096 && storage <= 4101 &&
+                    overwrittenBeforeRead(storage, piIndex) &&
+                    inlineableExpression(kv.second))
+                    continue;
                 // track sp adjustment (prologue/frame): sp = sp +/- K
                 const bool isSpWrite =
                     storage == stackPointerOffset(architecture) &&
@@ -3760,6 +3771,32 @@ public:
         for (const int position : it->second)
             if (static_cast<size_t>(position) >= piIndex) return true;
         return false;
+    }
+
+    // Phase 10g-2: is the value written to `storage` at piIndex observed
+    // before a later same-block write overwrites it?  The write is dead
+    // when the next same-block write to `storage` strictly follows piIndex
+    // and no read of `storage` sits in the open interval up to and
+    // including that next write (a read at the overwriting instruction
+    // observes this value: pending writes flush after the instruction's
+    // reads, so conservatively keep it).
+    bool overwrittenBeforeRead(uint64_t storage, size_t piIndex) const {
+        if (!writePos || !readPos) return false;
+        const auto it = writePos->find(storage);
+        if (it == writePos->end()) return false;
+        int next = -1;
+        for (const int position : it->second)
+            if (static_cast<size_t>(position) > piIndex &&
+                (next < 0 || position < next))
+                next = position;
+        if (next < 0) return false;
+        const auto rit = readPos->find(storage);
+        if (rit != readPos->end())
+            for (const int position : rit->second)
+                if (static_cast<size_t>(position) > piIndex &&
+                    position <= next)
+                    return false;
+        return true;
     }
 
 private:
@@ -3946,6 +3983,7 @@ std::string decompile(
     std::map<uint64_t, std::set<uint64_t>> liveOut, liveOutCall;
     std::map<uint64_t, std::set<uint64_t>> callArgsLocal;
     std::map<uint64_t, std::map<uint64_t, std::vector<int>>> blockReadPos;
+    std::map<uint64_t, std::map<uint64_t, std::vector<int>>> blockWritePos;
     const bool livenessEnabled =
         !useRecoveredRuntime && architecture.rfind("x86", 0) == 0;
     if (livenessEnabled) {
@@ -3954,6 +3992,7 @@ std::string decompile(
             liveOutCall[b.start];
             callArgsLocal[b.start];
             blockReadPos[b.start];
+            blockWritePos[b.start];
         }
     }
     auto findLiveSet = [](const std::map<uint64_t, std::set<uint64_t>>& m,
@@ -3962,6 +4001,13 @@ std::string decompile(
         return it == m.end() ? nullptr : &it->second;
     };
     auto findReadPos =
+        [](const std::map<uint64_t,
+                         std::map<uint64_t, std::vector<int>>>& m,
+           uint64_t key) -> const std::map<uint64_t, std::vector<int>>* {
+        const auto it = m.find(key);
+        return it == m.end() ? nullptr : &it->second;
+    };
+    auto findWritePos =
         [](const std::map<uint64_t,
                          std::map<uint64_t, std::vector<int>>>& m,
            uint64_t key) -> const std::map<uint64_t, std::vector<int>>* {
@@ -3979,10 +4025,15 @@ std::string decompile(
                 const auto& pi = b.insns[piIndex];
                 for (const auto& op : pi.ops) {
                     const Varnode* out = pi.find(op.out);
-                    if (out && out->kind == Varnode::REGISTER)
+                    if (out && out->kind == Varnode::REGISTER) {
                         writtenIn[b.start].insert(
                             registerStorageOffset(architecture, out->offset,
                                                   out->size));
+                        blockWritePos[b.start][
+                            registerStorageOffset(architecture, out->offset,
+                                                  out->size)]
+                                .push_back(static_cast<int>(piIndex));
+                    }
                     if (op.op == POp::CALL || op.op == POp::CALLIND) {
                         // ABI argument registers may be consumed by name at
                         // the call site; the target operand is still a real
@@ -4122,6 +4173,7 @@ body.liveOut = livenessEnabled ? findLiveSet(liveOut, b->start) : nullptr;
 body.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, b->start) : nullptr;
 body.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
 body.readPos = livenessEnabled ? findReadPos(blockReadPos, b->start) : nullptr;
+body.writePos = livenessEnabled ? findWritePos(blockWritePos, b->start) : nullptr;
 body.memRead = read;
 
 
@@ -4162,6 +4214,7 @@ body.liveOut = livenessEnabled ? findLiveSet(liveOut, b->start) : nullptr;
 body.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, b->start) : nullptr;
 body.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
 body.readPos = livenessEnabled ? findReadPos(blockReadPos, b->start) : nullptr;
+body.writePos = livenessEnabled ? findWritePos(blockWritePos, b->start) : nullptr;
 body.memRead = read;
 
 
@@ -4248,6 +4301,7 @@ header.liveOut = livenessEnabled ? findLiveSet(liveOut, b->start) : nullptr;
 header.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, b->start) : nullptr;
 header.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
 header.readPos = livenessEnabled ? findReadPos(blockReadPos, b->start) : nullptr;
+header.writePos = livenessEnabled ? findWritePos(blockWritePos, b->start) : nullptr;
 header.memRead = read;
 
 
@@ -4305,6 +4359,7 @@ be.liveOut = livenessEnabled ? findLiveSet(liveOut, b->start) : nullptr;
 be.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, b->start) : nullptr;
 be.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, b->start) : nullptr;
 be.readPos = livenessEnabled ? findReadPos(blockReadPos, b->start) : nullptr;
+be.writePos = livenessEnabled ? findWritePos(blockWritePos, b->start) : nullptr;
 be.memRead = read;
 
 
@@ -4351,6 +4406,7 @@ thenBody.liveOut = livenessEnabled ? findLiveSet(liveOut, tb->start) : nullptr;
 thenBody.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, tb->start) : nullptr;
 thenBody.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, tb->start) : nullptr;
 thenBody.readPos = livenessEnabled ? findReadPos(blockReadPos, tb->start) : nullptr;
+thenBody.writePos = livenessEnabled ? findWritePos(blockWritePos, tb->start) : nullptr;
 thenBody.memRead = read;
 
 
@@ -4375,6 +4431,7 @@ elseBody.liveOut = livenessEnabled ? findLiveSet(liveOut, fb->start) : nullptr;
 elseBody.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, fb->start) : nullptr;
 elseBody.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, fb->start) : nullptr;
 elseBody.readPos = livenessEnabled ? findReadPos(blockReadPos, fb->start) : nullptr;
+elseBody.writePos = livenessEnabled ? findWritePos(blockWritePos, fb->start) : nullptr;
 elseBody.memRead = read;
 
 
@@ -4415,6 +4472,7 @@ te.liveOut = livenessEnabled ? findLiveSet(liveOut, tb->start) : nullptr;
 te.liveOutCall = livenessEnabled ? findLiveSet(liveOutCall, tb->start) : nullptr;
 te.callArgsLocal = livenessEnabled ? findLiveSet(callArgsLocal, tb->start) : nullptr;
 te.readPos = livenessEnabled ? findReadPos(blockReadPos, tb->start) : nullptr;
+te.writePos = livenessEnabled ? findWritePos(blockWritePos, tb->start) : nullptr;
 te.memRead = read;
 
 

@@ -3163,10 +3163,57 @@ public:
                     break;
                 }
                 case POp::SELECT: {
-                    const CExpr c = exprOfV(pi.find(op.in0));
+                    const Varnode* condition = pi.find(op.in0);
+                    // CMOV conditions are one-byte flag (or UNIQUE flag)
+                    // values; the source-facing view substitutes the p-code
+                    // expression which last defined CF/ZF/SF/OF, exactly
+                    // like CBRANCH, so `r4099 != 0 ? a : b` reads as the
+                    // original comparison.  The recovered runtime keeps the
+                    // flag model.
+                    std::string condText;
+                    if (!useRecoveredRuntime && condition &&
+                        condition->kind == Varnode::REGISTER &&
+                        condition->offset >= 4096 && condition->offset <= 4101) {
+                        const auto definition = regExpr.find(condition->offset);
+                        condText = definition != regExpr.end() &&
+                                   inlineableExpression(definition->second)
+                            ? stripParens(definition->second.text)
+                            : stripParens(exprOfV(condition).text);
+                    } else {
+                        condText = stripParens(exprOfV(condition).text);
+                    }
+                    if (!useRecoveredRuntime) {
+                        // The condition may be a UNIQUE byte built from
+                        // INT_NOTEQUAL(flag, 0); substitute flags inside
+                        // that expression too, not only a direct operand.
+                        for (uint64_t flag = 4096; flag <= 4101; ++flag) {
+                            const auto definition = regExpr.find(flag);
+                            if (definition == regExpr.end() ||
+                                !inlineableExpression(definition->second)) continue;
+                            const std::string name = registerName(
+                                architecture, flag, 1);
+                            size_t at = 0;
+                            while ((at = condText.find(name, at)) !=
+                                   std::string::npos) {
+                                const bool before = at == 0 ||
+                                    (!std::isalnum(static_cast<unsigned char>(condText[at - 1])) && condText[at - 1] != '_');
+                                const size_t afterAt = at + name.size();
+                                const bool after = afterAt == condText.size() ||
+                                    (!std::isalnum(static_cast<unsigned char>(condText[afterAt])) && condText[afterAt] != '_');
+                                if (!before || !after) { at = afterAt; continue; }
+                                const std::string replacement = "(" +
+                                    stripParens(definition->second.text) + ")";
+                                condText.replace(at, name.size(), replacement);
+                                at += replacement.size();
+                            }
+                        }
+                    }
+                    // Unwrap "(cmp) != 0" wrappers left around inlined flag
+                    // comparisons, as for branch conditions.
+                    condText = normalizeBranchCond(condText);
                     const CExpr yes = exprOfV(pi.find(op.in1));
                     const CExpr no = exprOfV(pi.find(op.in2));
-                    r.text = "(" + stripParens(c.text) + " ? " +
+                    r.text = "(" + condText + " ? " +
                              stripParens(yes.text) + " : " + stripParens(no.text) + ")";
                     r.size = vo->size;
                     break;

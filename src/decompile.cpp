@@ -854,6 +854,49 @@ std::string rewriteSelfIncrements(const std::string& body) {
     return out.str();
 }
 
+// Fold "v = <expr>; return v;" (adjacent lines) into "return <expr>;".
+// Adjacency guarantees no label, branch target, or intervening statement,
+// so the store is observed only by the return; "v" is a plain local
+// scalar whose declaration stays valid.  Any side effects inside <expr>
+// (calls, dereferences) are preserved.
+std::string foldAssignBeforeReturn(const std::string& body) {
+    std::vector<std::string> lines;
+    {
+        std::istringstream in(body);
+        std::string ln;
+        while (std::getline(in, ln)) lines.push_back(ln);
+    }
+    const auto trimmed = [](const std::string& s) {
+        const size_t a = s.find_first_not_of(" \t");
+        return a == std::string::npos ? std::string() : s.substr(a);
+    };
+    for (size_t i = 0; i + 1 < lines.size(); ++i) {
+        const std::string t = trimmed(lines[i]);
+        const size_t eq = t.find(" = ");
+        if (eq == std::string::npos || t.back() != ';') continue;
+        const std::string var = t.substr(0, eq);
+        if (var.empty() ||
+            !std::all_of(var.begin(), var.end(), [](char c) {
+                return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+            }))
+            continue;
+        const std::string expr =
+            t.substr(eq + 3, t.size() - 1 - (eq + 3));
+        if (expr.find(';') != std::string::npos) continue;
+        const std::string r = trimmed(lines[i + 1]);
+        if (r != "return " + var + ";") continue;
+        lines[i] = lines[i + 1].substr(
+                       0, lines[i + 1].size() - r.size()) +
+                   "return " + expr + ";";
+        lines[i + 1].clear();
+        ++i;
+    }
+    std::ostringstream out;
+    for (const auto& l : lines)
+        if (!l.empty()) out << l << "\n";
+    return out.str();
+}
+
 // Phase 10i: when a flag store is immediately followed by a branch that
 // tests the same flag ("r4099 = <cond>;" then "if (r4099) goto L;"),
 // inline the stored condition into the branch.  Adjacency guarantees no
@@ -4960,7 +5003,8 @@ te.pushSlots = &pushSlots;
         result = inlineAdjacentFlagBranches(result, architecture);
         result = removeDeadFlagStores(result, architecture);
     }
-    return renameAbiRoles(result, architecture);
+    result = renameAbiRoles(result, architecture);
+    return result;
 }
 
 std::string decompileTyped(
@@ -5307,7 +5351,12 @@ std::string decompileTyped(
     else
         out << "    return 0;\n";
     out << "}\n";
-    return out.str();
+    // Fold "v = <expr>; return v;" into "return <expr>;" last, after the
+    // signature-driven return rewriting above: only plain integer returns
+    // still read "return <machine-reg>;" here - void, pointer, and
+    // multi-component struct returns were already rewritten, and a bare
+    // expression cannot stand in for those.
+    return foldAssignBeforeReturn(out.str());
 }
 
 } // namespace centrifuge

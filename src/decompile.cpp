@@ -1174,7 +1174,7 @@ public:
                     " + " + std::to_string(callerStackOffset);
                 argument = useRecoveredRuntime
                     ? "recovered_load<std::uint64_t>(" + address + ")"
-                    : "*((uint64_t *)(uintptr_t)(" + address + "))";
+                    : "*((uint64_t *)(" + address + "))";
             } else {
                 const uint64_t argumentStorage = registerStorageOffset(
                     architecture, offset, 8);
@@ -1423,14 +1423,14 @@ public:
             auto load = [&](const std::string& address) {
                 if (useRecoveredRuntime)
                     return "recovered_load<" + type + ">(" + address + ")";
-                return "*((" + type + " *)(uintptr_t)(" + address + "))";
+                return "*((" + type + " *)(" + address + "))";
             };
             auto store = [&](const std::string& address,
                              const std::string& value) {
                 if (useRecoveredRuntime)
                     return "recovered_store<" + type + ">(" + address + ", " +
                            value + ");";
-                return "*((" + type + " *)(uintptr_t)(" + address + ")) = " +
+                return "*((" + type + " *)(" + address + ")) = " +
                        value + ";";
             };
             auto advance = [&](const char* reg) {
@@ -1681,7 +1681,7 @@ public:
                                 line(registerName(
                                          architecture,
                                          returnRegisterOffset(architecture)) +
-                                     " = ((uint64_t (*)(...))(uintptr_t)" +
+                                     " = ((uint64_t (*)(...))" +
                                      target + ")(" + forwardArgs + stackArgs +
                                      ");");
                             }
@@ -1770,7 +1770,7 @@ public:
                                         line("*((" +
                                              std::string(uCast(
                                                  vs ? vs->size : 8)) +
-                                             " *)(uintptr_t)(" +
+                                             " *)(" +
                                              object->name + ")) = " +
                                              stripParens(v.text) + ";");
                                         continue;
@@ -1783,7 +1783,7 @@ public:
                                         line("*((" +
                                              std::string(uCast(
                                                  vs ? vs->size : 8)) +
-                                             " *)(uintptr_t)(" +
+                                             " *)(" +
                                              object->name + " + " +
                                              std::to_string(offset) +
                                              ")) = " + stripParens(v.text) +
@@ -3325,7 +3325,7 @@ public:
                             if (object) {
                                 r.text =
                                     "(*(" + std::string(uCast(vo->size)) +
-                                    " *)(uintptr_t)(" + object->name + "))";
+                                    " *)(" + object->name + "))";
                                 r.size = vo->size;
                                 r.ctype = uCast(vo->size);
                                 break;
@@ -3338,7 +3338,7 @@ public:
                             if (object && offset != 0) {
                                 r.text =
                                     "(*(" + std::string(uCast(vo->size)) +
-                                    " *)(uintptr_t)(" + object->name + " + " +
+                                    " *)(" + object->name + " + " +
                                     std::to_string(offset) + "))";
                                 r.size = vo->size;
                                 r.ctype = uCast(vo->size);
@@ -4388,7 +4388,7 @@ te.pushSlots = &pushSlots;
                         std::to_string(targetSignature->parameters[i].stackOffset);
                     argument = useRecoveredRuntime
                         ? "recovered_load<std::uint64_t>(" + address + ")"
-                        : "*((uint64_t *)(uintptr_t)(" +
+                        : "*((uint64_t *)(" +
                               be.rebaseText(address) + "))";
                 } else {
                     argument = registerName(architecture, offset);
@@ -4561,11 +4561,11 @@ te.pushSlots = &pushSlots;
                             << ", " << args << ");\n";
                 } else {
                     if (memoryTarget)
-                        out << "return ((uint64_t (*)(...))(uintptr_t)(*"
-                               "(uint64_t *)(uintptr_t)(" << *memoryTarget
+                        out << "return ((uint64_t (*)(...))(*"
+                               "(uint64_t *)(" << *memoryTarget
                             << ")))(" << args << ");\n";
                     else
-                        out << "return ((uint64_t (*)(...))(uintptr_t)"
+                        out << "return ((uint64_t (*)(...))"
                             << targetRegister << ")(" << args << ");\n";
                 }
                 return;
@@ -4675,7 +4675,7 @@ std::string decompileTyped(
     };
     if (effectiveSignature.returnType.kind == TypeKind::VOID_TYPE &&
         (body.find("return recovered_dispatch(") != std::string::npos ||
-         body.find("return ((uint64_t (*)(...))(uintptr_t)") !=
+         body.find("return ((uint64_t (*)(...))") !=
              std::string::npos))
         effectiveSignature.returnType =
             DataType{TypeKind::UNSIGNED_INT, 64, 1};
@@ -4848,8 +4848,13 @@ std::string decompileTyped(
                 (parameter.type.kind == TypeKind::UNSIGNED_INT ||
                  parameter.type.kind == TypeKind::SIGNED_INT) &&
                 parameter.type.bits == 64;
+            // Pointers convert straight to uint64_t; the uintptr_t hop is
+            // redundant there.  Narrower integers keep it: zero-extension
+            // through uintptr_t differs from a signed (uint64_t) cast.
+            const bool isPointer = parameter.type.kind == TypeKind::POINTER;
             out << "    " << name << " = "
-                << (already64 ? "" : "(uint64_t)(uintptr_t)")
+                << (already64 ? ""
+                    : isPointer ? "(uint64_t)" : "(uint64_t)(uintptr_t)")
                 << parameter.name << ";\n";
         }
     }
@@ -4877,9 +4882,15 @@ std::string decompileTyped(
                     (parameter.type.kind == TypeKind::UNSIGNED_INT ||
                      parameter.type.kind == TypeKind::SIGNED_INT) &&
                     parameter.type.bits == 64;
+                // See the register-parameter case above: pointers convert
+                // straight to uint64_t, narrower integers keep the
+                // zero-extending uintptr_t hop.
+                const bool isPointer =
+                    parameter.type.kind == TypeKind::POINTER;
                 out << "    " << localName(parameter.stackOffset)
                     << " = "
-                    << (already64 ? "" : "(uint64_t)(uintptr_t)")
+                    << (already64 ? ""
+                        : isPointer ? "(uint64_t)" : "(uint64_t)(uintptr_t)")
                     << parameter.name << ";\n";
             }
         }

@@ -3486,7 +3486,15 @@ public:
                 }
                 if (write.second.size == 4) {
                     CExpr extended = write.second;
-                    extended.text = "(uint32_t)(" + extended.text + ")";
+                    // A non-negative uint32-range literal already reads as
+                    // its zero-extended value, so the wrap is redundant
+                    // there; negative or out-of-range constants keep it
+                    // (the truncation is load-bearing for them).
+                    uint64_t k = 0;
+                    if (!(extended.isConst &&
+                          parseConstToken(stripParens(extended.text), &k) &&
+                          k <= 0xffffffffULL))
+                        extended.text = "(uint32_t)(" + extended.text + ")";
                     extended.size = 8;
                     regExpr[written] = std::move(extended);
                     continue;

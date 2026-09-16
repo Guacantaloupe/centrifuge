@@ -2052,6 +2052,34 @@ public:
                     case POp::INT_SLESSEQUAL: c = "<="; break;
                     default: break;
                     }
+                    // Constant fold: flag p-code routinely compares folded
+                    // constants (INT_EQUAL(u, 0x0) with u a zero temp),
+                    // printing dead '0 == 0'.  Evaluate exactly what the
+                    // emitted C literals would compute (parseConstToken
+                    // sign-extends like strtoll, and plain decimal literals
+                    // compare as int64_t in C, so signed comparison matches
+                    // the current output's behavior for every operator).
+                    uint64_t lhs = 0, rhs = 0;
+                    if (a.isConst && b.isConst &&
+                        parseConstToken(a.text, &lhs) &&
+                        parseConstToken(b.text, &rhs)) {
+                        const int64_t sl = static_cast<int64_t>(lhs);
+                        const int64_t sr = static_cast<int64_t>(rhs);
+                        bool truth = false;
+                        switch (op.op) {
+                        case POp::INT_EQUAL: truth = sl == sr; break;
+                        case POp::INT_NOTEQUAL: truth = sl != sr; break;
+                        case POp::INT_LESS:
+                        case POp::INT_SLESS: truth = sl < sr; break;
+                        case POp::INT_LESSEQUAL:
+                        case POp::INT_SLESSEQUAL: truth = sl <= sr; break;
+                        default: break;
+                        }
+                        r.text = truth ? "1" : "0";
+                        r.isConst = true;
+                        r.size = 1;
+                        break;
+                    }
                     r.text = "(" + a.text + " " + c + " " + b.text + ")";
                     r.size = 1;
                     break;

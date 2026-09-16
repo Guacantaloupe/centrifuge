@@ -916,6 +916,20 @@ std::string castTo(const CExpr& e, const std::string& target) {
     return "(" + target + ")(" + inner + ")";
 }
 
+// Wrap a template operand in parens only when it is not atomic: a plain
+// identifier or a literal binds tighter than every binary operator the
+// expression templates use, so "(x) ^ (y)" with atomic operands is noise.
+std::string parenNonAtomic(const std::string& t) {
+    uint64_t v = 0;
+    if (parseConstToken(t, &v)) return t;
+    bool ident = !t.empty() &&
+        (std::isalpha(static_cast<unsigned char>(t[0])) || t[0] == '_');
+    for (size_t i = 1; ident && i < t.size(); ++i)
+        if (!std::isalnum(static_cast<unsigned char>(t[i])) && t[i] != '_')
+            ident = false;
+    return ident ? t : "(" + t + ")";
+}
+
 // parse "reg + K" / "reg - K" / "reg" / "K" (reg = [a-z][a-z0-9]*)
 bool parseRegConstExpr(const std::string& t, std::string& reg, int64_t& k) {
     std::string s = stripParens(t);
@@ -1978,14 +1992,14 @@ public:
                         // variable, so for a logical shift both the width
                         // presentation and the 64-bit presentation wrap
                         // are the identity.
-                        operand = "(" + stripParens(a.text) + ")";
+                        operand = parenNonAtomic(stripParens(a.text));
                     } else {
                         const std::string widthTyped = arithmetic
                             ? castTo(a, cCast(width))
                             : castTo(a, uCast(width));
-                        operand = "(" +
+                        operand = parenNonAtomic(
                             castTo(CExpr{widthTyped, 8, false, false, ""},
-                                   arithmetic ? "int64_t" : "uint64_t") + ")";
+                                   arithmetic ? "int64_t" : "uint64_t"));
                     }
                     // Constant in-range counts need no guard: the runtime
                     // ternary only models count >= width, which cannot
@@ -2305,23 +2319,9 @@ public:
                         break;
                     }
                     // Parenthesize template operands only when they are not
-                    // atomic: a register name or a literal binds tighter
-                    // than every operator used here, so "(x) ^ (y)" with
-                    // atomic operands is just noise.
-                    auto atom = [](const std::string& t) {
-                        uint64_t v = 0;
-                        if (parseConstToken(t, &v)) return t;
-                        bool ident = !t.empty() &&
-                            (std::isalpha(static_cast<unsigned char>(t[0])) ||
-                             t[0] == '_');
-                        for (size_t i = 1; ident && i < t.size(); ++i)
-                            if (!std::isalnum(static_cast<unsigned char>(t[i])) &&
-                                t[i] != '_')
-                                ident = false;
-                        return ident ? t : "(" + t + ")";
-                    };
-                    const std::string xa = atom(x);
-                    const std::string ya = atom(y);
+                    // atomic (see parenNonAtomic).
+                    const std::string xa = parenNonAtomic(x);
+                    const std::string ya = parenNonAtomic(y);
                     if (op.op == POp::INT_CARRY) {
                         r.text = "((" + std::string(uCast(va ? va->size : 8)) +
                                  ")(" + xa + " + " + ya + ") < " + xa + ")";

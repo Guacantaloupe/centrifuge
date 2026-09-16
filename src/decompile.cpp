@@ -1121,6 +1121,184 @@ std::string foldAssignBeforeReturn(const std::string& body) {
     return out.str();
 }
 
+// Phase 10j: generalise the adjacent-branch inlining to any flag use
+// inside the same basic block.  For a store "rNNNN = <cond>;", scan
+// forward to the end of the block (a label line, another store to the
+// same flag, or the flag's first use, whichever comes first).  The use
+// is textually rewritten to the stored condition when the block segment
+// between store and use cannot have changed the condition's operands:
+//   - no assignment to any identifier appearing in <cond>
+//     (pseudo-registers are never address-taken, so textual assignment
+//     is the only way a scalar changes)
+//   - if <cond> dereferences memory, no intervening pointer store or
+//     call (either could write through an alias)
+// Flag-to-flag comparisons ("r4100 == r4101") are skipped: substituting
+// one side would still be correct, but the mixed form reads worse and
+// the pair is clearer left as flags.  The store is left in place;
+// removeDeadFlagStores drops it when no other read remains.
+std::string inlineBlockFlagConditions(const std::string& body,
+                                      const std::string& architecture) {
+    if (architecture.rfind("x86", 0) != 0) return body;
+    std::vector<std::string> lines;
+    {
+        std::istringstream in(body);
+        std::string ln;
+        while (std::getline(in, ln)) lines.push_back(ln);
+    }
+    const auto trimmed = [](const std::string& s) {
+        const size_t a = s.find_first_not_of(" \t");
+        return a == std::string::npos ? std::string() : s.substr(a);
+    };
+    const auto identifiers = [](const std::string& s) {
+        std::set<std::string> ids;
+        size_t i = 0;
+        while (i < s.size()) {
+            if (std::isalpha(static_cast<unsigned char>(s[i])) ||
+                s[i] == '_') {
+                const size_t start = i;
+                while (i < s.size() &&
+                       (std::isalnum(static_cast<unsigned char>(s[i])) ||
+                        s[i] == '_'))
+                    i++;
+                ids.insert(s.substr(start, i - start));
+            } else
+                i++;
+        }
+        return ids;
+    };
+    const char* typeNames[] = {"uint8_t",  "int8_t",   "uint16_t",
+                               "int16_t",  "uint32_t", "int32_t",
+                               "uint64_t", "int64_t",  "uintptr_t"};
+    // Replace flag atoms in `line` that test `var` with the stored
+    // condition.  Returns true when at least one replacement happened.
+    const auto substitute = [&](std::string& line, const std::string& var,
+                                const std::string& cond) {
+        bool any = false;
+        size_t at = 0;
+        while ((at = line.find(var, at)) != std::string::npos) {
+            const bool leftBoundary =
+                at == 0 ||
+                !(std::isalnum(static_cast<unsigned char>(line[at - 1])) ||
+                  line[at - 1] == '_');
+            size_t end = at + var.size();
+            const bool rightBoundary =
+                end >= line.size() ||
+                !(std::isalnum(static_cast<unsigned char>(line[end])) ||
+                  line[end] == '_');
+            if (!leftBoundary || !rightBoundary) {
+                at = end;
+                continue;
+            }
+            // Determine polarity from a trailing " != 0" / " == 0".
+            bool negated = false;
+            bool shaped = false;
+            size_t atomEnd = end;
+            std::string after = line.substr(end);
+            if (after.rfind(" != 0", 0) == 0) {
+                shaped = true;
+                atomEnd = end + 5;
+            } else if (after.rfind(" == 0", 0) == 0) {
+                shaped = true;
+                negated = true;
+                atomEnd = end + 5;
+            }
+            // Flag-to-flag comparison on either side: leave alone.
+            if (shaped) {
+                const std::string rest = line.substr(atomEnd);
+                const size_t nb = rest.find_first_not_of(" \t");
+                if (nb != std::string::npos &&
+                    (rest[nb] == '=' || rest[nb] == '!'))
+                    break;
+            }
+            {
+                const std::string before = line.substr(0, at);
+                const size_t pb = before.find_last_not_of(" \t");
+                if (pb != std::string::npos && pb >= 1 &&
+                    (before[pb] == '=' || before[pb] == '!'))
+                    break;
+            }
+            std::string replacement;
+            if (!negated) {
+                replacement = "(" + cond + ")";
+            } else {
+                bool zeroNeg = false;
+                if (matchTopLevelZeroCompare(cond, zeroNeg) >= 0) {
+                    std::string flipped = cond;
+                    const int pos = matchTopLevelZeroCompare(flipped, zeroNeg);
+                    flipped.replace(static_cast<size_t>(pos), 4,
+                                    zeroNeg ? "!= 0" : "== 0");
+                    replacement = "(" + flipped + ")";
+                } else {
+                    replacement = "(!(" + cond + "))";
+                }
+            }
+            line.replace(at, atomEnd - at, replacement);
+            at += replacement.size();
+            any = true;
+        }
+        return any;
+    };
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string t = trimmed(lines[i]);
+        std::string var, cond;
+        if (!matchFlagStoreLine(t, var, cond)) continue;
+        if (cond.find(var) != std::string::npos) continue;
+        std::set<std::string> ids = identifiers(cond);
+        for (const char* tn : typeNames) ids.erase(tn);
+        const bool hasDeref = cond.find("*(") != std::string::npos ||
+                              cond.find("->") != std::string::npos;
+        bool stale = false;
+        for (size_t j = i + 1; j < lines.size() && !stale; ++j) {
+            const std::string u = trimmed(lines[j]);
+            if (u.rfind("L0x", 0) == 0 && u.back() == ':') break; // label
+            // Declaration lines only initialise; treat as a re-store
+            // boundary (they never read the flag).
+            if (u.rfind("uint64_t ", 0) == 0 || u.rfind("int64_t ", 0) == 0 ||
+                u.rfind("uint32_t ", 0) == 0 || u.rfind("int32_t ", 0) == 0 ||
+                u.rfind("const ", 0) == 0)
+                break;
+            std::string v2, c2;
+            if (matchFlagStoreLine(u, v2, c2) && v2 == var) break; // re-store
+            // Operand change checks for the segment before the first use.
+            const bool usesVar =
+                u.find(var) != std::string::npos &&
+                (u.find(var + " != 0") != std::string::npos ||
+                 u.find(var + " == 0") != std::string::npos ||
+                 identifiers(u).count(var) != 0);
+            if (!usesVar) {
+                if (hasDeref &&
+                    (u.rfind("*(", 0) == 0 || u.find("FUN_") != std::string::npos ||
+                     u.find("__builtin") != std::string::npos)) {
+                    stale = true;
+                    break;
+                }
+                for (const auto& id : ids) {
+                    if (u.rfind(id + " = ", 0) == 0 ||
+                        u.rfind(id + " += ", 0) == 0 ||
+                        u.rfind(id + " -= ", 0) == 0 ||
+                        u.rfind(id + " &= ", 0) == 0 ||
+                        u.rfind(id + " |= ", 0) == 0 ||
+                        u.rfind(id + " ^= ", 0) == 0 ||
+                        u.rfind(id + " <<= ", 0) == 0 ||
+                        u.rfind(id + " >>= ", 0) == 0 ||
+                        u.rfind(id + "++", 0) == 0 ||
+                        u.rfind(id + "--", 0) == 0) {
+                        stale = true;
+                        break;
+                    }
+                }
+                continue;
+            }
+            // First use of the flag in this block: substitute.
+            substitute(lines[j], var, cond);
+            break;
+        }
+    }
+    std::ostringstream out;
+    for (const auto& l : lines) out << l << "\n";
+    return out.str();
+}
+
 // Phase 10i: when a flag store is immediately followed by a branch that
 // tests the same flag ("r4099 = <cond>;" then "if (r4099) goto L;"),
 // inline the stored condition into the branch.  Adjacency guarantees no
@@ -5228,6 +5406,7 @@ te.pushSlots = &pushSlots;
     result = rewriteSelfIncrements(result);
     if (!useRecoveredRuntime) {
         result = inlineAdjacentFlagBranches(result, architecture);
+        result = inlineBlockFlagConditions(result, architecture);
         result = removeDeadFlagStores(result, architecture);
     }
     result = renameAbiRoles(result, architecture);

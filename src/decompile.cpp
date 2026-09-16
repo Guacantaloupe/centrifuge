@@ -876,6 +876,17 @@ bool startsWithCast(const std::string& inner, const std::string& target) {
 std::string castTo(const CExpr& e, const std::string& target) {
     const std::string inner = stripParens(e.text);
     if (e.ctype == target) return inner;
+    if (e.isConst) {
+        // A small non-negative literal converts identically to any
+        // fixed-width integer type, so "(uint64_t)(4)" is just "4".
+        // Out-of-range or negative values keep the cast: the truncation
+        // (or the token's promoted type) is load-bearing there.
+        const int width = typeWidth(target);
+        uint64_t value = 0;
+        if (width > 0 && parseConstToken(inner, &value) &&
+            value < (uint64_t{1} << (width * 8 - 1)))
+            return inner;
+    }
     if (startsWithCast(inner, target)) return inner;
     std::string leading, rest;
     if (matchLeadingCast(inner, leading, rest) &&

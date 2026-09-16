@@ -123,6 +123,25 @@ uint64_t registerStorageOffset(const std::string& architecture,
                ? storageOffset : offset;
 }
 
+namespace {
+// Strip one fully-wrapping paren layer.  Local copy because the file-scope
+// stripParens is defined later in the file.
+std::string stripParensForward(const std::string& s) {
+    if (s.size() >= 2 && s.front() == '(' && s.back() == ')') {
+        int depth = 0;
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '(') depth++;
+            else if (s[i] == ')') {
+                depth--;
+                if (depth == 0 && i != s.size() - 1) return s;
+            }
+        }
+        if (depth == 0) return s.substr(1, s.size() - 2);
+    }
+    return s;
+}
+} // namespace
+
 std::string x86RegisterWrite(const std::string& architecture, uint64_t offset,
                              int size, const std::string& expression) {
     uint64_t storageOffset = offset;
@@ -133,8 +152,23 @@ std::string x86RegisterWrite(const std::string& architecture, uint64_t offset,
     if (size == 8 && shift == 0) return storage + " = " + expression;
     // x86-64 writes to a 32-bit GPR zero the upper half.  Byte/word writes,
     // including AH/BH/CH/DH, preserve all bits outside their slice.
-    if (size == 4 && shift == 0)
-        return storage + " = (uint32_t)(" + expression + ")";
+    if (size == 4 && shift == 0) {
+        // A non-negative decimal constant within uint32 range needs no
+        // zero-extension cast; "(uint32_t)(0)" is just "0".  Larger values
+        // keep the cast: folded expressions are not pre-truncated to the
+        // write width, so the cast is load-bearing for them.
+        const std::string inner = stripParensForward(expression);
+        bool inUint32Range = false;
+        if (!inner.empty() &&
+            std::all_of(inner.begin(), inner.end(),
+                        [](char c) { return std::isdigit(static_cast<unsigned char>(c)); })) {
+            const uint64_t value =
+                std::strtoull(inner.c_str(), nullptr, 10);
+            inUint32Range = value <= 0xffffffffULL;
+        }
+        return storage + " = " +
+               (inUint32Range ? inner : "(uint32_t)(" + expression + ")");
+    }
     const unsigned bits = static_cast<unsigned>(size * 8);
     const uint64_t valueMask = bits == 64
         ? std::numeric_limits<uint64_t>::max()
@@ -303,6 +337,9 @@ std::vector<uint64_t> defaultArgumentRegisters(const std::string& architecture) 
 // "a1" never touches "a11").
 std::string replaceIdentifier(std::string text, const std::string& from,
                               const std::string& to);
+
+// Strip one fully-wrapping paren layer (defined below).
+std::string stripParens(const std::string& s);
 
 // Readability: the ABI role of an 8-byte architectural register, for
 // offsets that have one.  Argument registers are checked before the return

@@ -1986,6 +1986,41 @@ public:
                                 constCount = n;
                         }
                     }
+                    if (constCount >= 0 && a.isConst) {
+                        // Constant fold: flag p-code sign/zero bit
+                        // extractions like '((uint64_t)(0)) >> 31' render
+                        // as plain literals.
+                        uint64_t av = 0;
+                        if (parseConstToken(stripParens(a.text), &av)) {
+                            const unsigned bits = width * 8;
+                            const uint64_t mask =
+                                bits >= 64 ? ~0ULL : (uint64_t{1} << bits) - 1;
+                            uint64_t z = 0;
+                            if (op.op == POp::INT_LEFT)
+                                z = (av << constCount) & mask;
+                            else if (op.op == POp::INT_RIGHT)
+                                z = (av & mask) >> constCount;
+                            else { // INT_SRIGHT: sign-extend from width
+                                uint64_t sx = av & mask;
+                                if (bits < 64 &&
+                                    (sx & (uint64_t{1} << (bits - 1))))
+                                    sx |= ~mask;
+                                z = static_cast<uint64_t>(
+                                    static_cast<int64_t>(sx) >> constCount) &
+                                    mask;
+                            }
+                            r.text = std::to_string(static_cast<int64_t>(z));
+                            r.isConst = true;
+                            if (z == (uint64_t{1} << 63)) {
+                                // A decimal token 9223372036854775808 is
+                                // not a signed C++ literal.
+                                r.text = "(-9223372036854775807LL - 1)";
+                                r.isConst = false;
+                            }
+                            r.size = vo->size;
+                            break;
+                        }
+                    }
                     if (constCount >= 0) {
                         r.text = "(" + operand + " " + c + " " +
                                  std::to_string(constCount) + ")";

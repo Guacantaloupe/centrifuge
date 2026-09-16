@@ -1453,11 +1453,28 @@ public:
                     const std::string operand = arithmetic
                         ? "(int64_t)(" + castTo(a, cCast(width)) + ")"
                         : "(uint64_t)(" + castTo(a, uCast(width)) + ")";
-                    const std::string count = "(uint64_t)(" + b.text + ")";
-                    const std::string outside = arithmetic
-                        ? "(" + operand + " < 0 ? -1 : 0)" : "0";
-                    r.text = "(" + count + " >= " + std::to_string(width * 8) +
-                             " ? " + outside + " : (" + operand + " " + c + " " + count + "))";
+                    // Constant in-range counts need no guard: the runtime
+                    // ternary only models count >= width, which cannot
+                    // happen for a folded constant below that bound.
+                    int64_t constCount = -1;
+                    if (b.isConst) {
+                        const int64_t n =
+                            std::strtoll(b.text.c_str(), nullptr, 10);
+                        if (n >= 0 && n < static_cast<int64_t>(width) * 8)
+                            constCount = n;
+                    }
+                    if (constCount >= 0) {
+                        r.text = "(" + operand + " " + c + " " +
+                                 std::to_string(constCount) + ")";
+                    } else {
+                        const std::string count = "(uint64_t)(" + b.text + ")";
+                        const std::string outside = arithmetic
+                            ? "(" + operand + " < 0 ? -1 : 0)" : "0";
+                        r.text = "(" + count + " >= " +
+                                 std::to_string(width * 8) +
+                                 " ? " + outside + " : (" + operand + " " +
+                                 c + " " + count + "))";
+                    }
                     r.size = vo->size;
                     break;
                 }
@@ -1497,9 +1514,26 @@ public:
                             : std::string(uCast(input ? input->size : vo->size));
                         const std::string x = castTo(a, cast);
                         const std::string y = castTo(b, cast);
-                        r.text = "((" + y + ") != 0 ? (" + x +
-                                 " " + (remainder ? "%" : "/") + " " + y +
-                                 ") : 0)";
+                        // A nonzero constant divisor can never trip the
+                        // divide-by-zero guard; -1 is kept guarded for
+                        // signed ops because INT64_MIN / -1 overflows in C
+                        // (the architecture faults and has no result there).
+                        const uint64_t constY =
+                            b.isConst
+                                ? std::strtoull(b.text.c_str(), nullptr, 10)
+                                : 0;
+                        const bool constantDivisor =
+                            b.isConst && constY != 0 &&
+                            !(signedOperation &&
+                              static_cast<int64_t>(constY) == -1);
+                        if (constantDivisor) {
+                            r.text = "(" + x + " " +
+                                     (remainder ? "%" : "/") + " " + y + ")";
+                        } else {
+                            r.text = "((" + y + ") != 0 ? (" + x +
+                                     " " + (remainder ? "%" : "/") + " " +
+                                     y + ") : 0)";
+                        }
                     }
                     r.size = vo->size;
                     break;

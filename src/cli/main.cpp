@@ -781,9 +781,12 @@ int cmdSpec(int argc, char** argv) {
             signatureCache[target] = result;
             return result;
         };
+        std::string entryName;
+        for (const auto& s : prog->symbols)
+            if (s.isFunction && s.addr == addr) { entryName = s.name; break; }
         std::printf("%s", decompile(*eng, reader, addr, end, nameOf,
                                      signatureOf, arch, false, &model,
-                                     &globals).c_str());
+                                     &globals, nullptr, entryName).c_str());
         return 0;
     }
     if (cmd == "decompile") {
@@ -803,8 +806,12 @@ int cmdSpec(int argc, char** argv) {
                           static_cast<unsigned long long>(target));
             return buf;
         };
+        std::string entryName;
+        for (const auto& s : prog->symbols)
+            if (s.isFunction && s.addr == addr) { entryName = s.name; break; }
         std::printf("%s", decompile(*eng, reader, addr, end, nameOf, nullptr,
-                                     prog->arch).c_str());
+                                     prog->arch, false, nullptr, nullptr,
+                                     nullptr, entryName).c_str());
         return 0;
     }
     usage(argv[0]);

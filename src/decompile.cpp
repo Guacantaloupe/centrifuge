@@ -1,4 +1,4 @@
-﻿// centrifuge - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // decompile.cpp - minimal C decompiler (v0.4)
 #include "centrifuge/decompile.hpp"
 
@@ -337,6 +337,11 @@ struct CExpr {
     int size = 8;
     bool isConst = false;
     bool floating = false;
+    // C type of the emitted text when known (e.g. "uint64_t", "int32_t").
+    // Empty means unknown; castTo() only elides a conversion when the
+    // inner expression already carries exactly the target type, so
+    // propagation is conservative and never changes semantics.
+    std::string ctype;
     // Architectural registers read while forming this expression.  Keeping
     // both the storage offset and the textual register view lets the emitter
     // preserve instruction-level parallel writes (for example RDX:RAX from
@@ -389,6 +394,72 @@ std::string stripParens(const std::string& s) {
         if (full) return s.substr(1, s.size() - 2);
     }
     return s;
+}
+
+// Byte width of a fixed-width integer type name (e.g. "uint32_t" -> 4);
+// 0 for anything else (floats, unknown names).
+int typeWidth(const std::string& type) {
+    if (type == "int8_t" || type == "uint8_t") return 1;
+    if (type == "int16_t" || type == "uint16_t") return 2;
+    if (type == "int32_t" || type == "uint32_t") return 4;
+    if (type == "int64_t" || type == "uint64_t") return 8;
+    return 0;
+}
+
+// If `inner` starts with "(T)(...)" where T is a fixed-width integer type,
+// return true and set `type`/`rest` to T and the remaining "(...)" text.
+bool matchLeadingCast(const std::string& inner, std::string& type,
+                      std::string& rest) {
+    if (inner.size() < 2 || inner.front() != '(') return false;
+    const size_t close = inner.find(")(", 1);
+    if (close == std::string::npos) return false;
+    const std::string candidate = inner.substr(1, close - 1);
+    if (typeWidth(candidate) == 0) return false;
+    if (!std::all_of(candidate.begin(), candidate.end(),
+                     [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; }))
+        return false;
+    const std::string remainder = inner.substr(close + 1); // includes trailing ')'
+    if (remainder.empty() || remainder.back() != ')') return false;
+    type = candidate;
+    rest = remainder;
+    return true;
+}
+
+// Does `inner` consist of exactly "(target)(...)" with the conversion's
+// closing paren at the final character?
+bool startsWithCast(const std::string& inner, const std::string& target) {
+    const std::string prefix = "(" + target + ")(";
+    if (inner.rfind(prefix, 0) != 0) return false;
+    int depth = 1; // inside the second '(' of the prefix
+    for (size_t i = prefix.size(); i < inner.size(); ++i) {
+        if (inner[i] == '(') depth++;
+        else if (inner[i] == ')') {
+            depth--;
+            if (depth == 0) return i == inner.size() - 1;
+        }
+    }
+    return false;
+}
+
+// Wrap `e` in a conversion to `target`, eliding conversions that carry no
+// additional information:
+//   - the expression already carries the target type (metadata or
+//     textually), or
+//   - it begins with a same-width conversion: for two's-complement targets
+//     "(int32_t)((uint32_t)x)" and "(uint32_t)((int32_t)x)" both reduce to
+//     the low bits of x, so the inner conversion can be replaced by the
+//     target one. Semantics are unchanged on the platforms this project
+//     targets (the emitter already relies on two's-complement conversions
+//     for SUBPIECE and width-polymorphic arithmetic).
+std::string castTo(const CExpr& e, const std::string& target) {
+    const std::string inner = stripParens(e.text);
+    if (e.ctype == target) return inner;
+    if (startsWithCast(inner, target)) return inner;
+    std::string leading, rest;
+    if (matchLeadingCast(inner, leading, rest) &&
+        typeWidth(leading) == typeWidth(target))
+        return "(" + target + ")(" + rest + ")";
+    return "(" + target + ")(" + inner + ")";
 }
 
 // parse "reg + K" / "reg - K" / "reg" / "K" (reg = [a-z][a-z0-9]*)
@@ -803,8 +874,13 @@ public:
 
         auto exprOfV = [&](const Varnode* v) -> CExpr {
             if (!v) return CExpr{"0", 8, true};
-            if (v->kind == Varnode::CONST)
-                return CExpr{fmtConst(v->offset, v->size), v->size, true};
+            if (v->kind == Varnode::CONST) {
+                CExpr c{fmtConst(v->offset, v->size), v->size, true};
+                // fmtConst emits a signed decimal token (int64_t for
+                // 8-byte values, int32_t otherwise).
+                c.ctype = v->size == 8 ? "int64_t" : "int32_t";
+                return c;
+            }
             if (v->kind == Varnode::REGISTER) {
                 if (architecture.rfind("riscv", 0) == 0 && v->offset == 0)
                     return CExpr{"0", v->size, true}; // architectural zero
@@ -813,9 +889,12 @@ public:
                 std::string name =
                     registerName(architecture, v->offset, v->size);
                 std::string text = name;
+                std::string ctype = v->size == 8 ? "int64_t"
+                                                 : std::string(uCast(v->size));
                 if (x86GprSlice(architecture, v->offset, v->size,
                                 storageOffset, shift)) {
                     name = registerName(architecture, storageOffset, 8);
+                    ctype = "int64_t";
                     if (entryBlock) {
                         const auto param = paramIndex.find(storageOffset);
                         if (param != paramIndex.end() &&
@@ -827,11 +906,13 @@ public:
                             ? name + " >> " + std::to_string(shift) : name;
                         text = "((" + std::string(uCast(v->size)) + ")(" +
                                shifted + "))";
+                        ctype = uCast(v->size);
                     } else {
                         text = name;
                     }
                 }
                 CExpr expression{text, v->size, false};
+                expression.ctype = ctype;
                 expression.registerRefs[storageOffset].insert(name);
                 return expression;
             }
@@ -1342,7 +1423,9 @@ public:
                             // P-code multiplication instead wraps at its
                             // destination width and must never overflow int.
                             r.text = "((" + std::string(uCast(vo->size)) +
-                                ")((uint64_t)(" + a.text + ") * (uint64_t)(" + b.text + ")))";
+                                ")(" + castTo(a, "uint64_t") + " * " +
+                                castTo(b, "uint64_t") + "))";
+                            r.ctype = uCast(vo->size);
                         }
                         r.size = vo->size;
                     }
@@ -1368,8 +1451,8 @@ public:
                     // promotions. In particular SAR must sign-extend its
                     // operand and SHL on a byte must not shift signed int.
                     const std::string operand = arithmetic
-                        ? "(int64_t)(" + std::string(cCast(width)) + ")(" + a.text + ")"
-                        : "(uint64_t)(" + std::string(uCast(width)) + ")(" + a.text + ")";
+                        ? "(int64_t)(" + castTo(a, cCast(width)) + ")"
+                        : "(uint64_t)(" + castTo(a, uCast(width)) + ")";
                     const std::string count = "(uint64_t)(" + b.text + ")";
                     const std::string outside = arithmetic
                         ? "(" + operand + " < 0 ? -1 : 0)" : "0";
@@ -1412,11 +1495,11 @@ public:
                         const std::string cast = signedOperation
                             ? std::string(cCast(input ? input->size : vo->size))
                             : std::string(uCast(input ? input->size : vo->size));
-                        const std::string x = stripParens(a.text);
-                        const std::string y = stripParens(b.text);
-                        r.text = "((" + y + ") != 0 ? ((" + cast + ")(" + x +
-                                 ") " + (remainder ? "%" : "/") + " ((" + cast +
-                                 ")(" + y + "))) : 0)";
+                        const std::string x = castTo(a, cast);
+                        const std::string y = castTo(b, cast);
+                        r.text = "((" + y + ") != 0 ? (" + x +
+                                 " " + (remainder ? "%" : "/") + " " + y +
+                                 ") : 0)";
                     }
                     r.size = vo->size;
                     break;
@@ -1446,19 +1529,53 @@ public:
                 case POp::INT_ZEXT: {
                     const CExpr a = exprOfV(pi.find(op.in0));
                     const Varnode* vs = pi.find(op.in0);
-                    r.text = "((uint64_t)(" +
-                             std::string(uCast(vs ? vs->size : 8)) + ")(" +
-                             stripParens(a.text) + "))";
+                    const int width = vs ? vs->size : 8;
                     r.size = vo->size;
+                    r.ctype = "uint64_t";
+                    if (width >= 8) {
+                        // Zero-extension from an already 64-bit value is the
+                        // identity; keep the value presented as uint64_t so
+                        // downstream unsigned comparisons stay unsigned.
+                        r.text = castTo(a, "uint64_t");
+                        break;
+                    }
+                    if (a.isConst) {
+                        const uint64_t mask = (uint64_t{1} << (width * 8)) - 1;
+                        const uint64_t value =
+                            std::strtoull(a.text.c_str(), nullptr, 10) & mask;
+                        r.text = std::to_string(value);
+                        r.isConst = true;
+                        break;
+                    }
+                    r.text = "(uint64_t)(" +
+                             castTo(a, uCast(width)) + ")";
                     break;
                 }
                 case POp::INT_SEXT: {
                     const CExpr a = exprOfV(pi.find(op.in0));
                     const Varnode* vs = pi.find(op.in0);
-                    r.text = "((int64_t)(" +
-                             std::string(cCast(vs ? vs->size : 8)) + ")(" +
-                             stripParens(a.text) + "))";
+                    const int width = vs ? vs->size : 8;
                     r.size = vo->size;
+                    r.ctype = "int64_t";
+                    if (width >= 8) {
+                        // Sign-extension from an already 64-bit value is the
+                        // identity; keep the value presented as int64_t so
+                        // downstream signed comparisons stay signed.
+                        r.text = castTo(a, "int64_t");
+                        break;
+                    }
+                    if (a.isConst) {
+                        const uint64_t mask = (uint64_t{1} << (width * 8)) - 1;
+                        uint64_t value =
+                            std::strtoull(a.text.c_str(), nullptr, 10) & mask;
+                        if (width < 8 && (value & (uint64_t{1} << (width * 8 - 1))))
+                            value |= ~mask; // sign-extend
+                        r.text = std::to_string(static_cast<int64_t>(value));
+                        r.isConst = true;
+                        break;
+                    }
+                    r.text = "(int64_t)(" +
+                             castTo(a, cCast(width)) + ")";
                     break;
                 }
                 case POp::SUBPIECE: {
@@ -1480,6 +1597,7 @@ public:
                     r.text = "((" + std::string(uCast(vo->size)) + ")(" +
                              shifted + "))";
                     r.size = vo->size;
+                    r.ctype = uCast(vo->size);
                     break;
                 }
                 case POp::PIECE: {
@@ -1491,11 +1609,15 @@ public:
                         r.text = stripParens(low.text);
                     } else {
                         r.text = "((" + std::string(uCast(vo->size)) + ")(" +
-                            "((uint64_t)(" + stripParens(high.text) +
-                            ") << " + std::to_string(shift) + ") | " +
-                            "(uint64_t)(" + stripParens(low.text) + ")))";
+                            "(" + castTo(high, "uint64_t") +
+                            " << " + std::to_string(shift) + ") | " +
+                            castTo(low, "uint64_t") + "))";
                     }
                     r.size = vo->size;
+                    if (shift >= 64)
+                        r.ctype = low.ctype;
+                    else
+                        r.ctype = uCast(vo->size);
                     break;
                 }
                 case POp::INT_NEGATE: {
@@ -2545,6 +2667,7 @@ public:
                                 "recovered_load<" + std::string(uCast(vo->size)) +
                                 ">(" + stripParens(a.text) + ")";
                             r.size = vo->size;
+                            r.ctype = uCast(vo->size);
                         }
                     } else if (!useRecoveredRuntime && globals) {
                         // Phase 8: name constant-address data accesses.
@@ -2557,6 +2680,7 @@ public:
                                     "(*(" + std::string(uCast(vo->size)) +
                                     " *)(uintptr_t)(" + object->name + "))";
                                 r.size = vo->size;
+                                r.ctype = uCast(vo->size);
                                 break;
                             }
                             // Phase 10h: accesses inside an object's span
@@ -2570,6 +2694,7 @@ public:
                                     " *)(uintptr_t)(" + object->name + " + " +
                                     std::to_string(offset) + "))";
                                 r.size = vo->size;
+                                r.ctype = uCast(vo->size);
                                 break;
                             }
                         }
@@ -2577,6 +2702,7 @@ public:
                         r.text = "(*(" + std::string(uCast(vo->size)) +
                                   " *)(" + stripParens(a.text) + "))";
                         r.size = vo->size;
+                        r.ctype = uCast(vo->size);
                     } else {
                         const CExpr a = exprOfV(pi.find(op.in0));
                         r.text = useRecoveredRuntime
@@ -2585,6 +2711,7 @@ public:
                             : "(*(" + std::string(uCast(vo->size)) +
                                   " *)(" + stripParens(a.text) + "))";
                         r.size = vo->size;
+                        r.ctype = uCast(vo->size);
                     }
                     break;
                 }
@@ -2918,7 +3045,8 @@ std::string decompile(
     const std::string& architecture, bool useRecoveredRuntime,
     const StackFrameModel* stackModel,
     const GlobalObjectRecovery* globals,
-    const std::function<bool(uint64_t)>& guardSlotOf) {
+    const std::function<bool(uint64_t)>& guardSlotOf,
+    const std::string& entryName) {
     CfgBuilder cfg;
     if (!cfg.build(eng, read, start, end)) return "// failed to build CFG\n";
 
@@ -3182,12 +3310,31 @@ std::string decompile(
     int64_t frameBias = 0; // sp bias right after the prologue (for locals)
     std::optional<uint64_t> suppressBackedgeTo; // structured loop backedge
 
+    // Readability: when the caller knows the function's symbol, name the
+    // entry block after it instead of a raw address label.  All other
+    // blocks are named by their offset from the function start (short and
+    // stable), falling back to a full address label if a stray target lies
+    // before `start`.  References and definitions share this helper so
+    // they can never disagree; the missing-label safety net below parses
+    // tokens back through the same function.
+    auto labelName = [&](uint64_t a) {
+        if (a == start && !entryName.empty())
+            return safeIdentifier(entryName);
+        if (a >= start) {
+            char buf[24];
+            std::snprintf(buf, sizeof(buf), "L0x%llx",
+                          static_cast<unsigned long long>(a - start));
+            return std::string(buf);
+        }
+        return "L" + hexAddr(a);
+    };
+
     std::function<void(uint64_t, int)> emitBlock;
     std::set<uint64_t> danglingLabels;
     emitBlock = [&](uint64_t a, int depth) {
         if (emitted.count(a)) {
             for (int i = 0; i < depth; ++i) out << "    ";
-            out << "goto L" << hexAddr(a) << ";\n";
+            out << "goto " << labelName(a) << ";\n";
             return;
         }
         emitted.insert(a);
@@ -3195,13 +3342,13 @@ std::string decompile(
         if (!b) {
             if (labeled.count(a)) {
                 for (int i = 0; i < depth; ++i) out << "    ";
-                out << "L" << hexAddr(a) << ":;\n";
+                out << labelName(a) << ":;\n";
             }
             return;
         }
         if (labeled.count(a)) {
             for (int i = 0; i < depth; ++i) out << "    ";
-            out << "L" << hexAddr(a) << ":\n";
+            out << labelName(a) << ":\n";
         }
 
         const NaturalLoop* loop = cfg.loopByHeader(a);
@@ -3540,10 +3687,10 @@ te.pushSlots = &pushSlots;
             }
             if (!cfg.blockAt(target) && danglingLabels.insert(target).second) {
                 for (int i = 0; i <= depth; ++i) out << "    ";
-                out << "L" << hexAddr(target) << ":;\n";
+                out << labelName(target) << ":;\n";
             }
             for (int i = 0; i <= depth; ++i) out << "    ";
-            out << "if (" << be.cond << ") goto L" << hexAddr(target)
+            out << "if (" << be.cond << ") goto " << labelName(target)
                 << ";\n";
             emitBlock(fall, depth);
             return;
@@ -3603,10 +3750,10 @@ te.pushSlots = &pushSlots;
             if (!cfg.blockAt(term->target) &&
                 danglingLabels.insert(term->target).second) {
                 for (int i = 0; i <= depth; ++i) out << "    ";
-                out << "L" << hexAddr(term->target) << ":;\n";
+                out << labelName(term->target) << ":;\n";
             }
             for (int i = 0; i <= depth; ++i) out << "    ";
-            out << "goto L" << hexAddr(term->target) << ";\n";
+            out << "goto " << labelName(term->target) << ";\n";
             return;
         }
         if (be.resolvedKnown && (term->kind == Insn::JMP ||
@@ -3614,10 +3761,10 @@ te.pushSlots = &pushSlots;
             if (!cfg.blockAt(be.resolvedTarget) &&
                 danglingLabels.insert(be.resolvedTarget).second) {
                 for (int i = 0; i <= depth; ++i) out << "    ";
-                out << "L" << hexAddr(be.resolvedTarget) << ":;\n";
+                out << labelName(be.resolvedTarget) << ":;\n";
             }
             for (int i = 0; i <= depth; ++i) out << "    ";
-            out << "goto L" << hexAddr(be.resolvedTarget) << ";\n";
+            out << "goto " << labelName(be.resolvedTarget) << ";\n";
             return;
         }
         // Indirect-jump trampoline: `mov reg, [rip+slot]; jmp *reg` (a
@@ -3786,7 +3933,7 @@ te.pushSlots = &pushSlots;
                 static_cast<uint64_t>(std::stoull((*it)[1].str(), nullptr, 16)));
         for (uint64_t missing : referenced) {
             if (defined.count(missing)) continue;
-            out << "L" << hexAddr(missing) << ":;\n";
+            out << labelName(missing) << ":;\n";
         }
     }
     return out.str();

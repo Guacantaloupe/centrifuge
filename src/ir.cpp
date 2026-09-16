@@ -2343,8 +2343,15 @@ std::string ProgramAnalysis::decompileFunction(const Program& program,
     auto nameOf = [&](uint64_t target) {
         const AnalyzedFunction* function = functionAt(target);
         if (function) return function->function.name;
-        char buffer[32];
-        std::snprintf(buffer, sizeof(buffer), "FUN_%llx",
+        // Match the analysis naming convention (analysis.cpp funName) so
+        // callees outside the function table do not appear in a different
+        // FUN_ format from discovered ones.
+        const bool is32 =
+            architecture_ == "x86" || architecture_ == "arm" ||
+            architecture_ == "mips" || architecture_ == "riscv32";
+        char buffer[40];
+        std::snprintf(buffer, sizeof(buffer),
+                      is32 ? "FUN_%08llX" : "FUN_%016llX",
                       static_cast<unsigned long long>(target));
         return std::string(buffer);
     };

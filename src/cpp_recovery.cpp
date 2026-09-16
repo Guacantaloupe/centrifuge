@@ -194,7 +194,14 @@ bool readPointer(const Program& program, uint64_t address, int pointerSize,
 std::string functionName(const Program& program, uint64_t address) {
     for (const Symbol& symbol : program.symbols)
         if (symbol.isFunction && symbol.addr == address) return symbol.name;
-    return "FUN_" + std::to_string(address);
+    // Match the analysis naming convention (analysis.cpp funName) so
+    // recovered vtables do not name targets in yet another FUN_ format.
+    const bool is64 = program.arch != "x86" && program.arch != "arm" &&
+                      program.arch != "mips" && program.arch != "riscv32";
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), is64 ? "FUN_%016llX" : "FUN_%08llX",
+                  static_cast<unsigned long long>(address));
+    return buf;
 }
 
 std::pair<std::string, std::string> visibleMemberName(

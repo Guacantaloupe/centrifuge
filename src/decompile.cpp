@@ -596,6 +596,89 @@ std::string normalizeBranchCond(std::string cond) {
     return stripParens(cond);
 }
 
+// Phase 10h: drop flag-register stores ("r4096 = ...;") whose variable is
+// never read anywhere in the emitted function.  Flag registers are
+// function-local C scalars, never address-taken, so a store with no
+// textual read cannot be observed; the backward scan is exact even with
+// gotos because a flag cannot be read from outside this function text.
+// Declaration lines are ignored: they write, never read.
+std::string removeDeadFlagStores(const std::string& body,
+                                 const std::string& architecture) {
+    if (architecture.rfind("x86", 0) != 0) return body;
+    std::vector<std::string> lines;
+    {
+        std::istringstream in(body);
+        std::string ln;
+        while (std::getline(in, ln)) lines.push_back(ln);
+    }
+    const auto identifiers = [](const std::string& s) {
+        std::set<std::string> ids;
+        size_t i = 0;
+        while (i < s.size()) {
+            if (std::isalpha(static_cast<unsigned char>(s[i])) ||
+                s[i] == '_') {
+                const size_t start = i;
+                while (i < s.size() &&
+                       (std::isalnum(static_cast<unsigned char>(s[i])) ||
+                        s[i] == '_'))
+                    i++;
+                ids.insert(s.substr(start, i - start));
+            } else {
+                i++;
+            }
+        }
+        return ids;
+    };
+    const auto trimmed = [](const std::string& s) {
+        const size_t a = s.find_first_not_of(" \t");
+        return a == std::string::npos ? std::string() : s.substr(a);
+    };
+    const auto isFlagStore = [&trimmed](const std::string& t, std::string& var) {
+        // "r4096 = ...;" as a whole line: r + exactly 4 digits, one
+        // assignment, one terminating ';'.
+        if (t.size() < 9 || t[0] != 'r') return false;
+        size_t i = 1;
+        while (i < t.size() &&
+               std::isdigit(static_cast<unsigned char>(t[i])))
+            i++;
+        if (i != 5) return false;
+        const uint64_t off =
+            std::strtoull(t.substr(1, 4).c_str(), nullptr, 10);
+        if (off < 4096 || off > 4101) return false;
+        if (t.compare(i, 3, " = ") != 0) return false;
+        if (t.back() != ';') return false;
+        if (t.find(';', i) != t.size() - 1) return false;
+        var = t.substr(0, 5);
+        return true;
+    };
+    const auto isDeclaration = [](const std::string& t) {
+        if (t.rfind("uint64_t ", 0) == 0 || t.rfind("int64_t ", 0) == 0 ||
+            t.rfind("uint32_t ", 0) == 0 || t.rfind("int32_t ", 0) == 0)
+            return t.find(',') != std::string::npos;
+        return false;
+    };
+
+    std::set<std::string> used;
+    for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+        const std::string t = trimmed(*it);
+        std::string var;
+        if (isFlagStore(t, var)) {
+            if (used.count(var)) {
+                const std::string rhs = t.substr(t.find(" = ") + 3);
+                for (const auto& id : identifiers(rhs)) used.insert(id);
+            } else {
+                it->clear(); // dead store: never read
+            }
+        } else if (!isDeclaration(t)) {
+            for (const auto& id : identifiers(t)) used.insert(id);
+        }
+    }
+    std::ostringstream out;
+    for (const auto& l : lines)
+        if (!l.empty()) out << l << "\n";
+    return out.str();
+}
+
 // Byte width of a fixed-width integer type name (e.g. "uint32_t" -> 4);
 // 0 for anything else (floats, unknown names).
 int typeWidth(const std::string& type) {
@@ -4208,7 +4291,10 @@ te.pushSlots = &pushSlots;
             out << labelName(missing) << ":;\n";
         }
     }
-    return renameAbiRoles(out.str(), architecture);
+    std::string result = out.str();
+    if (!useRecoveredRuntime)
+        result = removeDeadFlagStores(result, architecture);
+    return renameAbiRoles(result, architecture);
 }
 
 std::string decompileTyped(

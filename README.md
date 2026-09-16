@@ -125,6 +125,21 @@ cmake --build build-blender --config Release
 ctest --test-dir build-blender -C Release -R blender_windows --output-on-failure
 ```
 
+Krita 6.0.3 can be enabled as a second large Windows PE/DLL recovery gate.
+Point CMake at the verified `libkritaui.dll` from the official portable
+archive; Blender and Krita may be tested together and produce separate JSON
+reports:
+
+```powershell
+$krita = .\tests\fetch_krita_windows.ps1
+cmake -S . -B build-large `
+  -DCENTRIFUGE_BLENDER_WINDOWS_BINARY="C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" `
+  -DCENTRIFUGE_BLENDER_WINDOWS_MANIFEST=tests/blender_windows_manifest_5_2.json `
+  -DCENTRIFUGE_KRITA_WINDOWS_BINARY="$krita"
+cmake --build build-large --config Release
+ctest --test-dir build-large -C Release -L "blender|krita" --output-on-failure
+```
+
 This gate currently proves large-PE loading, recovery, C++ project generation,
 compilation, linking, and verifier execution. The recovered project preserves
 the PE import/DLL inventory, exact initialized global-data regions, individual
@@ -173,10 +188,25 @@ python tests/quality_benchmark.py --centrifuge build/centrifuge \
   stack frames) — 0 mismatches vs objdump, including compressed instructions
 - x86-64 spec: notepad.exe vs objdump — every decoded instruction byte-exact,
   0 false positives (~50% coverage; sweep stops at uncovered long-tail forms)
-- **Decompiler round-trip** (`tests/roundtrip.py`): decompile fib/sum_array/
-  compute/max3/absdiff, compile the emitted C, run test vectors — results are
-  identical to the original C (the IR semantics are provably correct, which
-  is exactly what the symbolic-execution engine needs as its base)
+- **Decompiler round-trip** (`tests/roundtrip.py`): recompile emitted C for
+  RISC-V fib/sum_array and compare test vectors with the original C.
+- **x86 CPU round-trip** (`tests/x86_roundtrip.py`): execute original x86-64
+  instruction fixtures and recompiled native output at `-O0`, `-O2`, and
+  `-O3`. Compare return values and all eight bytes of an aligned memory
+  buffer, covering signed/unsigned branches, preserved comparison flags,
+  byte/word/dword stores, partial-register writes, 32/64-bit shifts with
+  boundary counts and negative operands, 8/16/32/64-bit carry/overflow,
+  ADC/SBB, INC preserving carry, CMOV/SETcc, signed loads, LODSQ return
+  values after implicit register writes, and memory
+  XCHG/XADD/CMPXCHG (including both comparison outcomes). When objdump is
+  available, also compile seven leaf functions at `-O2` and use their machine code as independent
+  oracles for the emitted C++17. Requires an x86-64 host and executable-memory
+  allocation. Passing finite vectors is regression evidence, not a proof of
+  whole-program equivalence for Blender or Krita.
+  Recompiled C++ enables `-ftrapv` to expose accidental signed arithmetic
+  introduced by integer promotions (including 16-bit multiplication), and
+  treats invalid constant shift counts as compilation errors. This is not
+  a replacement for a complete undefined-behavior sanitizer.
 - `tests/test_sleigh.cpp`: spec disassembly + p-code interpreter semantics
 - `tests/test_x86_flags.cpp`: Intel SHA-1/SHA-256, AES/VAES, GFNI affine and
   inverse-affine, PCLMUL/VPCLMUL hardware/reference vectors; CPUID, CPL,

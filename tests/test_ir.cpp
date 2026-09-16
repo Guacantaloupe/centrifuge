@@ -48,6 +48,8 @@ token t8 (1) { op = (7:0); }
 :tail_forward is op=21 { goto 0x40; };
 :zero_and is op=22 { r1 = r0 & 0; return; };
 :parallel_outputs is op=23 { lo = r0 + 1; hi = r0 + 2; r0 = lo; r1 = hi; return; };
+:constant_negative_add is op=24 { value = 5; r1 = value + -1; return; };
+:constant_wrap is op=25 { value = 0x7fffffffffffffff; r1 = value + 1; return; };
 )SPEC";
 
 const char* mixedWidthAbiSpec = R"SPEC(
@@ -96,6 +98,32 @@ token t8 (1) { op = (7:0); }
 }
 
 int main() {
+    {
+        // The indirect call writes RAX directly rather than through pending.
+        // Its result must not be replaced by the pre-call constant on return.
+        SleighEngine calls;
+        std::string error;
+        CHECK(calls.loadSpec(R"SPEC(
+define space ram size=8 type=ram_space default;
+define space regs size=8 type=register_space;
+define register offset=0 size=8 [ rax rcx rdx rbx rsp rbp rsi rdi r8 ];
+token t8 (1) { op = (7:0); }
+:init is op=1 { rax = 42; };
+:invoke is op=2 { call r8; };
+:ret is op=3 { return; };
+)SPEC", error), "load indirect result regression spec");
+        const std::vector<uint8_t> bytes{1, 2, 3};
+        auto read = [&](uint64_t address, void* output, size_t size) {
+            if (address > bytes.size() || size > bytes.size() - address) return false;
+            std::memcpy(output, bytes.data() + address, size);
+            return true;
+        };
+        const auto source = decompile(calls, read, 0, bytes.size(), nullptr,
+                                      nullptr, "x86-64");
+        CHECK(source.find("return 42;") == std::string::npos &&
+              source.find("return rax;") != std::string::npos,
+              "indirect call result supersedes pre-call RAX definition");
+    }
     SleighEngine engine;
     std::string error;
     CHECK(engine.loadSpec(miniSpec, error), "load miniature SSA specification");
@@ -148,6 +176,22 @@ int main() {
             engine, zeroAndRead, 0, 1, nullptr, nullptr, "generic");
         CHECK(zeroAndSource.find("r1 = 0;") != std::string::npos,
               "C lowering preserves x AND 0 as zero rather than x");
+    }
+    {
+        const std::vector<uint8_t> bytes{24, 25};
+        auto readConstants = [&](uint64_t address, void* output, size_t size) {
+            if (address > bytes.size() || size > bytes.size() - address) return false;
+            std::memcpy(output, bytes.data() + address, size);
+            return true;
+        };
+        const auto negative = decompile(engine, readConstants, 0, 1, nullptr,
+                                        nullptr, "generic");
+        CHECK(negative.find("r1 = 4;") != std::string::npos,
+              "constant folding preserves the sign of an added negative constant");
+        const auto wrapped = decompile(engine, readConstants, 1, 2, nullptr,
+                                       nullptr, "generic");
+        CHECK(wrapped.find("-9223372036854775807LL - 1") != std::string::npos,
+              "constant folding wraps arithmetic without signed host overflow");
     }
 
     {

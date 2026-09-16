@@ -4887,8 +4887,8 @@ bool SleighEngine::disassemble(
                 // in an eight-byte temporary, but `66 C7 /0 iw` still writes
                 // exactly two bytes.  Preserve the decoded memory operand
                 // width here so adjacent C++ object fields are not clobbered.
-                int width = 0;
-                if (st.lhsE && st.lhsE->kind == SpecCtor::SExpr::VAR) {
+                int width = st.storeSize;
+                if (!width && st.lhsE && st.lhsE->kind == SpecCtor::SExpr::VAR) {
                     for (auto it = magicExports.rbegin();
                          it != magicExports.rend(); ++it) {
                         if (it->first == st.lhsE->var &&

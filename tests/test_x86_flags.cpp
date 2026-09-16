@@ -285,7 +285,8 @@ int main(int argc, char** argv) {
     put(0xB20, {0x66, 0x0F, 0x3A, 0x63, 0xC1, 0x18}); // pcmpistri xmm0,xmm1,18
     put(0xB30, {0x66, 0x0F, 0x3A, 0x62, 0xD1, 0x00}); // pcmpistrm xmm2,xmm1,00
     put(0xB40, {0x66, 0x0F, 0x3A, 0x62, 0xD1, 0x40}); // pcmpistrm xmm2,xmm1,40
-    put(0xB50, {0x66, 0x0F, 0x3A, 0x61, 0xC1, 0x04}); // pcmpestri xmm0,xmm1,04
+    put(0xB50, {0x66, 0x0F, 0x3A, 0x61, 0xC1, 0x04, 0xC3});
+                                                // pcmpestri xmm0,xmm1,04; ret
     put(0xB60, {0x66, 0x0F, 0x3A, 0x60, 0xD1, 0x0C}); // pcmpestrm xmm2,xmm1,0c
     put(0xB70, {0x66, 0x0F, 0xF5, 0xC1}); // pmaddwd xmm0,xmm1
     put(0xB80, {0x66, 0x0F, 0x38, 0x04, 0xC1}); // pmaddubsw xmm0,xmm1
@@ -446,6 +447,10 @@ int main(int argc, char** argv) {
     put(0x14D0, {0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3});
                                                // mov eax,ffffffffh; return
     put(0x14E0, {0xF3, 0x48, 0xAB, 0xC3}); // rep stosq; return
+    put(0x14F0, {0xF3, 0x0F, 0xBD, 0xC3, 0xC3}); // lzcnt eax,ebx; return
+    put(0x1500, {0xF3, 0x48, 0x0F, 0xBD, 0xC3, 0xC3});
+                                               // lzcnt rax,rbx; return
+    put(0x1510, {0xF3, 0x0F, 0xBC, 0xC3, 0xC3}); // tzcnt eax,ebx; return
 
     auto read = [&](uint64_t address, void* dst, size_t size) {
         if (address > image.size() || size > image.size() - address) return false;
@@ -471,6 +476,8 @@ int main(int argc, char** argv) {
         CHECK(byteBoolean.find("rax = (rax &") != std::string::npos &&
                   byteBoolean.find("& 255ULL) << 0") != std::string::npos,
               "real x86 AL writes preserve the other RAX bits");
+        CHECK(byteBoolean.find("if (r409") == std::string::npos,
+              "native C branch conditions inline their current x86 flag expression");
 
         const PcodeInsn highByte = disassemble(0x14C0);
         const Varnode* highByteOutput = highByte.ops.empty()
@@ -514,6 +521,28 @@ int main(int argc, char** argv) {
                   fillSource.find("rcx = recovered_string_count_") !=
                   std::string::npos,
               "decompiler preserves REP STOSQ bulk stores and register effects");
+
+        const std::string lzcnt32Source = decompile(
+            engine, read, 0x14F0, 0x14F5, nullptr, nullptr, "x86-64");
+        CHECK(lzcnt32Source.find("__builtin_clz((unsigned)") !=
+                  std::string::npos &&
+                  lzcnt32Source.find("__builtin_clzll") == std::string::npos &&
+                  lzcnt32Source.find(": 32") != std::string::npos,
+              "32-bit LZCNT lowering counts only the source operand width");
+
+        const std::string lzcnt64Source = decompile(
+            engine, read, 0x1500, 0x1506, nullptr, nullptr, "x86-64");
+        CHECK(lzcnt64Source.find("__builtin_clzll((unsigned long long)") !=
+                  std::string::npos &&
+                  lzcnt64Source.find(": 64") != std::string::npos,
+              "64-bit LZCNT lowering retains the full-width builtin");
+
+        const std::string tzcnt32Source = decompile(
+            engine, read, 0x1510, 0x1515, nullptr, nullptr, "x86-64");
+        CHECK(tzcnt32Source.find("__builtin_ctz((unsigned)") !=
+                  std::string::npos &&
+                  tzcnt32Source.find(": 32") != std::string::npos,
+              "32-bit TZCNT lowering returns the operand width for zero");
     }
 
     {
@@ -2796,6 +2825,13 @@ int main(int argc, char** argv) {
                   explicitStringIndex.regValue(SF).value_or(0) == 1 &&
                   explicitStringIndex.regValue(ZF).value_or(0) == 1,
               "PCMPESTRI uses absolute clamped EAX/EDX lengths and range aggregation");
+        const std::string explicitStringSource = decompile(
+            engine, read, 0xB50, 0xB57, nullptr, nullptr, "x86-64", true);
+        CHECK(explicitStringSource.find("recovered_simd_string_compare(") !=
+                  std::string::npos &&
+                  explicitStringSource.find("/* unknown */") ==
+                  std::string::npos,
+              "PCMPESTRI lowers to executable recovered C++ semantics");
 
         PcodeEvaluator explicitOrderedMask(disassemble(0xB60));
         explicitOrderedMask.wideRegs[16].assign(16, 0);

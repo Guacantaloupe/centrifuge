@@ -342,6 +342,8 @@ struct CExpr {
     // preserve instruction-level parallel writes (for example RDX:RAX from
     // one-operand MUL/IMUL) without confusing RAX with EAX.
     std::map<uint64_t, std::set<std::string>> registerRefs;
+    // A load cannot safely be re-evaluated after an intervening store/call.
+    bool readsMemory = false;
 };
 
 std::string replaceIdentifier(std::string text, const std::string& from,
@@ -428,11 +430,12 @@ bool parseRegConstExpr(const std::string& t, std::string& reg, int64_t& k) {
 // multi-predicate joins come out correct naturally (C sequential semantics
 // match the machine).
 // Phase 10b-2: an argument-setup expression may be inlined into a call site
-// only when evaluating it again has no side effects.  Constants, loads,
-// arithmetic and named globals qualify; anything with a function-like call
+// only when evaluating it again has no side effects or deferred memory reads.
+// Constants and register arithmetic qualify; anything with a function-like call
 // (identifier directly before '(') is kept as a register variable to avoid
 // duplicate evaluation.
 bool inlineableExpression(const CExpr& expression) {
+    if (expression.readsMemory) return false;
     if (expression.text.empty()) return false;
     if (expression.isConst) return true;
     size_t pos = 0;
@@ -673,6 +676,10 @@ public:
             args += (i ? ", " : "") + argument;
         }
         const std::string call = fname + "(" + args + ")";
+        // Calls can clobber registers and memory. Argument text has already
+        // been captured; no pre-call definition is valid for later inlining.
+        regExpr.clear();
+        regConst.clear();
         if (signature && signature->returnType.kind == TypeKind::VOID_TYPE)
             line(call + ";");
         else
@@ -958,6 +965,14 @@ public:
                 operation == 5)
                 regConst.erase(56); // RDI
             if (operation == 4) regConst.erase(0); // RAX
+            // These writes bypass pending, including comparison flags and
+            // entry-parameter aliases. Conservatively forget all expressions.
+            regExpr.clear();
+            if (repeat) paramDefined.insert(8);
+            if (operation == 1 || operation == 2 || operation == 4)
+                paramDefined.insert(48);
+            if (operation == 1 || operation == 2 || operation == 3 || operation == 5)
+                paramDefined.insert(56);
         };
 
         for (size_t piIndex = 0; piIndex < blk_.insns.size(); ++piIndex) {
@@ -965,7 +980,52 @@ public:
             dropRspWrite = false; // Phase 10f: per-instruction fold flag
             for (const auto& op : pi.ops) {
                 if (op.op == POp::CBRANCH) {
-                    cond = stripParens(exprOfV(pi.find(op.in1)).text);
+                    const Varnode* condition = pi.find(op.in1);
+                    // Native output need not materialize an EFLAGS bit just
+                    // to branch on it.  Keep the executable recovered view
+                    // conservative, but in the source-facing view substitute
+                    // the p-code expression which last defined CF/ZF/SF/OF.
+                    // This turns `if (r4096 != 0)` into the original
+                    // comparison expression while preserving the flag model
+                    // for ADC/SBB/CMOV and the runtime oracle.
+                    if (!useRecoveredRuntime && condition &&
+                        condition->kind == Varnode::REGISTER &&
+                        condition->offset >= 4096 && condition->offset <= 4101) {
+                        const auto definition = regExpr.find(condition->offset);
+                        cond = definition != regExpr.end() &&
+                               inlineableExpression(definition->second)
+                            ? stripParens(definition->second.text)
+                            : stripParens(exprOfV(condition).text);
+                    } else {
+                        cond = stripParens(exprOfV(condition).text);
+                    }
+                    if (!useRecoveredRuntime) {
+                        // CBRANCH normally consumes a one-byte UNIQUE made
+                        // from a flag (for example INT_NOTEQUAL(CF, 0)), so
+                        // substitute flags occurring inside that expression
+                        // too, not only a direct register operand.
+                        for (uint64_t flag = 4096; flag <= 4101; ++flag) {
+                            const auto definition = regExpr.find(flag);
+                            if (definition == regExpr.end() ||
+                                !inlineableExpression(definition->second)) continue;
+                            const std::string name = registerName(
+                                architecture, flag, 1);
+                            size_t at = 0;
+                            while ((at = cond.find(name, at)) !=
+                                   std::string::npos) {
+                                const bool before = at == 0 ||
+                                    (!std::isalnum(static_cast<unsigned char>(cond[at - 1])) && cond[at - 1] != '_');
+                                const size_t afterAt = at + name.size();
+                                const bool after = afterAt == cond.size() ||
+                                    (!std::isalnum(static_cast<unsigned char>(cond[afterAt])) && cond[afterAt] != '_');
+                                if (!before || !after) { at = afterAt; continue; }
+                                const std::string replacement = "(" +
+                                    stripParens(definition->second.text) + ")";
+                                cond.replace(at, name.size(), replacement);
+                                at += replacement.size();
+                            }
+                        }
+                    }
                     hasCond = true;
                     continue;
                 }
@@ -1079,7 +1139,10 @@ public:
                             }
                         } else {
                             line("/* call " + target + " */");
-                        }                    }
+                        }
+                    }
+                    regExpr.clear();
+                    regConst.clear();
                     continue;
                 }
                 const Varnode* vo = pi.find(op.out);
@@ -1218,20 +1281,18 @@ public:
                     case POp::INT_XOR: c = "^"; break;
                     default: break;
                     }
-                    if (op.op == POp::INT_ADD && b.isConst) {
+                    if (op.op == POp::INT_ADD && b.isConst && !a.isConst) {
                         const int64_t n = static_cast<int64_t>(
                             std::strtoll(b.text.c_str(), nullptr, 10));
-                        if (n < 0) {
+                        if (n < 0 && n != std::numeric_limits<int64_t>::min()) {
                             c = "-";
                             b.text = std::to_string(-n);
                         }
                     }
                     if (a.isConst && b.isConst) {
-                        const int64_t x = static_cast<int64_t>(
-                            std::strtoll(a.text.c_str(), nullptr, 10));
-                        const int64_t y = static_cast<int64_t>(
-                            std::strtoll(b.text.c_str(), nullptr, 10));
-                        int64_t z = 0;
+                        const uint64_t x = std::strtoull(a.text.c_str(), nullptr, 10);
+                        const uint64_t y = std::strtoull(b.text.c_str(), nullptr, 10);
+                        uint64_t z = 0;
                         switch (op.op) {
                         case POp::INT_ADD: z = x + y; break;
                         case POp::INT_SUB: z = x - y; break;
@@ -1241,9 +1302,15 @@ public:
                         case POp::INT_XOR: z = x ^ y; break;
                         default: break;
                         }
-                        r.text = std::to_string(z);
+                        r.text = std::to_string(static_cast<int64_t>(z));
                         r.size = vo->size;
                         r.isConst = true;
+                        if (z == (uint64_t{1} << 63)) {
+                            // A decimal token 9223372036854775808 is not a
+                            // signed C++ literal; form INT64_MIN legally.
+                            r.text = "(-9223372036854775807LL - 1)";
+                            r.isConst = false; // not a single numeric token
+                        }
                     } else if (b.isConst && b.text == "0") {
                         if (op.op == POp::INT_MULT ||
                             op.op == POp::INT_AND)
@@ -1270,6 +1337,13 @@ public:
                         r.isConst = true;
                     } else {
                         r.text = "(" + a.text + " " + c + " " + b.text + ")";
+                        if (op.op == POp::INT_MULT && vo->size <= 8) {
+                            // uint8_t/uint16_t promote to signed int in C++.
+                            // P-code multiplication instead wraps at its
+                            // destination width and must never overflow int.
+                            r.text = "((" + std::string(uCast(vo->size)) +
+                                ")((uint64_t)(" + a.text + ") * (uint64_t)(" + b.text + ")))";
+                        }
                         r.size = vo->size;
                     }
                     break;
@@ -1280,7 +1354,27 @@ public:
                     const CExpr a = exprOfV(pi.find(op.in0));
                     const CExpr b = exprOfV(pi.find(op.in1));
                     const char* c = op.op == POp::INT_LEFT ? "<<" : ">>";
-                    r.text = "(" + a.text + " " + c + " " + b.text + ")";
+                    const Varnode* input = pi.find(op.in0);
+                    const int width = input ? input->size : vo->size;
+                    if (width > 8) {
+                        // Wide/vector operations have separate lowering;
+                        // do not treat them as signed 64-bit scalars here.
+                        r.text = "(" + a.text + " " + c + " " + b.text + ")";
+                        r.size = vo->size;
+                        break;
+                    }
+                    const bool arithmetic = op.op == POp::INT_SRIGHT;
+                    // P-code shifts use the input width, not C integer
+                    // promotions. In particular SAR must sign-extend its
+                    // operand and SHL on a byte must not shift signed int.
+                    const std::string operand = arithmetic
+                        ? "(int64_t)(" + std::string(cCast(width)) + ")(" + a.text + ")"
+                        : "(uint64_t)(" + std::string(uCast(width)) + ")(" + a.text + ")";
+                    const std::string count = "(uint64_t)(" + b.text + ")";
+                    const std::string outside = arithmetic
+                        ? "(" + operand + " < 0 ? -1 : 0)" : "0";
+                    r.text = "(" + count + " >= " + std::to_string(width * 8) +
+                             " ? " + outside + " : (" + operand + " " + c + " " + count + "))";
                     r.size = vo->size;
                     break;
                 }
@@ -1352,7 +1446,7 @@ public:
                 case POp::INT_ZEXT: {
                     const CExpr a = exprOfV(pi.find(op.in0));
                     const Varnode* vs = pi.find(op.in0);
-                    r.text = "((int64_t)(" +
+                    r.text = "((uint64_t)(" +
                              std::string(uCast(vs ? vs->size : 8)) + ")(" +
                              stripParens(a.text) + "))";
                     r.size = vo->size;
@@ -1369,8 +1463,38 @@ public:
                 }
                 case POp::SUBPIECE: {
                     const CExpr a = exprOfV(pi.find(op.in0));
+                    const CExpr offset = op.in1
+                        ? exprOfV(pi.find(op.in1))
+                        : CExpr{"0", 8, true};
+                    const Varnode* offsetNode = pi.find(op.in1);
+                    const std::string source = "(uint64_t)(" + stripParens(a.text) + ")";
+                    std::string shifted = stripParens(a.text);
+                    if (offsetNode && offsetNode->isConst()) {
+                        shifted = offsetNode->offset == 0 ? stripParens(a.text) :
+                            offsetNode->offset >= 8 ? "0" :
+                            "(" + source + " >> " + std::to_string(offsetNode->offset * 8) + ")";
+                    } else if (op.in1 != 0) {
+                        const std::string bytes = "(uint64_t)(" + stripParens(offset.text) + ")";
+                        shifted = "(" + bytes + " >= 8 ? 0 : (" + source + " >> (" + bytes + " * 8)))";
+                    }
                     r.text = "((" + std::string(uCast(vo->size)) + ")(" +
-                             stripParens(a.text) + "))";
+                             shifted + "))";
+                    r.size = vo->size;
+                    break;
+                }
+                case POp::PIECE: {
+                    const CExpr high = exprOfV(pi.find(op.in0));
+                    const CExpr low = exprOfV(pi.find(op.in1));
+                    const Varnode* lowNode = pi.find(op.in1);
+                    const int shift = (lowNode ? lowNode->size : 8) * 8;
+                    if (shift >= 64) {
+                        r.text = stripParens(low.text);
+                    } else {
+                        r.text = "((" + std::string(uCast(vo->size)) + ")(" +
+                            "((uint64_t)(" + stripParens(high.text) +
+                            ") << " + std::to_string(shift) + ") | " +
+                            "(uint64_t)(" + stripParens(low.text) + ")))";
+                    }
                     r.size = vo->size;
                     break;
                 }
@@ -1431,13 +1555,37 @@ public:
                 case POp::INT_COUNT_LEADING_ZERO:
                 case POp::INT_COUNT_TRAILING_ZERO: {
                     const CExpr a = exprOfV(pi.find(op.in0));
+                    const Varnode* input = pi.find(op.in0);
                     const std::string x = stripParens(a.text);
+                    const int bits = (input ? input->size : 8) * 8;
                     if (op.op == POp::INT_POPCOUNT)
                         r.text = "__builtin_popcountll(" + x + ")";
-                    else if (op.op == POp::INT_COUNT_LEADING_ZERO)
-                        r.text = "(" + x + " ? __builtin_clzll(" + x + ") : 64)";
-                    else
-                        r.text = "(" + x + " ? __builtin_ctzll(" + x + ") : 64)";
+                    else if (op.op == POp::INT_COUNT_LEADING_ZERO) {
+                        // clz/clzll count over the width of their host type,
+                        // not the p-code varnode.  Using clzll for EAX, AX or
+                        // AL therefore adds 32/48/56 nonexistent high zero
+                        // bits.  Select the closest host builtin and remove
+                        // its padding so the emitted C preserves the source
+                        // operand's architectural width.
+                        const bool wide = bits > 32;
+                        const int hostBits = wide ? 64 : 32;
+                        const std::string builtin = wide
+                            ? "__builtin_clzll((unsigned long long)(" + x + "))"
+                            : "__builtin_clz((unsigned)(" + x + "))";
+                        const std::string adjusted = hostBits == bits
+                            ? builtin
+                            : "(" + builtin + " - " +
+                                  std::to_string(hostBits - bits) + ")";
+                        r.text = "(" + x + " ? " + adjusted + " : " +
+                                 std::to_string(bits) + ")";
+                    }
+                    else {
+                        const std::string builtin = bits > 32
+                            ? "__builtin_ctzll((unsigned long long)(" + x + "))"
+                            : "__builtin_ctz((unsigned)(" + x + "))";
+                        r.text = "(" + x + " ? " + builtin + " : " +
+                                 std::to_string(bits) + ")";
+                    }
                     r.size = vo->size;
                     break;
                 }
@@ -2222,6 +2370,20 @@ public:
                     r.size = vo->size;
                     break;
                 }
+                case POp::SIMD_STRING_COMPARE: {
+                    const CExpr left = exprOfV(pi.find(op.in0));
+                    const CExpr right = exprOfV(pi.find(op.in1));
+                    const CExpr lengths = op.in2
+                        ? exprOfV(pi.find(op.in2))
+                        : CExpr{"0", 8, true};
+                    r.text = "recovered_simd_string_compare(" +
+                        stripParens(left.text) + ", " +
+                        stripParens(right.text) + ", " +
+                        stripParens(lengths.text) + ", " +
+                        std::to_string(op.aux) + ")";
+                    r.size = vo->size;
+                    break;
+                }
                 case POp::SIMD_MOVEMASK: {
                     // vpmovmskb/pmovmskb/movmskps/movmskpd: the most
                     // significant bit of each source lane becomes one bit
@@ -2437,9 +2599,27 @@ public:
                 // generated C expression has been evaluated.
                 for (uint64_t input : {op.in0, op.in1, op.in2}) {
                     const CExpr inputExpression = exprOfV(pi.find(input));
+                    r.readsMemory = r.readsMemory || inputExpression.readsMemory;
                     for (const auto& reference : inputExpression.registerRefs)
                         r.registerRefs[reference.first].insert(
                             reference.second.begin(), reference.second.end());
+                }
+                if (op.op == POp::LOAD) r.readsMemory = true;
+                if (op.op == POp::LOAD && std::any_of(
+                        pi.ops.begin(), pi.ops.end(), [](const PcodeOp& other) {
+                            return other.op == POp::STORE;
+                        })) {
+                    // UNIQUE expressions are usually deferred until their
+                    // consumer. A read-modify-write instruction must instead
+                    // capture the old memory value before emitting STORE
+                    // (XCHG/XADD/CMPXCHG may return that old value afterwards).
+                    const std::string snapshot = "recovered_memory_" +
+                        std::to_string(pi.addr) + "_" + std::to_string(op.out);
+                    line("const auto " + snapshot + " = " + r.text + ";");
+                    r.text = snapshot;
+                    r.readsMemory = false;
+                    r.registerRefs.clear();
+                    r.isConst = false;
                 }
                 // The destination varnode, not the right-hand expression,
                 // defines the architectural write width.  In particular,
@@ -2522,6 +2702,24 @@ public:
                 // plain register name (runtime value) instead of the text.
                 regExpr.erase(written);
                 continue;
+            }
+            uint64_t sliceBase = 0;
+            unsigned sliceShift = 0;
+            if (x86GprSlice(architecture, write.first, write.second.size,
+                            sliceBase, sliceShift)) {
+                if (write.second.size < 4) {
+                    // AL/AH/AX writes preserve the other bits of the GPR.
+                    // Their RHS is not a definition of the complete RAX.
+                    regExpr.erase(written);
+                    continue;
+                }
+                if (write.second.size == 4) {
+                    CExpr extended = write.second;
+                    extended.text = "(uint32_t)(" + extended.text + ")";
+                    extended.size = 8;
+                    regExpr[written] = std::move(extended);
+                    continue;
+                }
             }
             regExpr[written] = write.second;
         }

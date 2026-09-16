@@ -18,6 +18,14 @@ set(CENTRIFUGE_BLENDER_WINDOWS_MANIFEST
 set(CENTRIFUGE_BLENDER_WINDOWS_OUTPUT
     "${CMAKE_CURRENT_BINARY_DIR}/blender-recovery"
     CACHE PATH "Output directory for the Blender recovery benchmark")
+set(CENTRIFUGE_KRITA_WINDOWS_BINARY "" CACHE FILEPATH
+    "Optional path to a pinned Windows x64 libkritaui.dll scale fixture")
+set(CENTRIFUGE_KRITA_WINDOWS_MANIFEST
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/krita_windows_manifest_6_0_3.json"
+    CACHE FILEPATH "Manifest for the Krita Windows scale fixture")
+set(CENTRIFUGE_KRITA_WINDOWS_OUTPUT
+    "${CMAKE_CURRENT_BINARY_DIR}/krita-recovery"
+    CACHE PATH "Output directory for the Krita recovery benchmark")
 
 if(CENTRIFUGE_BUILD_FUZZERS AND NOT CENTRIFUGE_ENABLE_SANITIZERS)
   message(FATAL_ERROR
@@ -246,6 +254,18 @@ if(BUILD_TESTING)
       LABELS "integration;differential;large"
       TIMEOUT 180
     )
+    find_program(CENTRIFUGE_OBJDUMP NAMES objdump llvm-objdump)
+    set(CENTRIFUGE_X86_ORACLE_ARGS)
+    if(CENTRIFUGE_OBJDUMP)
+      list(APPEND CENTRIFUGE_X86_ORACLE_ARGS --objdump "${CENTRIFUGE_OBJDUMP}")
+    endif()
+    add_test(NAME decompiler_x86_roundtrip
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/x86_roundtrip.py"
+              --centrifuge "$<TARGET_FILE:centrifuge>"
+              --source-dir "${CMAKE_CURRENT_SOURCE_DIR}" --cc "${CENTRIFUGE_C_COMPILER}"
+              ${CENTRIFUGE_X86_ORACLE_ARGS})
+    set_tests_properties(decompiler_x86_roundtrip PROPERTIES
+      LABELS "integration;differential;x86" TIMEOUT 180)
   else()
     message(STATUS
       "Skipping decompiler_roundtrip: Python 3 and a C compiler are required")
@@ -284,9 +304,10 @@ if(BUILD_TESTING)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/blender_windows_recovery.py"
                 --centrifuge "$<TARGET_FILE:centrifuge>"
                 --source-dir "${CMAKE_CURRENT_SOURCE_DIR}"
-                --blender "${CENTRIFUGE_BLENDER_WINDOWS_BINARY}"
+                --binary "${CENTRIFUGE_BLENDER_WINDOWS_BINARY}"
                 --manifest "${CENTRIFUGE_BLENDER_WINDOWS_MANIFEST}"
                 --output-dir "${CENTRIFUGE_BLENDER_WINDOWS_OUTPUT}"
+                --report-name "blender_recovery_report.json"
                 --cmake "${CMAKE_COMMAND}"
       )
       set_tests_properties(blender_windows_project_recovery PROPERTIES
@@ -297,6 +318,29 @@ if(BUILD_TESTING)
       message(STATUS
         "Blender recovery benchmark disabled; set "
         "CENTRIFUGE_BLENDER_WINDOWS_BINARY to blender.exe")
+    endif()
+    if(CENTRIFUGE_KRITA_WINDOWS_BINARY AND
+       EXISTS "${CENTRIFUGE_KRITA_WINDOWS_BINARY}")
+      add_test(
+        NAME krita_windows_project_recovery
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/blender_windows_recovery.py"
+                --centrifuge "$<TARGET_FILE:centrifuge>"
+                --source-dir "${CMAKE_CURRENT_SOURCE_DIR}"
+                --binary "${CENTRIFUGE_KRITA_WINDOWS_BINARY}"
+                --manifest "${CENTRIFUGE_KRITA_WINDOWS_MANIFEST}"
+                --output-dir "${CENTRIFUGE_KRITA_WINDOWS_OUTPUT}"
+                --report-name "krita_recovery_report.json"
+                --cmake "${CMAKE_COMMAND}"
+      )
+      set_tests_properties(krita_windows_project_recovery PROPERTIES
+        LABELS "integration;benchmark;large;windows;krita;project-recovery"
+        TIMEOUT 3600
+      )
+    else()
+      message(STATUS
+        "Krita recovery benchmark disabled; set "
+        "CENTRIFUGE_KRITA_WINDOWS_BINARY to libkritaui.dll")
     endif()
   endif()
 endif()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in Windows Blender scale benchmark for project recovery.
+"""Opt-in large Windows PE benchmark for project recovery.
 
 This stage proves deterministic loading, whole-program analysis, C++ project
 generation, recompilation, linking, and execution of the recovery verifier.
@@ -17,24 +17,27 @@ import time
 parser = argparse.ArgumentParser()
 parser.add_argument("--centrifuge", required=True)
 parser.add_argument("--source-dir", required=True)
-parser.add_argument("--blender", required=True)
+binary_group = parser.add_mutually_exclusive_group(required=True)
+binary_group.add_argument("--binary")
+binary_group.add_argument("--blender", help=argparse.SUPPRESS)
 parser.add_argument("--manifest", required=True)
 parser.add_argument("--output-dir", required=True)
+parser.add_argument("--report-name", default="blender_recovery_report.json")
 parser.add_argument("--cmake", required=True)
 parser.add_argument("--timeout", type=float, default=1800.0)
 args = parser.parse_args()
 
 root = Path(args.source_dir).resolve()
-binary = Path(args.blender).resolve()
+binary = Path(args.binary or args.blender).resolve()
 output = Path(args.output_dir).resolve()
 manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
 output.mkdir(parents=True, exist_ok=True)
 
 if not binary.is_file():
-    raise SystemExit(f"Blender binary does not exist: {binary}")
+    raise SystemExit(f"Windows fixture does not exist: {binary}")
 with binary.open("rb") as stream:
     if stream.read(2) != b"MZ":
-        raise SystemExit(f"Blender fixture is not a Windows PE image: {binary}")
+        raise SystemExit(f"Fixture is not a Windows PE image: {binary}")
 
 
 def sha256_file(path):
@@ -52,7 +55,7 @@ binary_sha256 = sha256_file(binary)
 expected_binary_sha256 = manifest.get("binary_sha256")
 if expected_binary_sha256 and binary_sha256 != expected_binary_sha256:
     raise SystemExit(
-        f"Blender executable SHA-256 mismatch: expected "
+        f"Fixture SHA-256 mismatch: expected "
         f"{expected_binary_sha256}, got {binary_sha256}")
 
 
@@ -129,7 +132,7 @@ report["quality_thresholds_passed"] = (
     (project / "resources" / "index.json").is_file() and
     (project / "entrypoint.json").is_file()
 )
-(output / "blender_recovery_report.json").write_text(
+(output / args.report_name).write_text(
     json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 print(json.dumps(report, indent=2, sort_keys=True))
 raise SystemExit(0 if report["project_compiled"] and

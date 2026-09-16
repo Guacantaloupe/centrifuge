@@ -4631,7 +4631,15 @@ std::string decompileTyped(
         for (const FunctionParameter& parameter : effectiveSignature.parameters) {
             if (parameter.onStack) continue;
             const std::string name = registerDeclName(parameter.registerOffset);
-            out << "    " << name << " = (uint64_t)(uintptr_t)"
+            // A 64-bit integer parameter already carries the register
+            // width; the (uint64_t)(uintptr_t) round trip is the identity
+            // there.  Pointers and narrower ints still need the cast.
+            const bool already64 =
+                (parameter.type.kind == TypeKind::UNSIGNED_INT ||
+                 parameter.type.kind == TypeKind::SIGNED_INT) &&
+                parameter.type.bits == 64;
+            out << "    " << name << " = "
+                << (already64 ? "" : "(uint64_t)(uintptr_t)")
                 << parameter.name << ";\n";
         }
     }
@@ -4654,9 +4662,16 @@ std::string decompileTyped(
                            registerDeclName(stackPointerOffset(architecture)) +
                            " + " + std::to_string(parameter.stackOffset) +
                            ", " + parameter.name + ");\n";
-            else
+            else {
+                const bool already64 =
+                    (parameter.type.kind == TypeKind::UNSIGNED_INT ||
+                     parameter.type.kind == TypeKind::SIGNED_INT) &&
+                    parameter.type.bits == 64;
                 out << "    " << localName(parameter.stackOffset)
-                    << " = (uint64_t)(uintptr_t)" << parameter.name << ";\n";
+                    << " = "
+                    << (already64 ? "" : "(uint64_t)(uintptr_t)")
+                    << parameter.name << ";\n";
+            }
         }
     std::istringstream lines(body);
     std::string line;

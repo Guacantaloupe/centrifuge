@@ -1121,6 +1121,80 @@ std::string foldAssignBeforeReturn(const std::string& body) {
     return out.str();
 }
 
+// Drop the first of two adjacent whole-line stores to the same plain
+// scalar: "x = A; x = B;" -> "x = B;".  Adjacency guarantees no label
+// or statement can observe A's stored value, and B's RHS must not read
+// x (data dependency).  A must be side-effect free: no calls (direct
+// "FUN_", indirect ")(", or "__builtin") and no "?:" - the scalar
+// pseudo-registers are never address-taken, so a pure right-hand side
+// leaves no trace when its store is dropped.  Applied repeatedly so
+// "x = A; x = B; x = C;" collapses fully.
+std::string dropOverwrittenStores(const std::string& body) {
+    std::vector<std::string> lines;
+    {
+        std::istringstream in(body);
+        std::string ln;
+        while (std::getline(in, ln)) lines.push_back(ln);
+    }
+    const auto matchStore = [](const std::string& raw, std::string& var,
+                               std::string& rhs) {
+        const size_t start = raw.find_first_not_of(" \t");
+        if (start == std::string::npos) return false;
+        const std::string t = raw.substr(start);
+        const size_t eq = t.find(" = ");
+        if (eq == std::string::npos || t.back() != ';') return false;
+        var = t.substr(0, eq);
+        if (var.empty() ||
+            !std::all_of(var.begin(), var.end(), [](char c) {
+                return std::isalnum(static_cast<unsigned char>(c)) ||
+                       c == '_';
+            }))
+            return false;
+        rhs = t.substr(eq + 3, t.size() - 1 - (eq + 3));
+        return true;
+    };
+    const auto pure = [](const std::string& rhs) {
+        return rhs.find("FUN_") == std::string::npos &&
+               rhs.find(")(") == std::string::npos &&
+               rhs.find("__builtin") == std::string::npos &&
+               rhs.find('?') == std::string::npos;
+    };
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (size_t i = 0; i + 1 < lines.size(); ++i) {
+            std::string v1, r1, v2, r2;
+            if (!matchStore(lines[i], v1, r1)) continue;
+            if (!matchStore(lines[i + 1], v2, r2)) continue;
+            if (v1 != v2 || !pure(r1)) continue;
+            // B must not read x.
+            size_t at = 0;
+            bool reads = false;
+            while ((at = r2.find(v1, at)) != std::string::npos) {
+                const bool lb = at == 0 ||
+                    !(std::isalnum(static_cast<unsigned char>(r2[at - 1])) ||
+                      r2[at - 1] == '_');
+                const size_t end = at + v1.size();
+                const bool rb = end >= r2.size() ||
+                    !(std::isalnum(static_cast<unsigned char>(r2[end])) ||
+                      r2[end] == '_');
+                if (lb && rb) {
+                    reads = true;
+                    break;
+                }
+                at = end;
+            }
+            if (reads) continue;
+            lines[i].clear();
+            changed = true;
+        }
+    }
+    std::ostringstream out;
+    for (const auto& l : lines)
+        if (!l.empty()) out << l << "\n";
+    return out.str();
+}
+
 // Phase 10j: generalise the adjacent-branch inlining to any flag use
 // inside the same basic block.  For a store "rNNNN = <cond>;", scan
 // forward to the end of the block (a label line, another store to the
@@ -5403,6 +5477,7 @@ te.pushSlots = &pushSlots;
     result = dropSubsumedTruncations(result);
     result = dropSubsumedRightTruncations(result);
     result = collapseSameTypeDoubleCasts(result);
+    result = dropOverwrittenStores(result);
     result = rewriteSelfIncrements(result);
     if (!useRecoveredRuntime) {
         result = inlineAdjacentFlagBranches(result, architecture);

@@ -993,6 +993,22 @@ void FunctionIR::inferTypes() {
         }
     for (auto& entry : accessedFields) {
         auto& fields = entry.second;
+        // The same (offset, type) pair is recorded once per memory op, so
+        // repeated accesses to one field emitted duplicate members (e.g.
+        // four "uint32_t field_8;" lines).  Only distinct observations
+        // carry layout information - deduplicate before the analysis.
+        std::sort(fields.begin(), fields.end(), [](const TypeField& a,
+                                                   const TypeField& b) {
+            return std::tie(a.byteOffset, a.name, a.type.bits) <
+                   std::tie(b.byteOffset, b.name, b.type.bits);
+        });
+        fields.erase(std::unique(fields.begin(), fields.end(),
+                                 [](const TypeField& a, const TypeField& b) {
+                                     return a.byteOffset == b.byteOffset &&
+                                            a.name == b.name &&
+                                            a.type.bits == b.type.bits;
+                                 }),
+                     fields.end());
         // One constant-offset dereference is already sufficient to establish
         // that an ABI live-in is an address.  Multiple observations are only
         // required to choose between struct/array/union layout patterns.

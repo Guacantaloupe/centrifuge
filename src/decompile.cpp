@@ -854,6 +854,69 @@ std::string rewriteSelfIncrements(const std::string& body) {
     return out.str();
 }
 
+// Drop an inner unsigned truncation when an identical outer truncation
+// subsumes it and the connective distributes over the modulus:
+//   "(T)(((T)(X)) OP rest)" -> "(T)((X) OP rest)"
+// for T in {uint8,uint16,uint32} and OP in {+ - & | ^}.  Truncation is a
+// ring homomorphism for + and - (mod 2^N) and depends only on the low N
+// bits of both operands for the bitwise ops, so the low N bits of the
+// whole expression are unchanged.  X is kept textually intact (single
+// evaluation, any internal casts preserved).  "(T)" is unsigned only;
+// signed truncation is not substituted.  Applied repeatedly so nested
+// shapes collapse too.
+std::string dropSubsumedTruncations(std::string text) {
+    const char* types[] = {"uint8_t", "uint16_t", "uint32_t"};
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const char* tc : types) {
+            const std::string t = "(" + std::string(tc) + ")";
+            const std::string needle = t + "((" + t + "(";
+            size_t pos = 0;
+            while ((pos = text.find(needle, pos)) != std::string::npos) {
+                // X opens at the needle's final '(' and is one balanced
+                // "(...)" group.
+                const size_t xOpen = pos + needle.size() - 1;
+                if (xOpen >= text.size() || text[xOpen] != '(') {
+                    pos++;
+                    continue;
+                }
+                int depth = 0;
+                size_t j = xOpen;
+                for (; j < text.size(); ++j) {
+                    if (text[j] == '(')
+                        depth++;
+                    else if (text[j] == ')') {
+                        depth--;
+                        if (!depth) break;
+                    }
+                }
+                if (j >= text.size()) {
+                    pos++;
+                    continue;
+                }
+                // X spans [xOpen, j]; the wrapper group must close next,
+                // followed by " <op> " with a distributing operator.
+                if (j + 4 >= text.size() || text[j + 1] != ')' ||
+                    text[j + 2] != ' ' || text[j + 4] != ' ' ||
+                    std::string("+-&|^").find(text[j + 3]) ==
+                        std::string::npos) {
+                    pos++;
+                    continue;
+                }
+                // "((T)(X))" -> "(X)": erase the wrapper open paren and
+                // the inner cast, then the wrapper close that followed X.
+                // "(T)(((T)(X)) OP r)" -> "(T)((X) OP r)".
+                text.erase(pos + t.size() + 1, t.size() + 1);
+                text.erase(j - t.size(), 1);
+                changed = true;
+                break; // restart the scan
+            }
+        }
+    }
+    return text;
+}
+
 // Fold "v = <expr>; return v;" (adjacent lines) into "return <expr>;".
 // Adjacency guarantees no label, branch target, or intervening statement,
 // so the store is observed only by the return; "v" is a plain local
@@ -4998,6 +5061,7 @@ te.pushSlots = &pushSlots;
         }
     }
     std::string result = out.str();
+    result = dropSubsumedTruncations(result);
     result = rewriteSelfIncrements(result);
     if (!useRecoveredRuntime) {
         result = inlineAdjacentFlagBranches(result, architecture);

@@ -789,11 +789,15 @@ static int matchTopLevelZeroCompare(const std::string& cond, bool& negated) {
     return found;
 }
 
-// Rewrite "v = v + 1;" / "v = v - 1;" to "v++;" / "v--;" for plain
-// scalar identifiers.  The pseudo-registers are function-local uint64_t
-// C scalars, never address-taken, so value and side effects are
-// identical.  Longer forms ("v = v + 2;", "v = (v + x) + 1;") and
-// non-identifier operands are left untouched.
+// Rewrite self-arithmetic whole-line assignments to compound form for
+// plain scalar identifiers:
+//   "v = v + 1;" / "v = v - 1;"      -> "v++;" / "v--;"
+//   "v = v + k;" / "v = v - k;" ...  -> "v += k;" / "v -= k;" (& | ^ too)
+// The pseudo-registers are function-local uint64_t C scalars, never
+// address-taken, so value and side effects are identical ("v" is a plain
+// lvalue evaluated once in both forms).  Only the exact two-term shape
+// "v OP operand" is matched - "v = (v + x) + 1;", casts, and dereferences
+// are left untouched.
 std::string rewriteSelfIncrements(const std::string& body) {
     std::vector<std::string> lines;
     {
@@ -805,29 +809,45 @@ std::string rewriteSelfIncrements(const std::string& body) {
         const size_t a = s.find_first_not_of(" \t");
         return a == std::string::npos ? std::string() : s.substr(a);
     };
+    const auto isPlainId = [](const std::string& s) {
+        return !s.empty() &&
+               (std::isalpha(static_cast<unsigned char>(s[0])) ||
+                s[0] == '_') &&
+               std::all_of(s.begin(), s.end(), [](char c) {
+                   return std::isalnum(static_cast<unsigned char>(c)) ||
+                          c == '_';
+               });
+    };
     for (auto& ln : lines) {
         const std::string t = trimmed(ln);
         const size_t eq = t.find(" = ");
         if (eq == std::string::npos || t.back() != ';') continue;
         const std::string lhs = t.substr(0, eq);
-        const std::string rhs = t.substr(eq + 3, t.size() - 1 - (eq + 3));
-        if (lhs.empty() || rhs != lhs + " + 1" && rhs != lhs + " - 1")
-            continue;
-        // Whole-line plain identifier on both sides only.
-        const auto isPlainId = [](const std::string& s) {
-            return !s.empty() &&
-                   (std::isalpha(static_cast<unsigned char>(s[0])) ||
-                    s[0] == '_') &&
-                   std::all_of(s.begin(), s.end(), [](char c) {
-                       return std::isalnum(static_cast<unsigned char>(c)) ||
-                              c == '_';
-                   });
-        };
         if (!isPlainId(lhs)) continue;
-        const char* op = rhs.back() == '1' && rhs[rhs.size() - 3] == '+'
-                             ? "++"
-                             : "--";
-        ln = ln.substr(0, ln.size() - t.size()) + lhs + op + ";";
+        const std::string rhs = t.substr(eq + 3, t.size() - 1 - (eq + 3));
+        // rhs must be exactly "v <op> operand" with a plain identifier
+        // or integer operand (allow ULL-style suffixes).
+        for (const char* op : {" + ", " - ", " & ", " | ", " ^ "}) {
+            const std::string prefix = lhs + op;
+            if (rhs.rfind(prefix, 0) != 0) continue;
+            const std::string operand = rhs.substr(prefix.size());
+            if (operand.empty()) break;
+            const bool plainOperand =
+                std::all_of(operand.begin(), operand.end(), [](char c) {
+                    return std::isalnum(static_cast<unsigned char>(c)) ||
+                           c == '_';
+                });
+            if (!plainOperand) break;
+            const char opc = op[1];
+            if (operand == "1" && (opc == '+' || opc == '-')) {
+                ln = ln.substr(0, ln.size() - t.size()) + lhs +
+                     (opc == '+' ? "++;" : "--;");
+            } else {
+                ln = ln.substr(0, ln.size() - t.size()) + lhs + " " +
+                     std::string(1, opc) + "= " + operand + ";";
+            }
+            break;
+        }
     }
     std::ostringstream out;
     for (const auto& l : lines) out << l << "\n";

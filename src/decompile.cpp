@@ -3208,6 +3208,41 @@ public:
                             }
                         }
                     }
+                    // Constant-condition fold: bit-test p-code (BT/BTS-style)
+                    // feeds SELECT with literal conditions such as '3 != 0'
+                    // (the constant may reach the comparison through temp
+                    // copies, so match the rendered text, not the p-code
+                    // tree).  Resolve and take the matching branch instead
+                    // of printing a dead ternary.  Semantics-preserving in
+                    // both views.
+                    {
+                        const std::string flat = stripParens(condText);
+                        uint64_t lhs = 0, rhs = 0;
+                        int condConst = -1; // -1 unknown, 0 false, 1 true
+                        if (parseConstToken(flat, &lhs)) {
+                            condConst = lhs != 0;
+                        } else {
+                            for (const char* cmp : {" != ", " == "}) {
+                                const size_t at = flat.find(cmp);
+                                if (at == std::string::npos ||
+                                    flat.find(cmp, at + std::strlen(cmp)) !=
+                                        std::string::npos)
+                                    continue;
+                                if (!parseConstToken(flat.substr(0, at), &lhs) ||
+                                    !parseConstToken(flat.substr(at + std::strlen(cmp)),
+                                                     &rhs))
+                                    continue;
+                                condConst = std::strlen(cmp) == 4
+                                    ? (lhs != rhs) : (lhs == rhs);
+                                break;
+                            }
+                        }
+                        if (condConst >= 0) {
+                            r = exprOfV(pi.find(condConst ? op.in1 : op.in2));
+                            r.size = vo->size;
+                            break;
+                        }
+                    }
                     // Unwrap "(cmp) != 0" wrappers left around inlined flag
                     // comparisons, as for branch conditions.
                     condText = normalizeBranchCond(condText);
@@ -3520,7 +3555,21 @@ public:
                 for (const auto& snapshot : snapshots)
                     expression = replaceIdentifier(expression, snapshot.first,
                                                    snapshot.second);
-                if (emittedSpWrite) {
+                // A write whose right-hand side is the plain target variable
+                // ('rax = rax', 'r4099 = r4099') is a no-op in the recovered
+                // model; drop the statement instead of printing it.  This
+                // survives constant SELECT folding, which can reduce a
+                // conditional flag merge to the identity branch.  A write
+                // renamed by a same-instruction snapshot no longer matches
+                // the plain name and is kept, as are 32-bit writes (their
+                // zero-extension cast is not the plain name).
+                const bool selfAssign =
+                    stripParens(expression) ==
+                    registerName(architecture, kv.first, kv.second.size);
+                if (selfAssign) {
+                    // regConst/spBias handling above already ran; nothing to
+                    // emit.
+                } else if (emittedSpWrite) {
                     // rsp write: re-base only the right-hand side so the
                     // output variable lands on the simulated frame; the LHS
                     // register name must stay a plain identifier.

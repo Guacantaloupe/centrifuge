@@ -1954,12 +1954,26 @@ public:
                     // for ">>" signedness, so the ctype-metadata path
                     // (a plain uint64_t-declared register named like an
                     // int64_t) must NOT elide it.
-                    const std::string widthTyped = arithmetic
-                        ? castTo(a, cCast(width))
-                        : castTo(a, uCast(width));
-                    const std::string operand = "(" +
-                        castTo(CExpr{widthTyped, 8, false, false, ""},
-                               arithmetic ? "int64_t" : "uint64_t") + ")";
+                    const bool bareRegister =
+                        input && input->kind == Varnode::REGISTER &&
+                        input->size == 8 &&
+                        stripParens(a.text) ==
+                            registerName(architecture, input->offset, 8);
+                    std::string operand;
+                    if (bareRegister && !arithmetic) {
+                        // A full-width register is already a uint64_t
+                        // variable, so for a logical shift both the width
+                        // presentation and the 64-bit presentation wrap
+                        // are the identity.
+                        operand = "(" + stripParens(a.text) + ")";
+                    } else {
+                        const std::string widthTyped = arithmetic
+                            ? castTo(a, cCast(width))
+                            : castTo(a, uCast(width));
+                        operand = "(" +
+                            castTo(CExpr{widthTyped, 8, false, false, ""},
+                                   arithmetic ? "int64_t" : "uint64_t") + ")";
+                    }
                     // Constant in-range counts need no guard: the runtime
                     // ternary only models count >= width, which cannot
                     // happen for a folded constant below that bound.
@@ -2109,8 +2123,14 @@ public:
                     if (width >= 8) {
                         // Zero-extension from an already 64-bit value is the
                         // identity; keep the value presented as uint64_t so
-                        // downstream unsigned comparisons stay unsigned.
-                        r.text = castTo(a, "uint64_t");
+                        // downstream unsigned comparisons stay unsigned.  A
+                        // full-width register read is already a uint64_t
+                        // variable, so the explicit cast is redundant there.
+                        const bool bareRegister =
+                            vs && vs->kind == Varnode::REGISTER && vs->size == 8 &&
+                            stripParens(a.text) ==
+                                registerName(architecture, vs->offset, 8);
+                        r.text = bareRegister ? a.text : castTo(a, "uint64_t");
                         break;
                     }
                     if (a.isConst) {
@@ -2136,8 +2156,14 @@ public:
                     if (width >= 8) {
                         // Sign-extension from an already 64-bit value is the
                         // identity; keep the value presented as int64_t so
-                        // downstream signed comparisons stay signed.
-                        r.text = castTo(a, "int64_t");
+                        // downstream signed comparisons stay signed.  A
+                        // full-width register read already carries the same
+                        // bits, so the explicit cast is redundant there.
+                        const bool bareRegister =
+                            vs && vs->kind == Varnode::REGISTER && vs->size == 8 &&
+                            stripParens(a.text) ==
+                                registerName(architecture, vs->offset, 8);
+                        r.text = bareRegister ? a.text : castTo(a, "int64_t");
                         break;
                     }
                     if (a.isConst) {

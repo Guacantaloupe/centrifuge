@@ -57,7 +57,10 @@ bool parseSpExpr(const std::string& t, const std::string& stackName,
     }
     while (*p == ' ') p++;
     if (!*p) return false;
-    const long long k = std::strtoll(p, nullptr, 10);
+    if (p[0] == '0' && p[1] == 'x') return false; // hex address, not a delta
+    char* end = nullptr;
+    const long long k = std::strtoll(p, &end, 10);
+    if (!end || *end != '\0') return false;
     bias = (op == '-') ? -k : k;
     return true;
 }
@@ -384,7 +387,33 @@ std::string hexAddr(uint64_t a) {
 std::string fmtConst(uint64_t v, int size) {
     if (size <= 4)
         return std::to_string(static_cast<int32_t>(v));
-    return std::to_string(static_cast<int64_t>(v));
+    const int64_t signedValue = static_cast<int64_t>(v);
+    // Large non-negative 64-bit constants are almost always addresses
+    // (RIP-relative displacements); hex preserves that intent.  Restricted
+    // to the 8-byte form: small constants stay decimal, and the 4-byte
+    // signed form keeps mask/comparison semantics untouched.
+    if (signedValue >= 0x1000000LL)
+        return hexAddr(v);
+    return std::to_string(signedValue);
+}
+
+// Parse a constant token as produced by fmtConst: signed decimal, or a
+// 0x-prefixed hex address.  Returns false for any other text (callers
+// must then keep the generic path - base-10 parsing would silently turn
+// "0x..." into 0).
+bool parseConstToken(const std::string& text, uint64_t* value) {
+    if (text.size() > 2 && text[0] == '0' && text[1] == 'x') {
+        char* end = nullptr;
+        const unsigned long long v = std::strtoull(text.c_str(), &end, 16);
+        if (!end || *end != '\0') return false;
+        *value = static_cast<uint64_t>(v);
+        return true;
+    }
+    char* end = nullptr;
+    const long long sv = std::strtoll(text.c_str(), &end, 10);
+    if (end == text.c_str() || !end || *end != '\0') return false;
+    *value = static_cast<uint64_t>(sv);
+    return true;
 }
 
 const char* cCast(int size) {
@@ -529,11 +558,58 @@ std::string topLevelComparison(std::string s) {
     return "";
 }
 
+// "(a < b)" -> "(a >= b)": the group text with its single top-level
+// comparison operator negated.  The comparison's boolean value makes
+// operator negation exactly logical NOT.  Returns "" when the group is
+// not a single comparison (ternaries, shifts, and non-comparisons are
+// left alone).  The result is re-wrapped in one paren layer so it can be
+// spliced anywhere a primary expression is required.
+std::string negateComparisonGroup(std::string g) {
+    std::string inner = g;
+    for (;;) {
+        const std::string t = stripParens(inner);
+        if (t == inner) break;
+        inner = t;
+    }
+    auto scanOp = [&inner](size_t from, size_t* pos, std::string* op) {
+        int depth = 0;
+        for (size_t i = from; i < inner.size(); ++i) {
+            const char c = inner[i];
+            if (c == '(') { depth++; continue; }
+            if (c == ')') { depth--; continue; }
+            if (depth != 0) continue;
+            if (c == '?' || c == ':') return false; // not a plain compare
+            if (i + 1 >= inner.size()) continue;
+            if (c == '=' && inner[i + 1] == '=') { *pos = i; *op = "=="; return true; }
+            if (c == '!' && inner[i + 1] == '=') { *pos = i; *op = "!="; return true; }
+            if (c == '<' && inner[i + 1] == '=') { *pos = i; *op = "<="; return true; }
+            if (c == '>' && inner[i + 1] == '=') { *pos = i; *op = ">="; return true; }
+            if (c == '<' && inner[i + 1] == '<') { i++; continue; }
+            if (c == '>' && inner[i + 1] == '>') { i++; continue; }
+            if (c == '<') { *pos = i; *op = "<"; return true; }
+            if (c == '>') { *pos = i; *op = ">"; return true; }
+        }
+        return false;
+    };
+    size_t pos = 0;
+    std::string op;
+    if (!scanOp(0, &pos, &op)) return "";
+    size_t second = 0;
+    std::string op2;
+    if (scanOp(pos + op.size(), &second, &op2)) return ""; // chained compare
+    const std::string negation =
+        op == "==" ? "!=" : op == "!=" ? "==" : op == "<" ? ">=" :
+        op == "<=" ? ">" : op == ">" ? "<=" : ">=";
+    inner.replace(pos, op.size(), negation);
+    return "(" + inner + ")";
+}
+
 // Normalize a CBRANCH condition for readability, preserving semantics:
 //   - "(cmp) != 0"  -> "(cmp)"      (a comparison already yields 0/1;
 //                                    the parenthesized group is kept
 //                                    verbatim so surrounding precedence
 //                                    cannot change)
+//   - "(cmp) == 0"  -> "(cmp-negated)", e.g. "(a < b) == 0" -> "(a >= b)"
 //   - "X == (0)" / "X != (0)" and the other comparison operators with a
 //     parenthesized pure-decimal literal operand drop the parens.
 std::string normalizeBranchCond(std::string cond) {
@@ -564,14 +640,15 @@ std::string normalizeBranchCond(std::string cond) {
     while (changed && guard++ < 64) {
         changed = false;
         for (size_t i = 0; i + 3 < cond.size() && !changed; ++i) {
-            if (cond[i] != '!' || cond[i + 1] != '=' ||
-                cond[i + 2] != ' ' || cond[i + 3] != '0')
+            const bool neq = cond[i] == '!' && cond[i + 1] == '=';
+            const bool eq = cond[i] == '=' && cond[i + 1] == '=';
+            if ((!neq && !eq) || cond[i + 2] != ' ' || cond[i + 3] != '0')
                 continue;
             const size_t zeroEnd = i + 4;
             if (zeroEnd < cond.size() &&
                 std::isalnum(static_cast<unsigned char>(cond[zeroEnd])))
                 continue;
-            // The text before " != 0" must end with a balanced group.
+            // The text before " == 0"/" != 0" must end with a group.
             size_t ge = i;
             while (ge > 0 && cond[ge - 1] == ' ') --ge;
             if (ge == 0 || cond[ge - 1] != ')') continue;
@@ -586,8 +663,15 @@ std::string normalizeBranchCond(std::string cond) {
             }
             if (depth != 0) continue;
             const std::string group = cond.substr(gs, ge - gs);
-            if (topLevelComparison(group).empty()) continue;
-            cond.replace(gs, zeroEnd - gs, group);
+            std::string replacement;
+            if (neq) {
+                if (topLevelComparison(group).empty()) continue;
+                replacement = group;
+            } else {
+                replacement = negateComparisonGroup(group);
+                if (replacement.empty()) continue;
+            }
+            cond.replace(gs, zeroEnd - gs, replacement);
             changed = true;
         }
     }
@@ -766,6 +850,9 @@ std::string castTo(const CExpr& e, const std::string& target) {
 bool parseRegConstExpr(const std::string& t, std::string& reg, int64_t& k) {
     std::string s = stripParens(t);
     if (s.empty()) return false;
+    // Hex address tokens (fmtConst) are not reg+K arithmetic; a base-10
+    // parse would silently read "0x..." as 0, so decline them outright.
+    if (s.size() > 2 && s[0] == '0' && s[1] == 'x') return false;
     // pure integer
     char* end = nullptr;
     const long long v = std::strtoll(s.c_str(), &end, 10);
@@ -1032,12 +1119,15 @@ public:
                 argument = "(void *)(uintptr_t)" + argument;
             // Phase 10h: a bare constant argument that points at a printable
             // data-segment C string reads naturally as a string literal.
+            // Constants may render as decimal or hex (fmtConst), so accept
+            // both token forms.
             if (!useRecoveredRuntime && memRead &&
                 argument.size() > 2 &&
                 std::isdigit(static_cast<unsigned char>(argument[0]))) {
+                const bool hex = argument[1] == 'x';
                 char* end = nullptr;
                 const unsigned long long value =
-                    std::strtoull(argument.c_str(), &end, 10);
+                    std::strtoull(argument.c_str(), &end, hex ? 16 : 10);
                 if (end && *end == '\0' && value > 0x10000ULL) {
                     const std::string literal =
                         stringLiteralAt(static_cast<uint64_t>(value));
@@ -1667,16 +1757,21 @@ public:
                     default: break;
                     }
                     if (op.op == POp::INT_ADD && b.isConst && !a.isConst) {
-                        const int64_t n = static_cast<int64_t>(
-                            std::strtoll(b.text.c_str(), nullptr, 10));
-                        if (n < 0 && n != std::numeric_limits<int64_t>::min()) {
-                            c = "-";
-                            b.text = std::to_string(-n);
+                        uint64_t bv = 0;
+                        if (parseConstToken(b.text, &bv)) {
+                            const int64_t n = static_cast<int64_t>(bv);
+                            if (n < 0 && n != std::numeric_limits<int64_t>::min()) {
+                                c = "-";
+                                b.text = std::to_string(-n);
+                            }
                         }
                     }
-                    if (a.isConst && b.isConst) {
-                        const uint64_t x = std::strtoull(a.text.c_str(), nullptr, 10);
-                        const uint64_t y = std::strtoull(b.text.c_str(), nullptr, 10);
+                    uint64_t foldedX = 0, foldedY = 0;
+                    if (a.isConst && b.isConst &&
+                        parseConstToken(a.text, &foldedX) &&
+                        parseConstToken(b.text, &foldedY)) {
+                        const uint64_t x = foldedX;
+                        const uint64_t y = foldedY;
                         uint64_t z = 0;
                         switch (op.op) {
                         case POp::INT_ADD: z = x + y; break;
@@ -1779,10 +1874,12 @@ public:
                     // happen for a folded constant below that bound.
                     int64_t constCount = -1;
                     if (b.isConst) {
-                        const int64_t n =
-                            std::strtoll(b.text.c_str(), nullptr, 10);
-                        if (n >= 0 && n < static_cast<int64_t>(width) * 8)
-                            constCount = n;
+                        uint64_t bv = 0;
+                        if (parseConstToken(b.text, &bv)) {
+                            const int64_t n = static_cast<int64_t>(bv);
+                            if (n >= 0 && n < static_cast<int64_t>(width) * 8)
+                                constCount = n;
+                        }
                     }
                     if (constCount >= 0) {
                         r.text = "(" + operand + " " + c + " " +
@@ -1809,9 +1906,12 @@ public:
                                                  op.op == POp::INT_SREM;
                     const bool remainder = op.op == POp::INT_REM ||
                                            op.op == POp::INT_SREM;
-                    if (a.isConst && b.isConst) {
-                        const uint64_t x = std::strtoull(a.text.c_str(), nullptr, 10);
-                        const uint64_t y = std::strtoull(b.text.c_str(), nullptr, 10);
+                    uint64_t divX = 0, divY = 0;
+                    if (a.isConst && b.isConst &&
+                        parseConstToken(a.text, &divX) &&
+                        parseConstToken(b.text, &divY)) {
+                        const uint64_t x = divX;
+                        const uint64_t y = divY;
                         if (!y) {
                             r.text = "0";
                         } else if (signedOperation) {
@@ -1840,8 +1940,8 @@ public:
                         // signed ops because INT64_MIN / -1 overflows in C
                         // (the architecture faults and has no result there).
                         const uint64_t constY =
-                            b.isConst
-                                ? std::strtoull(b.text.c_str(), nullptr, 10)
+                            b.isConst && parseConstToken(b.text, &divY)
+                                ? divY
                                 : 0;
                         const bool constantDivisor =
                             b.isConst && constY != 0 &&
@@ -1896,11 +1996,13 @@ public:
                     }
                     if (a.isConst) {
                         const uint64_t mask = (uint64_t{1} << (width * 8)) - 1;
-                        const uint64_t value =
-                            std::strtoull(a.text.c_str(), nullptr, 10) & mask;
-                        r.text = std::to_string(value);
-                        r.isConst = true;
-                        break;
+                        uint64_t parsed = 0;
+                        if (parseConstToken(a.text, &parsed)) {
+                            const uint64_t value = parsed & mask;
+                            r.text = std::to_string(value);
+                            r.isConst = true;
+                            break;
+                        }
                     }
                     r.text = "(uint64_t)(" +
                              castTo(a, uCast(width)) + ")";
@@ -1921,13 +2023,15 @@ public:
                     }
                     if (a.isConst) {
                         const uint64_t mask = (uint64_t{1} << (width * 8)) - 1;
-                        uint64_t value =
-                            std::strtoull(a.text.c_str(), nullptr, 10) & mask;
-                        if (width < 8 && (value & (uint64_t{1} << (width * 8 - 1))))
-                            value |= ~mask; // sign-extend
-                        r.text = std::to_string(static_cast<int64_t>(value));
-                        r.isConst = true;
-                        break;
+                        uint64_t parsed = 0;
+                        if (parseConstToken(a.text, &parsed)) {
+                            uint64_t value = parsed & mask;
+                            if (width < 8 && (value & (uint64_t{1} << (width * 8 - 1))))
+                                value |= ~mask; // sign-extend
+                            r.text = std::to_string(static_cast<int64_t>(value));
+                            r.isConst = true;
+                            break;
+                        }
                     }
                     r.text = "(int64_t)(" +
                              castTo(a, cCast(width)) + ")";

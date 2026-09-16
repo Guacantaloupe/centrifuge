@@ -1906,9 +1906,22 @@ public:
                             // uint8_t/uint16_t promote to signed int in C++.
                             // P-code multiplication instead wraps at its
                             // destination width and must never overflow int.
+                            // A full-width register read is already a
+                            // uint64_t variable, so the castTo wrap is
+                            // textually redundant there.
+                            auto uint64Operand = [&](const CExpr& e,
+                                                     uint64_t input) {
+                                const Varnode* v = pi.find(input);
+                                if (v && v->kind == Varnode::REGISTER &&
+                                    v->size == 8 &&
+                                    stripParens(e.text) ==
+                                        registerName(architecture, v->offset, 8))
+                                    return e.text;
+                                return castTo(e, "uint64_t");
+                            };
                             r.text = "((" + std::string(uCast(vo->size)) +
-                                ")(" + castTo(a, "uint64_t") + " * " +
-                                castTo(b, "uint64_t") + "))";
+                                ")(" + uint64Operand(a, op.in0) + " * " +
+                                uint64Operand(b, op.in1) + "))";
                             r.ctype = uCast(vo->size);
                         }
                         r.size = vo->size;

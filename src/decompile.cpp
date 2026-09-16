@@ -1121,14 +1121,17 @@ std::string foldAssignBeforeReturn(const std::string& body) {
     return out.str();
 }
 
-// Drop the first of two adjacent whole-line stores to the same plain
-// scalar: "x = A; x = B;" -> "x = B;".  Adjacency guarantees no label
-// or statement can observe A's stored value, and B's RHS must not read
-// x (data dependency).  A must be side-effect free: no calls (direct
-// "FUN_", indirect ")(", or "__builtin") and no "?:" - the scalar
-// pseudo-registers are never address-taken, so a pure right-hand side
-// leaves no trace when its store is dropped.  Applied repeatedly so
-// "x = A; x = B; x = C;" collapses fully.
+// Drop a store to a plain scalar when a later store to the same
+// variable in the same basic block overwrites it before any read.
+// "Same basic block" is established textually: the scan stops at label
+// lines (the only jump targets), so no control flow can enter between
+// the two stores or observe the first value; reads of the variable
+// (anywhere on an intervening line - conditions, calls, compound
+// assignments) also stop the scan.  The removed right-hand side must be
+// side-effect free: no calls (direct "FUN_", indirect ")(", or
+// "__builtin") and no "?:" - the scalar pseudo-registers are never
+// address-taken, so a pure right-hand side leaves no trace when its
+// store is dropped.  Applied repeatedly so overwrite chains collapse.
 std::string dropOverwrittenStores(const std::string& body) {
     std::vector<std::string> lines;
     {
@@ -1136,6 +1139,10 @@ std::string dropOverwrittenStores(const std::string& body) {
         std::string ln;
         while (std::getline(in, ln)) lines.push_back(ln);
     }
+    const auto trimmed = [](const std::string& s) {
+        const size_t a = s.find_first_not_of(" \t");
+        return a == std::string::npos ? std::string() : s.substr(a);
+    };
     const auto matchStore = [](const std::string& raw, std::string& var,
                                std::string& rhs) {
         const size_t start = raw.find_first_not_of(" \t");
@@ -1159,34 +1166,43 @@ std::string dropOverwrittenStores(const std::string& body) {
                rhs.find("__builtin") == std::string::npos &&
                rhs.find('?') == std::string::npos;
     };
+    const auto containsId = [](const std::string& s, const std::string& id) {
+        size_t at = 0;
+        while ((at = s.find(id, at)) != std::string::npos) {
+            const bool lb = at == 0 ||
+                !(std::isalnum(static_cast<unsigned char>(s[at - 1])) ||
+                  s[at - 1] == '_');
+            const size_t end = at + id.size();
+            const bool rb = end >= s.size() ||
+                !(std::isalnum(static_cast<unsigned char>(s[end])) ||
+                  s[end] == '_');
+            if (lb && rb) return true;
+            at = end;
+        }
+        return false;
+    };
     bool changed = true;
     while (changed) {
         changed = false;
-        for (size_t i = 0; i + 1 < lines.size(); ++i) {
-            std::string v1, r1, v2, r2;
-            if (!matchStore(lines[i], v1, r1)) continue;
-            if (!matchStore(lines[i + 1], v2, r2)) continue;
-            if (v1 != v2 || !pure(r1)) continue;
-            // B must not read x.
-            size_t at = 0;
-            bool reads = false;
-            while ((at = r2.find(v1, at)) != std::string::npos) {
-                const bool lb = at == 0 ||
-                    !(std::isalnum(static_cast<unsigned char>(r2[at - 1])) ||
-                      r2[at - 1] == '_');
-                const size_t end = at + v1.size();
-                const bool rb = end >= r2.size() ||
-                    !(std::isalnum(static_cast<unsigned char>(r2[end])) ||
-                      r2[end] == '_');
-                if (lb && rb) {
-                    reads = true;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            std::string var, rhs;
+            if (!matchStore(lines[i], var, rhs) || !pure(rhs)) continue;
+            for (size_t j = i + 1; j < lines.size(); ++j) {
+                const std::string u = trimmed(lines[j]);
+                if (u.rfind("L0x", 0) == 0 && u.back() == ':') break;
+                if (u.find('{') != std::string::npos ||
+                    u.find('}') != std::string::npos)
+                    break; // conditional region: overwrite may not execute
+                std::string v2, r2;
+                if (matchStore(lines[j], v2, r2) && v2 == var) {
+                    if (containsId(r2, var)) break; // overwrite depends on the old value
+                    lines[i].clear(); // overwritten before any read
+                    changed = true;
                     break;
                 }
-                at = end;
+                if (containsId(u, var)) break; // read
             }
-            if (reads) continue;
-            lines[i].clear();
-            changed = true;
+            if (changed) break; // restart the scan
         }
     }
     std::ostringstream out;

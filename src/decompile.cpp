@@ -1169,9 +1169,11 @@ public:
                 }
                 if (architecture.rfind("x86", 0) == 0)
                     callerStackOffset -= architecture == "x86" ? 4 : 8;
-                const std::string address =
-                    registerName(architecture, stackPointerOffset(architecture)) +
-                    " + " + std::to_string(callerStackOffset);
+                const std::string stackName =
+                    registerName(architecture, stackPointerOffset(architecture));
+                const std::string address = callerStackOffset == 0
+                    ? stackName
+                    : stackName + " + " + std::to_string(callerStackOffset);
                 argument = useRecoveredRuntime
                     ? "recovered_load<std::uint64_t>(" + address + ")"
                     : "*((uint64_t *)(" + address + "))";
@@ -4455,11 +4457,15 @@ te.pushSlots = &pushSlots;
                                            targetSignature->parameters[i].onStack;
                 std::string argument;
                 if (stackArgument) {
-                    const std::string address =
+                    const std::string stackName =
                         registerName(architecture,
-                                     stackPointerOffset(architecture)) +
-                        " + " +
-                        std::to_string(targetSignature->parameters[i].stackOffset);
+                                     stackPointerOffset(architecture));
+                    const std::string address =
+                        targetSignature->parameters[i].stackOffset == 0
+                            ? stackName
+                            : stackName + " + " +
+                              std::to_string(
+                                  targetSignature->parameters[i].stackOffset);
                     argument = useRecoveredRuntime
                         ? "recovered_load<std::uint64_t>(" + address + ")"
                         : "*((uint64_t *)(" +

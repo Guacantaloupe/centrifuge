@@ -5650,13 +5650,18 @@ std::string decompileTyped(
                 (parameter.type.kind == TypeKind::UNSIGNED_INT ||
                  parameter.type.kind == TypeKind::SIGNED_INT) &&
                 parameter.type.bits == 64;
-            // Pointers convert straight to uint64_t; the uintptr_t hop is
-            // redundant there.  Narrower integers keep it: zero-extension
+            // Everything except signed narrow integers converts straight
+            // to uint64_t: pointers (data and function) and unsigned
+            // narrow integers zero-extend identically (all supported
+            // targets are 64-bit, so uintptr_t == uint64_t).  Only
+            // signed narrow integers keep the hop: zero-extension
             // through uintptr_t differs from a signed (uint64_t) cast.
-            const bool isPointer = parameter.type.kind == TypeKind::POINTER;
+            const bool signedNarrow =
+                parameter.type.kind == TypeKind::SIGNED_INT &&
+                parameter.type.bits < 64;
             out << "    " << name << " = "
                 << (already64 ? ""
-                    : isPointer ? "(uint64_t)" : "(uint64_t)(uintptr_t)")
+                    : signedNarrow ? "(uint64_t)(uintptr_t)" : "(uint64_t)")
                 << parameter.name << ";\n";
         }
     }
@@ -5684,15 +5689,16 @@ std::string decompileTyped(
                     (parameter.type.kind == TypeKind::UNSIGNED_INT ||
                      parameter.type.kind == TypeKind::SIGNED_INT) &&
                     parameter.type.bits == 64;
-                // See the register-parameter case above: pointers convert
-                // straight to uint64_t, narrower integers keep the
-                // zero-extending uintptr_t hop.
-                const bool isPointer =
-                    parameter.type.kind == TypeKind::POINTER;
+                // See the register-parameter case above: only signed
+                // narrow integers keep the zero-extending uintptr_t hop.
+                const bool signedNarrow =
+                    parameter.type.kind == TypeKind::SIGNED_INT &&
+                    parameter.type.bits < 64;
                 out << "    " << localName(parameter.stackOffset)
                     << " = "
                     << (already64 ? ""
-                        : isPointer ? "(uint64_t)" : "(uint64_t)(uintptr_t)")
+                        : signedNarrow ? "(uint64_t)(uintptr_t)"
+                                       : "(uint64_t)")
                     << parameter.name << ";\n";
             }
         }

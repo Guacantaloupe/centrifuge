@@ -458,6 +458,23 @@ bool matchLeadingCast(const std::string& inner, std::string& type,
         return false;
     const std::string remainder = inner.substr(close + 1); // includes trailing ')'
     if (remainder.empty() || remainder.back() != ')') return false;
+    // The operand must be one fully-wrapped "(...)" group - otherwise the
+    // cast only covers a prefix (e.g. "(uint32_t)(x) + (uint32_t)(y)")
+    // and treating the remainder as the operand would corrupt the text.
+    if (remainder.front() != '(') return false;
+    int depth = 0;
+    bool fullyWrapped = true;
+    for (size_t i = 0; i < remainder.size(); ++i) {
+        if (remainder[i] == '(') depth++;
+        else if (remainder[i] == ')') {
+            depth--;
+            if (depth == 0 && i != remainder.size() - 1) {
+                fullyWrapped = false;
+                break;
+            }
+        }
+    }
+    if (!fullyWrapped || depth != 0) return false;
     type = candidate;
     rest = remainder;
     return true;
@@ -496,7 +513,7 @@ std::string castTo(const CExpr& e, const std::string& target) {
     std::string leading, rest;
     if (matchLeadingCast(inner, leading, rest) &&
         typeWidth(leading) == typeWidth(target))
-        return "(" + target + ")(" + rest + ")";
+        return "(" + target + ")(" + stripParens(rest) + ")";
     return "(" + target + ")(" + inner + ")";
 }
 

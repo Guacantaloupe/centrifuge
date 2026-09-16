@@ -127,8 +127,9 @@ uint64_t registerStorageOffset(const std::string& architecture,
 }
 
 namespace {
-// Strip one fully-wrapping paren layer.  Local copy because the file-scope
-// stripParens is defined later in the file.
+// Strip one fully-wrapping paren layer, and detect a "(T)(...)" prefix;
+// both are defined later in the file (stripParens is also forward-declared
+// below replaceIdentifier further down).
 std::string stripParensForward(const std::string& s) {
     if (s.size() >= 2 && s.front() == '(' && s.back() == ')') {
         int depth = 0;
@@ -142,6 +143,21 @@ std::string stripParensForward(const std::string& s) {
         if (depth == 0) return s.substr(1, s.size() - 2);
     }
     return s;
+}
+
+bool startsWithCastForward(const std::string& inner,
+                           const std::string& target) {
+    const std::string prefix = "(" + target + ")(";
+    if (inner.rfind(prefix, 0) != 0) return false;
+    int depth = 1; // inside the second '(' of the prefix
+    for (size_t i = prefix.size(); i < inner.size(); ++i) {
+        if (inner[i] == '(') depth++;
+        else if (inner[i] == ')') {
+            depth--;
+            if (depth == 0) return i == inner.size() - 1;
+        }
+    }
+    return false;
 }
 } // namespace
 
@@ -169,6 +185,11 @@ std::string x86RegisterWrite(const std::string& architecture, uint64_t offset,
                 std::strtoull(inner.c_str(), nullptr, 10);
             inUint32Range = value <= 0xffffffffULL;
         }
+        // The expression may already carry the exact zero-extension cast
+        // (e.g. a 32-bit register read); wrapping it again would print
+        // "(uint32_t)((uint32_t)(rcx))".
+        if (!inUint32Range && startsWithCastForward(inner, "uint32_t"))
+            return storage + " = " + inner;
         return storage + " = " +
                (inUint32Range ? inner : "(uint32_t)(" + expression + ")");
     }
@@ -1805,12 +1826,17 @@ public:
                     case POp::INT_XOR: c = "^"; break;
                     default: break;
                     }
-                    if (op.op == POp::INT_ADD && b.isConst && !a.isConst) {
+                    if ((op.op == POp::INT_ADD || op.op == POp::INT_SUB) &&
+                        b.isConst && !a.isConst) {
                         uint64_t bv = 0;
                         if (parseConstToken(b.text, &bv)) {
                             const int64_t n = static_cast<int64_t>(bv);
                             if (n < 0 && n != std::numeric_limits<int64_t>::min()) {
-                                c = "-";
+                                // Fold the sign into the operator so
+                                // "a + -1" prints as "a - 1" and
+                                // "a - -1" as "a + 1" (modular arithmetic
+                                // makes both rewrites exact).
+                                c = op.op == POp::INT_ADD ? "-" : "+";
                                 b.text = std::to_string(-n);
                             }
                         }

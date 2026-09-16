@@ -2392,8 +2392,18 @@ std::string ProgramAnalysis::decompileFunction(const Program& program,
         for (const TypeField& field : type.detail->fields) emitType(field.type);
         output << (type.kind == TypeKind::STRUCT ? "struct " : "union ")
                << type.detail->name << " {\n";
-        for (const TypeField& field : type.detail->fields)
-            output << "    " << field.type.declaration(field.name) << ";\n";
+        // Overlapping fields share an offset and therefore a generated
+        // name ("field_0"); duplicate member names are invalid C, so
+        // disambiguate with a numeric suffix.  The bodies access these
+        // objects through raw pointer casts, never by member name, so the
+        // rename is display-only.
+        std::map<std::string, int> usedNames;
+        for (const TypeField& field : type.detail->fields) {
+            std::string name = field.name;
+            const int seen = usedNames[name]++;
+            if (seen > 0) name += "_" + std::to_string(seen + 1);
+            output << "    " << field.type.declaration(name) << ";\n";
+        }
         output << "};\n\n";
     };
     emitType(analyzed->signature.returnType);

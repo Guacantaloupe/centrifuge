@@ -1505,9 +1505,19 @@ public:
                     // P-code shifts use the input width, not C integer
                     // promotions. In particular SAR must sign-extend its
                     // operand and SHL on a byte must not shift signed int.
-                    const std::string operand = arithmetic
-                        ? "(int64_t)(" + castTo(a, cCast(width)) + ")"
-                        : "(uint64_t)(" + castTo(a, uCast(width)) + ")";
+                    // castTo() already presents the operand at the input
+                    // width; the final 64-bit presentation wrap is added
+                    // here.  It is elided only when the text already
+                    // carries that exact cast - the cast is load-bearing
+                    // for ">>" signedness, so the ctype-metadata path
+                    // (a plain uint64_t-declared register named like an
+                    // int64_t) must NOT elide it.
+                    const std::string widthTyped = arithmetic
+                        ? castTo(a, cCast(width))
+                        : castTo(a, uCast(width));
+                    const std::string operand = "(" +
+                        castTo(CExpr{widthTyped, 8, false, false, ""},
+                               arithmetic ? "int64_t" : "uint64_t") + ")";
                     // Constant in-range counts need no guard: the runtime
                     // ternary only models count >= width, which cannot
                     // happen for a folded constant below that bound.

@@ -1121,6 +1121,86 @@ std::string foldAssignBeforeReturn(const std::string& body) {
     return out.str();
 }
 
+// Prune identifiers from plain "uint64_t a = 0, b = 0;" declaration lines
+// that no longer appear anywhere else in the function.
+void pruneUnusedDecls(std::vector<std::string>& lines,
+                      const std::function<bool(const std::string&,
+                                               const std::string&)>& used) {
+    const auto ltrim = [](const std::string& s) {
+        const size_t a = s.find_first_not_of(" \t");
+        return a == std::string::npos ? std::string() : s.substr(a);
+    };
+    for (std::string& l : lines) {
+        const size_t firstNonBlank = l.find_first_not_of(" \t");
+        const std::string indent =
+            firstNonBlank == std::string::npos ? "" : l.substr(0, firstNonBlank);
+        const std::string t = ltrim(l);
+        if (t.rfind("uint64_t ", 0) != 0 || t.back() != ';') continue;
+        const std::string rest = t.substr(9, t.size() - 10);
+        std::vector<std::pair<std::string, bool>> items; // name, hadInit
+        size_t pos = 0;
+        bool malformed = false;
+        while (pos <= rest.size()) {
+            size_t comma = rest.find(", ", pos);
+            const std::string item = rest.substr(
+                pos, comma == std::string::npos ? std::string::npos
+                                                : comma - pos);
+            const size_t eqz = item.find(" = 0");
+            const bool hadInit = eqz != std::string::npos;
+            const std::string name = hadInit ? item.substr(0, eqz) : item;
+            if (name.empty() ||
+                !std::all_of(name.begin(), name.end(), [](char c) {
+                    return std::isalnum(static_cast<unsigned char>(c)) ||
+                           c == '_';
+                })) {
+                malformed = true;
+                break;
+            }
+            items.push_back({name, hadInit});
+            if (comma == std::string::npos) break;
+            pos = comma + 2;
+        }
+        if (malformed) continue;
+        // Usage check against every OTHER line.
+        std::ostringstream others;
+        for (const std::string& o : lines)
+            if (&o != &l && !o.empty()) others << o << "\n";
+        const std::string elsewhere = others.str();
+        std::vector<std::pair<std::string, bool>> kept;
+        for (const auto& item : items)
+            if (used(elsewhere, item.first)) kept.push_back(item);
+        if (kept.size() == items.size()) continue;
+        if (kept.empty()) {
+            l.clear();
+            continue;
+        }
+        std::ostringstream rebuilt;
+        rebuilt << indent << "uint64_t ";
+        for (size_t i = 0; i < kept.size(); ++i)
+            rebuilt << (i ? ", " : "") << kept[i].first
+                    << (kept[i].second ? " = 0" : "");
+        rebuilt << ";";
+        l = rebuilt.str();
+    }
+}
+
+const auto containsIdentifier = [](const std::string& s,
+                                   const std::string& id) {
+    size_t at = 0;
+    while ((at = s.find(id, at)) != std::string::npos) {
+        const bool lb = at == 0 ||
+            !(std::isalnum(static_cast<unsigned char>(s[at - 1])) ||
+              s[at - 1] == '_');
+        const size_t end = at + id.size();
+        const bool rb = end >= s.size() ||
+            !(std::isalnum(static_cast<unsigned char>(s[end])) ||
+              s[end] == '_');
+        if (lb && rb) return true;
+        at = end;
+    }
+    return false;
+};
+
 // Collapse the ABI prologue hop the typed wrapper synthesizes
 // ("rdi = (uint64_t)arg0;") by propagating the parameter name into the
 // register's straight-line window and deleting the binding.  The window
@@ -1223,66 +1303,161 @@ std::string collapseAbiPrologue(std::string text, const std::string& architectur
         }
         lines[kv.first].clear();
     }
-    // Prune identifiers from plain "uint64_t a = 0, b = 0;" declaration
-    // lines that no longer appear anywhere else in the function.
-    std::ostringstream joined;
-    for (const std::string& l : lines)
-        if (!l.empty()) joined << l << "\n";
-    const std::string whole = joined.str();
-    for (std::string& l : lines) {
-        const std::string indent = l.substr(0, l.find_first_not_of(" \t"));
-        const std::string t = ltrim(l);
-        if (t.rfind("uint64_t ", 0) != 0 || t.back() != ';') continue;
-        const std::string rest = t.substr(9, t.size() - 10);
-        std::vector<std::pair<std::string, bool>> items; // name, hadInit
-        size_t pos = 0;
-        bool malformed = false;
-        while (pos <= rest.size()) {
-            size_t comma = rest.find(", ", pos);
-            const std::string item = rest.substr(
-                pos, comma == std::string::npos ? std::string::npos
-                                                : comma - pos);
-            const size_t eqz = item.find(" = 0");
-            const bool hadInit = eqz != std::string::npos;
-            const std::string name = hadInit ? item.substr(0, eqz) : item;
-            if (name.empty() ||
-                !std::all_of(name.begin(), name.end(), [](char c) {
-                    return std::isalnum(static_cast<unsigned char>(c)) ||
-                           c == '_';
-                })) {
-                malformed = true;
-                break;
-            }
-            items.push_back({name, hadInit});
-            if (comma == std::string::npos) break;
-            pos = comma + 2;
-        }
-        if (malformed) continue;
-        // Usage check against every OTHER line.
-        std::ostringstream others;
-        for (const std::string& o : lines)
-            if (&o != &l && !o.empty()) others << o << "\n";
-        const std::string elsewhere = others.str();
-        std::vector<std::pair<std::string, bool>> kept;
-        for (const auto& item : items)
-            if (containsId(elsewhere, item.first)) kept.push_back(item);
-        if (kept.size() == items.size()) continue;
-        if (kept.empty()) {
-            l.clear();
-            continue;
-        }
-        std::ostringstream rebuilt;
-        rebuilt << indent << "uint64_t ";
-        for (size_t i = 0; i < kept.size(); ++i)
-            rebuilt << (i ? ", " : "") << kept[i].first
-                    << (kept[i].second ? " = 0" : "");
-        rebuilt << ";";
-        l = rebuilt.str();
-    }
+    pruneUnusedDecls(lines, containsIdentifier);
     std::ostringstream out;
     for (const std::string& l : lines)
         if (!l.empty()) out << l << "\n";
     return out.str();
+}
+
+// Propagate top-level "simulated" stores of numeric constants into their
+// straight-line window, and delete the store when no read survives.  Only
+// simulated names (registers, flag temporaries, stack locals) qualify, so
+// structured fields or parameters are never rewritten; the window closes
+// at the first re-store, any brace boundary, and any goto-targeted label,
+// exactly as in collapseAbiPrologue.  Runs to a fixed point so chains like
+// "rcx = 0; rdx = rcx;" collapse in one pass.
+std::string propagateLocalConstants(std::string text) {
+    const auto isSimName = [](const std::string& s) {
+        if (s == "ret_val" || s == "stack_ptr" || s == "frame_ptr" ||
+            s == "fsbase" || s == "gsbase")
+            return true;
+        static const char* kRegs[] = {"rax", "rbx", "rcx", "rdx", "rsi",
+                                      "rdi", "rbp", "rsp"};
+        for (const char* r : kRegs)
+            if (s == r) return true;
+        if (s.rfind("arg", 0) == 0 && s.size() > 3)
+            return std::all_of(s.begin() + 3, s.end(), [](char c) {
+                return std::isdigit(static_cast<unsigned char>(c));
+            });
+        if (s.rfind("local_", 0) == 0 || s.rfind("saved_", 0) == 0)
+            return true;
+        // rNNN: flags (r4099), unnamed bank registers (r10, r15), vectors.
+        if (s.size() >= 2 && s[0] == 'r')
+            return std::all_of(s.begin() + 1, s.end(), [](char c) {
+                return std::isdigit(static_cast<unsigned char>(c));
+            });
+        if (s.size() >= 4 &&
+            (s[0] == 'x' || s[0] == 'y' || s[0] == 'z') &&
+            s[1] == 'm' && s[2] == 'm')
+            return std::all_of(s.begin() + 3, s.end(), [](char c) {
+                return std::isdigit(static_cast<unsigned char>(c));
+            });
+        if (s.size() >= 3 && s[0] == 's' && s[1] == 't' &&
+            std::isdigit(static_cast<unsigned char>(s[2])))
+            return std::all_of(s.begin() + 2, s.end(), [](char c) {
+                return std::isdigit(static_cast<unsigned char>(c));
+            });
+        return false;
+    };
+    const auto isConstToken = [](const std::string& s) {
+        if (s.empty()) return false;
+        size_t at = (s[0] == '-') ? 1 : 0;
+        if (at == s.size()) return false;
+        if (at + 1 < s.size() && s[at] == '0' && s[at + 1] == 'x') {
+            at += 2;
+            if (at == s.size()) return false;
+            return std::all_of(s.begin() + at, s.end(), [](char c) {
+                return std::isxdigit(static_cast<unsigned char>(c));
+            });
+        }
+        return std::all_of(s.begin() + at, s.end(), [](char c) {
+            return std::isdigit(static_cast<unsigned char>(c));
+        });
+    };
+    const auto ltrim = [](const std::string& s) {
+        const size_t a = s.find_first_not_of(" \t");
+        return a == std::string::npos ? std::string() : s.substr(a);
+    };
+    const auto matchStore = [](const std::string& raw, std::string& var,
+                               std::string& rhs) {
+        const size_t start = raw.find_first_not_of(" \t");
+        if (start == std::string::npos) return false;
+        const std::string t = raw.substr(start);
+        const size_t eq = t.find(" = ");
+        if (eq == std::string::npos || t.back() != ';') return false;
+        var = t.substr(0, eq);
+        if (var.empty() ||
+            !std::all_of(var.begin(), var.end(), [](char c) {
+                return std::isalnum(static_cast<unsigned char>(c)) ||
+                       c == '_';
+            }))
+            return false;
+        rhs = t.substr(eq + 3, t.size() - 1 - (eq + 3));
+        return true;
+    };
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        std::vector<std::string> lines;
+        {
+            std::istringstream in(text);
+            std::string ln;
+            while (std::getline(in, ln)) lines.push_back(ln);
+        }
+        std::set<std::string> targeted;
+        for (const std::string& ln : lines) {
+            const std::string t = ltrim(ln);
+            if (t.rfind("goto ", 0) == 0 && t.back() == ';')
+                targeted.insert(t.substr(5, t.size() - 6));
+        }
+        // Brace depth per line: constant stores propagate only from the
+        // function body's top-level straight-line segment.
+        std::vector<int> depth(lines.size(), 0);
+        int running = 0;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            depth[i] = running;
+            for (char c : lines[i]) {
+                if (c == '{') ++running;
+                else if (c == '}') --running;
+            }
+        }
+        // The body top level sits one brace below the signature line.
+        int bodyDepth = -1;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (lines[i].find('{') != std::string::npos) {
+                bodyDepth = depth[i] + 1;
+                break;
+            }
+        }
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (depth[i] != bodyDepth) continue;
+            std::string var, rhs;
+            if (!matchStore(lines[i], var, rhs) || !isSimName(var) ||
+                !isConstToken(rhs))
+                continue;
+            for (size_t j = i + 1; j < lines.size(); ++j) {
+                const std::string u = ltrim(lines[j]);
+                if (u.rfind("L0x", 0) == 0 && u.back() == ':') {
+                    if (targeted.count(u.substr(0, u.size() - 1))) break;
+                    continue;
+                }
+                if (u.find('{') != std::string::npos ||
+                    u.find('}') != std::string::npos) break;
+                std::string v2, r2;
+                if (matchStore(lines[j], v2, r2) && v2 == var) break;
+                const std::string before = lines[j];
+                lines[j] = replaceIdentifier(lines[j], var, rhs);
+                if (lines[j] != before) changed = true;
+            }
+            // The store dies when no read survives anywhere else.
+            std::ostringstream others;
+            for (const std::string& o : lines)
+                if (&o != &lines[i] && !o.empty()) others << o << "\n";
+            if (!containsIdentifier(others.str(), var)) {
+                lines[i].clear();
+                changed = true;
+            }
+        }
+        if (changed) {
+            pruneUnusedDecls(lines, containsIdentifier);
+            std::ostringstream rebuilt;
+            for (const std::string& l : lines)
+                if (!l.empty()) rebuilt << l << "\n";
+            text = rebuilt.str();
+        }
+    }
+    return text;
 }
 
 // Drop a store to a plain scalar when a later store to the same
@@ -6066,9 +6241,10 @@ std::string decompileTyped(
     // expression cannot stand in for those.
     // The ABI prologue hop is collapsed last of all: the binding lines it
     // propagates through are synthesized by this wrapper, so they only
-    // exist in the fully assembled text.
-    return collapseAbiPrologue(foldAssignBeforeReturn(out.str()), architecture,
-                               effectiveSignature);
+    // exist in the fully assembled text.  Constant propagation runs after
+    // it so bindings-turned-stores ("rcx = 0;") fold into call sites.
+    return propagateLocalConstants(collapseAbiPrologue(
+        foldAssignBeforeReturn(out.str()), architecture, effectiveSignature));
 }
 
 } // namespace centrifuge

@@ -2286,6 +2286,10 @@ public:
     // resolves a call target address to a function name ("" = indirect)
     std::function<std::string(uint64_t)> nameOf;
     std::function<std::optional<FunctionSignature>(uint64_t)> signatureOf;
+    // This function's own recovered signature (decompileTyped path): used
+    // to type unbound paramK call arguments that will bind to pointer
+    // parameters, so pointer->integer call casts are emitted up front.
+    const FunctionSignature* callerSignature = nullptr;
     // True for data-segment slots whose value is a `jmp rax` trampoline
     // (MSVC /guard:cf __guard_dispatch_icall_fptr).  The machine does
     // mov rax, <real target>; call [slot]; the trampoline jumps to rax.
@@ -2461,6 +2465,33 @@ public:
                 // register is already a uint64_t integer, and converting it
                 // straight to void* yields the same pointer.
                 argument = "(void *)" + argument;
+            // Symmetric pointer->integer cast: an unbound incoming-argument
+            // token (paramK) that decompileTyped will bind to a pointer-typed
+            // parameter of this function must not flow into a callee
+            // parameter still typed as a plain integer - C++ has no implicit
+            // void* -> integer conversion.  Cast at the call site so the
+            // later token->parameterName binding keeps the call compilable.
+            if (callerSignature && signature &&
+                (signature->parameters[p].type.kind == TypeKind::UNSIGNED_INT ||
+                 signature->parameters[p].type.kind == TypeKind::SIGNED_INT ||
+                 signature->parameters[p].type.kind == TypeKind::UNKNOWN) &&
+                argument.rfind("param", 0) == 0) {
+                size_t used = 0;
+                const unsigned long index =
+                    std::stoul(argument.substr(5), &used);
+                if (used == argument.size() - 5 && index >= 1 &&
+                    index <= fallback.size()) {
+                    const uint64_t regOff = fallback[index - 1];
+                    for (const FunctionParameter& cp :
+                         callerSignature->parameters) {
+                        if (cp.onStack || cp.registerOffset != regOff)
+                            continue;
+                        if (cp.type.kind == TypeKind::POINTER)
+                            argument = "(uint64_t)" + argument;
+                        break;
+                    }
+                }
+            }
             // Phase 10h: a bare constant argument that points at a printable
             // data-segment C string reads naturally as a string literal.
             // Constants may render as decimal or hex (fmtConst), so accept
@@ -5117,7 +5148,7 @@ std::string decompile(
     const StackFrameModel* stackModel,
     const GlobalObjectRecovery* globals,
     const std::function<bool(uint64_t)>& guardSlotOf,
-    const std::string& entryName) {
+    const std::string& entryName, const FunctionSignature* callerSignature) {
     CfgBuilder cfg;
     if (!cfg.build(eng, read, start, end)) return "// failed to build CFG\n";
 
@@ -5449,6 +5480,7 @@ std::string decompile(
                     body.nameOf = nameOf;
                     body.guardSlotOf = guardSlotOf;
                     body.signatureOf = signatureOf;
+                    body.callerSignature = callerSignature;
                     body.architecture = architecture;
                     body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -5490,6 +5522,7 @@ body.pushSlots = &pushSlots;
                 body.nameOf = nameOf;
                     body.guardSlotOf = guardSlotOf;
                 body.signatureOf = signatureOf;
+                body.callerSignature = callerSignature;
                 body.architecture = architecture;
                 body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -5579,6 +5612,7 @@ body.pushSlots = &pushSlots;
                         header.nameOf = nameOf;
                     header.guardSlotOf = guardSlotOf;
                         header.signatureOf = signatureOf;
+                        header.callerSignature = callerSignature;
                         header.architecture = architecture;
                         header.useRecoveredRuntime = useRecoveredRuntime;
                         header.stackModel = stackModel;
@@ -5635,6 +5669,7 @@ header.pushSlots = &pushSlots;
         be.nameOf = nameOf;
                     be.guardSlotOf = guardSlotOf;
         be.signatureOf = signatureOf;
+        be.callerSignature = callerSignature;
         be.architecture = architecture;
         be.useRecoveredRuntime = useRecoveredRuntime;
                     be.stackModel = stackModel;
@@ -5682,6 +5717,7 @@ be.pushSlots = &pushSlots;
                 thenBody.nameOf = nameOf;
                     thenBody.guardSlotOf = guardSlotOf;
                 thenBody.signatureOf = signatureOf;
+                thenBody.callerSignature = callerSignature;
                 thenBody.architecture = architecture;
                 thenBody.useRecoveredRuntime = useRecoveredRuntime;
                     thenBody.stackModel = stackModel;
@@ -5707,6 +5743,7 @@ thenBody.pushSlots = &pushSlots;
                 elseBody.nameOf = nameOf;
                     elseBody.guardSlotOf = guardSlotOf;
                 elseBody.signatureOf = signatureOf;
+                elseBody.callerSignature = callerSignature;
                 elseBody.architecture = architecture;
                 elseBody.useRecoveredRuntime = useRecoveredRuntime;
                     elseBody.stackModel = stackModel;
@@ -5748,6 +5785,7 @@ elseBody.pushSlots = &pushSlots;
                 te.nameOf = nameOf;
                     te.guardSlotOf = guardSlotOf;
                 te.signatureOf = signatureOf;
+                te.callerSignature = callerSignature;
                 te.architecture = architecture;
                 te.useRecoveredRuntime = useRecoveredRuntime;
                     te.stackModel = stackModel;
@@ -5819,6 +5857,32 @@ te.pushSlots = &pushSlots;
                               be.rebaseText(address) + "))";
                 } else {
                     argument = registerName(architecture, offset);
+                    // Symmetric argument casts, mirroring the plain-call
+                    // path: a register forwarded to a pointer-typed callee
+                    // parameter needs (void *), and a register that reads
+                    // as a pointer-typed parameter of this function (role
+                    // names collide with the recovered parameter names)
+                    // needs (uint64_t) when the callee still types the slot
+                    // as a plain integer.
+                    if (callerSignature && targetSignature) {
+                        const auto& pt =
+                            targetSignature->parameters[i].type;
+                        if (pt.kind == TypeKind::POINTER) {
+                            argument = "(void *)" + argument;
+                        } else if (pt.kind == TypeKind::UNSIGNED_INT ||
+                                   pt.kind == TypeKind::SIGNED_INT ||
+                                   pt.kind == TypeKind::UNKNOWN) {
+                            for (const FunctionParameter& cp :
+                                 callerSignature->parameters) {
+                                if (cp.onStack ||
+                                    cp.registerOffset != offset)
+                                    continue;
+                                if (cp.type.kind == TypeKind::POINTER)
+                                    argument = "(uint64_t)" + argument;
+                                break;
+                            }
+                        }
+                    }
                 }
                 args += (i ? ", " : "") + argument;
             }
@@ -5832,7 +5896,30 @@ te.pushSlots = &pushSlots;
                                     returnRegisterOffset(architecture))
                     << ";\n";
             } else {
-                out << "return " << nameOf(*b->tailCallTarget) << "(" << args
+                // A tail call forwards the callee's return value straight
+                // into this function's return slot; when the two recovered
+                // return types disagree (pointer vs plain integer), C++
+                // needs an explicit cast.
+                std::string returnCast;
+                if (callerSignature && targetSignature) {
+                    const auto& callerReturn =
+                        callerSignature->returnType;
+                    const auto& calleeReturn =
+                        targetSignature->returnType;
+                    if (callerReturn.kind == TypeKind::POINTER &&
+                        (calleeReturn.kind == TypeKind::UNSIGNED_INT ||
+                         calleeReturn.kind == TypeKind::SIGNED_INT ||
+                         calleeReturn.kind == TypeKind::UNKNOWN))
+                        returnCast = "(void *)";
+                    else if ((callerReturn.kind ==
+                                  TypeKind::UNSIGNED_INT ||
+                              callerReturn.kind ==
+                                  TypeKind::SIGNED_INT) &&
+                             calleeReturn.kind == TypeKind::POINTER)
+                        returnCast = "(uint64_t)";
+                }
+                out << "return " << returnCast
+                    << nameOf(*b->tailCallTarget) << "(" << args
                     << ");\n";
             }
             return;
@@ -6071,7 +6158,8 @@ std::string decompileTyped(
     const std::function<bool(uint64_t)>& guardSlotOf) {
     std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
                                  architecture, useRecoveredRuntime,
-                                 stackModel, globals, guardSlotOf);
+                                 stackModel, globals, guardSlotOf,
+                                 /*entryName=*/"", &signature);
     // A data-slot trampoline (indirect tail call) forwards the callee's
     // return value through rax, so it must never decompile to void: the
     // typed wrapper's void-return rewrite would turn the dispatch into a

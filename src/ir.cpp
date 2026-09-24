@@ -1697,6 +1697,11 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
             cfgPrefetchFactor = static_cast<size_t>(parsed);
     }
 
+    // Functions whose body ends in an indirect jump (data-slot jump board
+    // or vtable tail call).  decompileTyped promotes a void return back to
+    // a 64-bit value for these (the dispatch forwards rax), so the Phase 7
+    // void downgrade must skip them or callers see a conflicting prototype.
+    std::set<uint64_t> tailDispatchers;
     for (size_t selectedIndex = 0;
          selectedIndex < selected.size() &&
          (!bounded || selectedIndex < maximumFunctions);
@@ -2154,6 +2159,8 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                     analyzed.effects.modifiedObjects.insert(objectKind);
                 } else if (operation.op == POp::CALLIND) {
                     ++indirectCalls;
+                } else if (operation.op == POp::BRANCHIND) {
+                    tailDispatchers.insert(function.addr);
                 } else if (operation.op == POp::SYSCALL) {
                     hasSystemCall = true;
                 }
@@ -2329,6 +2336,146 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
     // table itself has no machine code; the union of every call site does).
     importPrototypes_->aggregate(*this, program);
     importPrototypes_->applyKnownPrototypes();
+    // Phase 7: refine internal callee prototypes from the union of their
+    // call sites - the inverse direction of Phase 6 (which only covers
+    // imports, whose bodies do not exist).  Iterates to a fixed point like
+    // the Mod/Ref pass: every caller's argInfo/return-consumption evidence
+    // merges into the callee signature until no signature changes anymore.
+    {
+        const auto abi = abiArguments(architecture_, callingConvention_);
+        struct CalleeEvidence {
+            size_t sites = 0;
+            std::vector<CallSiteArgInfo> args;
+            bool anyReturnValue = false;
+            bool returnDereferenced = false;
+            bool returnBoolean = false;
+            bool returnArithmetic = false;
+        };
+        for (size_t pass = 0; pass < functions_.size() + 1; ++pass) {
+            bool changed = false;
+            std::map<uint64_t, CalleeEvidence> evidence;
+            for (const auto& callerEntry : functions_) {
+                if (!callerEntry.second.complete) continue;
+                for (const AnalyzedCallSite& site :
+                     callerEntry.second.callSites) {
+                    if (!site.target || site.indirect) continue;
+                    CalleeEvidence& ev = evidence[*site.target];
+                    ++ev.sites;
+                    if (ev.args.size() < site.argInfo.size())
+                        ev.args.resize(site.argInfo.size());
+                    for (size_t i = 0; i < site.argInfo.size(); ++i) {
+                        const CallSiteArgInfo& info = site.argInfo[i];
+                        CallSiteArgInfo& merged = ev.args[i];
+                        merged.observed |= info.observed;
+                        merged.widthBytes =
+                            std::max(merged.widthBytes, info.widthBytes);
+                        merged.addressUsed |= info.addressUsed;
+                        if (!info.observed ||
+                            info.type.kind == TypeKind::UNKNOWN)
+                            continue;
+                        if (merged.type.kind == TypeKind::UNKNOWN &&
+                            merged.type.bits == 0)
+                            merged.type = info.type;
+                        else
+                            merged.type = mergeType(merged.type, info.type);
+                    }
+                    ev.anyReturnValue |= site.returnsValue;
+                    ev.returnDereferenced |= site.returnDereferenced;
+                    ev.returnBoolean |= site.returnBoolean;
+                    ev.returnArithmetic |= site.returnArithmetic;
+                }
+            }
+            for (const auto& kv : evidence) {
+                const auto fit = functions_.find(kv.first);
+                if (fit == functions_.end() || !fit->second.complete)
+                    continue;
+                FunctionSignature& sig = fit->second.signature;
+                // Parameters: pointer evidence upgrades (or installs) a
+                // parameter.  Widths are never narrowed here - the callee
+                // body's own usage evidence already set them, and a
+                // 32-bit-looking caller argument may still carry live
+                // upper bits the callee reads.
+                for (size_t i = 0;
+                     i < kv.second.args.size() && i < abi.size(); ++i) {
+                    const CallSiteArgInfo& info = kv.second.args[i];
+                    if (!info.observed) continue;
+                    FunctionParameter* param = nullptr;
+                    for (FunctionParameter& p : sig.parameters)
+                        if (!p.onStack &&
+                            p.registerOffset == abi[i].first) {
+                            param = &p;
+                            break;
+                        }
+                    if (param) {
+                        if (info.addressUsed &&
+                            param->type.kind != TypeKind::POINTER &&
+                            (param->type.kind == TypeKind::UNSIGNED_INT ||
+                             param->type.kind == TypeKind::SIGNED_INT ||
+                             param->type.kind == TypeKind::UNKNOWN)) {
+                            param->type =
+                                DataType{TypeKind::POINTER, 64, 1};
+                            changed = true;
+                        }
+                    } else if (info.addressUsed) {
+                        // The callee never reads this argument, but every
+                        // caller passes something it dereferences: declare
+                        // the pointer parameter for the prototype.
+                        FunctionParameter added;
+                        added.name = "arg" + std::to_string(i);
+                        added.registerOffset = abi[i].first;
+                        added.type = DataType{TypeKind::POINTER, 64, 1};
+                        sig.parameters.push_back(added);
+                        changed = true;
+                    }
+                }
+                // Keep register parameters in ABI order: parameters added
+                // from evidence append at the end, and positional call
+                // emission requires declaration order to match.
+                std::stable_sort(
+                    sig.parameters.begin(), sig.parameters.end(),
+                    [&](const FunctionParameter& a,
+                        const FunctionParameter& b) {
+                        auto abiIndex = [&](const FunctionParameter& p) {
+                            if (p.onStack) return abi.size() + 1;
+                            for (size_t i = 0; i < abi.size(); ++i)
+                                if (abi[i].first == p.registerOffset)
+                                    return i;
+                            return abi.size();
+                        };
+                        return abiIndex(a) < abiIndex(b);
+                    });
+                // Return type: unanimous ignoring downgrades integer
+                // returns to void (the typed wrapper rewrites the body's
+                // machine-return for void); a dereferenced return is a
+                // pointer.  Struct/float returns are left untouched - the
+                // adapter only rewrites plain integer returns.  Tail
+                // dispatchers keep their return: decompileTyped promotes
+                // them back to a 64-bit value (the dispatch forwards rax),
+                // and a cross-unit void downgrade would conflict with it.
+                if (kv.second.sites > 0 && !kv.second.anyReturnValue &&
+                    !tailDispatchers.count(kv.first) &&
+                    (sig.returnType.kind == TypeKind::UNSIGNED_INT ||
+                     sig.returnType.kind == TypeKind::SIGNED_INT ||
+                     sig.returnType.kind == TypeKind::BOOL ||
+                     sig.returnType.kind == TypeKind::UNKNOWN)) {
+                    sig.returnType = {TypeKind::VOID_TYPE, 0, 1};
+                    sig.returnValues.clear();
+                    sig.returnComponents.clear();
+                    changed = true;
+                } else if (kv.second.returnDereferenced &&
+                           sig.returnType.kind != TypeKind::POINTER &&
+                           (sig.returnType.kind == TypeKind::UNSIGNED_INT ||
+                            sig.returnType.kind == TypeKind::SIGNED_INT ||
+                            sig.returnType.kind == TypeKind::UNKNOWN)) {
+                    sig.returnType = DataType{TypeKind::POINTER, 64, 1};
+                    if (sig.returnComponents.size() == 1)
+                        sig.returnComponents[0] = sig.returnType;
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+    }
     const auto refinementFinished = std::chrono::steady_clock::now();
     if (std::getenv("CENTRIFUGE_ANALYSIS_PROFILE")) {
         const auto secondsBetween = [](const auto& begin, const auto& end) {

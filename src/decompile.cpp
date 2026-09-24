@@ -2290,6 +2290,90 @@ public:
     // to type unbound paramK call arguments that will bind to pointer
     // parameters, so pointer->integer call casts are emitted up front.
     const FunctionSignature* callerSignature = nullptr;
+    // Recovered struct members for pointer parameters (WS3): address
+    // expressions (paramK + const) on the entry block rewrite to
+    // paramK->member when the recovered layout carries a member at that
+    // offset with a matching width.
+    const FieldAccessorMap* fieldAccessors = nullptr;
+    // WS3: registers currently holding an untouched incoming parameter
+    // (storage -> paramK), recorded from plain `reg = paramK` copies.
+    // Unlike regExpr, an entry survives unrelated reads of the parameter
+    // register: the paramK CExpr carries a registerRef, so regExpr
+    // invalidates it at the next read expression.
+    std::map<uint64_t, int> paramCopies;
+    // WS3: when a LOAD/STORE address is an untouched incoming-parameter
+    // register plus a constant displacement, and the recovered parameter
+    // type carries a member at that offset whose width matches the
+    // access, return "paramK->member" so the caller emits a member access
+    // instead of *(T *)(base + K).  Empty string keeps the raw cast form.
+    std::string memberAccess(const PcodeInsn& pi, uint64_t addrId,
+                             int valueSize) const {
+        if (!fieldAccessors || !entryBlock) return {};
+        const Varnode* v = pi.find(addrId);
+        if (!v) return {};
+        uint64_t baseReg = 0;
+        int64_t disp = 0;
+        if (v->kind == Varnode::REGISTER) {
+            baseReg = registerStorageOffset(architecture, v->offset, 8);
+        } else if (v->kind == Varnode::UNIQUE) {
+            bool found = false;
+            for (const auto& def : pi.ops) {
+                if (def.out != v->id) continue;
+                if (def.op != POp::INT_ADD && def.op != POp::INT_SUB)
+                    return {};
+                const Varnode* a = pi.find(def.in0);
+                const Varnode* b = pi.find(def.in1);
+                const Varnode* reg = nullptr;
+                const Varnode* konst = nullptr;
+                for (const Varnode* c : {a, b}) {
+                    if (!c) continue;
+                    if (c->kind == Varnode::REGISTER && !reg) reg = c;
+                    else if (c->kind == Varnode::CONST && !konst) konst = c;
+                }
+                if (!reg || !konst) return {};
+                if (def.op == POp::INT_SUB && reg != a) return {};
+                baseReg =
+                    registerStorageOffset(architecture, reg->offset, 8);
+                disp = static_cast<int64_t>(konst->offset);
+                if (def.op == POp::INT_SUB) disp = -disp;
+                found = true;
+                break;
+            }
+            if (!found) return {};
+        } else {
+            return {};
+        }
+        // Members are only recovered at non-negative offsets.  The base
+        // register names an incoming parameter either directly (untouched
+        // entry-block read renders as paramK) or through a plain copy
+        // (`ret_val = paramK`) whose block-local definition text is the
+        // bare token - in both cases the access attributes to that
+        // parameter's recovered layout.
+        if (disp < 0) return {};
+        const auto pit = paramIndex.find(baseReg);
+        if (pit == paramIndex.end()) {
+            const auto cit = paramCopies.find(baseReg);
+            if (cit == paramCopies.end()) return {};
+            bool resolved = false;
+            for (const auto& kv : paramIndex)
+                if (kv.second == cit->second) {
+                    baseReg = kv.first;
+                    resolved = true;
+                    break;
+                }
+            if (!resolved) return {};
+        } else if (paramDefined.count(baseReg)) {
+            return {};
+        }
+        const auto it = fieldAccessors->find({baseReg, disp});
+        if (it == fieldAccessors->end()) return {};
+        if (it->second.second != valueSize * 8) return {};
+        for (const auto& kv : paramIndex)
+            if (kv.first == baseReg)
+                return "param" + std::to_string(kv.second) + "->" +
+                       it->second.first;
+        return {};
+    }
     // True for data-segment slots whose value is a `jmp rax` trampoline
     // (MSVC /guard:cf __guard_dispatch_icall_fptr).  The machine does
     // mov rax, <real target>; call [slot]; the trampoline jumps to rax.
@@ -2515,6 +2599,7 @@ public:
         // Calls can clobber registers and memory. Argument text has already
         // been captured; no pre-call definition is valid for later inlining.
         regExpr.clear();
+        paramCopies.clear();
         regConst.clear();
         if (signature && signature->returnType.kind == TypeKind::VOID_TYPE)
             line(call + ";");
@@ -2572,6 +2657,7 @@ public:
         regConst.clear();
         pending.clear();
         regExpr.clear();
+        paramCopies.clear();
         if (entryBlock) {
             paramIndex.clear();
             paramDefined.clear();
@@ -2814,6 +2900,7 @@ public:
             // These writes bypass pending, including comparison flags and
             // entry-parameter aliases. Conservatively forget all expressions.
             regExpr.clear();
+            paramCopies.clear();
             if (repeat) paramDefined.insert(8);
             if (operation == 1 || operation == 2 || operation == 4)
                 paramDefined.insert(48);
@@ -2992,6 +3079,7 @@ public:
                         }
                     }
                     regExpr.clear();
+                    paramCopies.clear();
                     regConst.clear();
                     continue;
                 }
@@ -3093,15 +3181,29 @@ public:
                                         continue;
                                     }
                                 }
-                                line("*((" +
-                                     std::string(uCast(vs ? vs->size : 8)) +
-                                     " *)(" + stripParens(a.text) + ")) = " +
-                                     stripParens(v.text) + ";");
+                                const std::string member = memberAccess(
+                                    pi, op.in0, vs ? vs->size : 8);
+                                if (!member.empty()) {
+                                    line(member + " = " +
+                                         stripParens(v.text) + ";");
+                                } else {
+                                    line("*((" +
+                                         std::string(uCast(vs ? vs->size : 8)) +
+                                         " *)(" + stripParens(a.text) + ")) = " +
+                                         stripParens(v.text) + ";");
+                                }
                             } else {
-                                line("*((" +
-                                     std::string(uCast(vs ? vs->size : 8)) +
-                                     " *)(" + stripParens(a.text) + ")) = " +
-                                     stripParens(v.text) + ";");
+                                const std::string member = memberAccess(
+                                    pi, op.in0, vs ? vs->size : 8);
+                                if (!member.empty()) {
+                                    line(member + " = " +
+                                         stripParens(v.text) + ";");
+                                } else {
+                                    line("*((" +
+                                         std::string(uCast(vs ? vs->size : 8)) +
+                                         " *)(" + stripParens(a.text) + ")) = " +
+                                         stripParens(v.text) + ";");
+                                }
                             }
                         }
                         (void)vs;
@@ -4745,17 +4847,29 @@ public:
                             }
                         }
                         const CExpr a = exprOfV(pi.find(op.in0));
-                        r.text = "(*(" + std::string(uCast(vo->size)) +
-                                  " *)(" + stripParens(a.text) + "))";
+                        const std::string member =
+                            memberAccess(pi, op.in0, vo->size);
+                        if (!member.empty()) {
+                            r.text = member;
+                        } else {
+                            r.text = "(*(" + std::string(uCast(vo->size)) +
+                                      " *)(" + stripParens(a.text) + "))";
+                        }
                         r.size = vo->size;
                         r.ctype = uCast(vo->size);
                     } else {
                         const CExpr a = exprOfV(pi.find(op.in0));
-                        r.text = useRecoveredRuntime
-                            ? "recovered_load<" + std::string(uCast(vo->size)) +
-                                  ">(" + stripParens(a.text) + ")"
-                            : "(*(" + std::string(uCast(vo->size)) +
-                                  " *)(" + stripParens(a.text) + "))";
+                        const std::string member =
+                            memberAccess(pi, op.in0, vo->size);
+                        if (!member.empty()) {
+                            r.text = member;
+                        } else {
+                            r.text = useRecoveredRuntime
+                                ? "recovered_load<" + std::string(uCast(vo->size)) +
+                                      ">(" + stripParens(a.text) + ")"
+                                : "(*(" + std::string(uCast(vo->size)) +
+                                      " *)(" + stripParens(a.text) + "))";
+                        }
                         r.size = vo->size;
                         r.ctype = uCast(vo->size);
                     }
@@ -4843,6 +4957,7 @@ public:
         for (const auto& write : pending) {
             const uint64_t written = registerStorageOffset(
                 architecture, write.first, write.second.size);
+            paramCopies.erase(written);
             if (entryBlock && paramIndex.count(written))
                 paramDefined.insert(written);
             if (liveFlags && written >= 4096 && written <= 4101 &&
@@ -4903,6 +5018,18 @@ public:
                 }
             }
             regExpr[written] = write.second;
+            // WS3: a plain `reg = paramK` copy makes the register an alias
+            // of an incoming parameter for member-access naming.
+            if (write.second.size == 8) {
+                const std::string def = stripParens(write.second.text);
+                if (def.rfind("param", 0) == 0) {
+                    size_t used = 0;
+                    const unsigned long k = std::stoul(def.substr(5), &used);
+                    if (used == def.size() - 5 && k >= 1 &&
+                        k <= 100)
+                        paramCopies[written] = static_cast<int>(k);
+                }
+            }
         }
         for (const auto& kv : pending) {
                 const uint64_t storage = registerStorageOffset(
@@ -5148,7 +5275,8 @@ std::string decompile(
     const StackFrameModel* stackModel,
     const GlobalObjectRecovery* globals,
     const std::function<bool(uint64_t)>& guardSlotOf,
-    const std::string& entryName, const FunctionSignature* callerSignature) {
+    const std::string& entryName, const FunctionSignature* callerSignature,
+    const FieldAccessorMap* fieldAccessors) {
     CfgBuilder cfg;
     if (!cfg.build(eng, read, start, end)) return "// failed to build CFG\n";
 
@@ -5481,6 +5609,7 @@ std::string decompile(
                     body.guardSlotOf = guardSlotOf;
                     body.signatureOf = signatureOf;
                     body.callerSignature = callerSignature;
+                    body.fieldAccessors = fieldAccessors;
                     body.architecture = architecture;
                     body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -5523,6 +5652,7 @@ body.pushSlots = &pushSlots;
                     body.guardSlotOf = guardSlotOf;
                 body.signatureOf = signatureOf;
                 body.callerSignature = callerSignature;
+                body.fieldAccessors = fieldAccessors;
                 body.architecture = architecture;
                 body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -5613,6 +5743,7 @@ body.pushSlots = &pushSlots;
                     header.guardSlotOf = guardSlotOf;
                         header.signatureOf = signatureOf;
                         header.callerSignature = callerSignature;
+                        header.fieldAccessors = fieldAccessors;
                         header.architecture = architecture;
                         header.useRecoveredRuntime = useRecoveredRuntime;
                         header.stackModel = stackModel;
@@ -5670,6 +5801,7 @@ header.pushSlots = &pushSlots;
                     be.guardSlotOf = guardSlotOf;
         be.signatureOf = signatureOf;
         be.callerSignature = callerSignature;
+        be.fieldAccessors = fieldAccessors;
         be.architecture = architecture;
         be.useRecoveredRuntime = useRecoveredRuntime;
                     be.stackModel = stackModel;
@@ -5718,6 +5850,7 @@ be.pushSlots = &pushSlots;
                     thenBody.guardSlotOf = guardSlotOf;
                 thenBody.signatureOf = signatureOf;
                 thenBody.callerSignature = callerSignature;
+                thenBody.fieldAccessors = fieldAccessors;
                 thenBody.architecture = architecture;
                 thenBody.useRecoveredRuntime = useRecoveredRuntime;
                     thenBody.stackModel = stackModel;
@@ -5744,6 +5877,7 @@ thenBody.pushSlots = &pushSlots;
                     elseBody.guardSlotOf = guardSlotOf;
                 elseBody.signatureOf = signatureOf;
                 elseBody.callerSignature = callerSignature;
+                elseBody.fieldAccessors = fieldAccessors;
                 elseBody.architecture = architecture;
                 elseBody.useRecoveredRuntime = useRecoveredRuntime;
                     elseBody.stackModel = stackModel;
@@ -5786,6 +5920,7 @@ elseBody.pushSlots = &pushSlots;
                     te.guardSlotOf = guardSlotOf;
                 te.signatureOf = signatureOf;
                 te.callerSignature = callerSignature;
+                te.fieldAccessors = fieldAccessors;
                 te.architecture = architecture;
                 te.useRecoveredRuntime = useRecoveredRuntime;
                     te.stackModel = stackModel;
@@ -6155,11 +6290,13 @@ std::string decompileTyped(
     const std::function<std::optional<FunctionSignature>(uint64_t)>& signatureOf,
     bool useRecoveredRuntime, const StackFrameModel* stackModel,
     const GlobalObjectRecovery* globals,
-    const std::function<bool(uint64_t)>& guardSlotOf) {
+    const std::function<bool(uint64_t)>& guardSlotOf,
+    const FieldAccessorMap* fieldAccessors) {
     std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
                                  architecture, useRecoveredRuntime,
                                  stackModel, globals, guardSlotOf,
-                                 /*entryName=*/"", &signature);
+                                 /*entryName=*/"", &signature,
+                                 fieldAccessors);
     // A data-slot trampoline (indirect tail call) forwards the callee's
     // return value through rax, so it must never decompile to void: the
     // typed wrapper's void-return rewrite would turn the dispatch into a

@@ -8,8 +8,10 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "centrifuge/ir.hpp"
 #include "centrifuge/sleigh.hpp"
@@ -17,6 +19,14 @@
 #include "centrifuge/global_recovery.hpp"
 
 namespace centrifuge {
+
+// Recovered struct-member accessors, keyed by (parameter register pcode
+// offset, byte displacement).  The value is the member name on the
+// parameter's recovered struct type plus the member width in bits, so the
+// emitter can rewrite *(T *)(base + K) into base->member when the width
+// matches.
+using FieldAccessorMap =
+    std::map<std::pair<uint64_t, int64_t>, std::pair<std::string, int>>;
 
 // Decompile the function starting at `start` (until RET/undecodable/`end`).
 // `nameOf` resolves call-target addresses to function names ("" = indirect).
@@ -36,7 +46,8 @@ std::string decompile(
     const GlobalObjectRecovery* globals = nullptr,
     const std::function<bool(uint64_t)>& guardSlotOf = nullptr,
     const std::string& entryName = "",
-    const FunctionSignature* callerSignature = nullptr);
+    const FunctionSignature* callerSignature = nullptr,
+    const FieldAccessorMap* fieldAccessors = nullptr);
 
 // Emits a complete C-like function with the recovered declaration and ABI
 // register aliases.  Direct calls use propagated callee signatures.
@@ -53,6 +64,7 @@ std::string decompileTyped(
     bool useRecoveredRuntime = false,
     const StackFrameModel* stackModel = nullptr,
     const GlobalObjectRecovery* globals = nullptr,
-    const std::function<bool(uint64_t)>& guardSlotOf = nullptr);
+    const std::function<bool(uint64_t)>& guardSlotOf = nullptr,
+    const FieldAccessorMap* fieldAccessors = nullptr);
 
 } // namespace centrifuge

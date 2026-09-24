@@ -1055,6 +1055,33 @@ void FunctionIR::inferTypes() {
         pointer.detail->elementType = std::make_shared<DataType>(aggregate);
         values_[entry.first].type = std::move(pointer);
     }
+    // WS3: recovered_* aggregate names are keyed by SSA id, which is only
+    // unique within one function.  Two functions recovered into one
+    // translation unit would emit colliding definitions with different
+    // layouts.  Prefix every synthetic aggregate name with this function's
+    // entry address so names stay globally unique.
+    if (!blocks_.empty()) {
+        char prefixBuf[48];
+        std::snprintf(prefixBuf, sizeof(prefixBuf), "recovered_%llx_",
+                      static_cast<unsigned long long>(blocks_.front().start));
+        const std::string prefix = prefixBuf;
+        std::set<TypeDetail*> renamed;
+        std::function<void(DataType&)> uniquify;
+        uniquify = [&](DataType& type) {
+            if (type.detail) {
+                if (type.detail->name.rfind("recovered_", 0) == 0 &&
+                    type.detail->name.rfind(prefix, 0) != 0 &&
+                    renamed.insert(type.detail.get()).second)
+                    type.detail->name =
+                        prefix + type.detail->name.substr(10);
+                if (type.detail->elementType)
+                    uniquify(*type.detail->elementType);
+                for (TypeField& field : type.detail->fields)
+                    uniquify(field.type);
+            }
+        };
+        for (auto& kv : values_) uniquify(kv.second.type);
+    }
 }
 
 FunctionSignature FunctionIR::inferSignature() const {
@@ -2563,9 +2590,33 @@ std::string ProgramAnalysis::decompileFunction(const Program& program,
             output << callee->signature.declaration(callee->function.name) << ";\n";
     }
     if (!analyzed->callees.empty()) output << "\n";
+    // WS3: member accessors for pointer parameters whose recovered type
+    // carries a struct layout.  The emitter rewrites entry-block
+    // *(T *)(paramK + K) accesses to paramK->member.  Member names must
+    // match the (possibly suffixed) names emitType prints, so replicate
+    // its per-name deduplication counting.
+    FieldAccessorMap fieldAccessors;
+    for (const FunctionParameter& parameter : analyzed->signature.parameters) {
+        if (parameter.onStack ||
+            parameter.type.kind != TypeKind::POINTER ||
+            !parameter.type.detail ||
+            !parameter.type.detail->elementType ||
+            parameter.type.detail->elementType->kind != TypeKind::STRUCT)
+            continue;
+        std::map<std::string, int> usedNames;
+        for (const TypeField& field : parameter.type.detail->elementType->detail->fields) {
+            std::string name = field.name;
+            const int seen = usedNames[name]++;
+            if (seen > 0) name += "_" + std::to_string(seen + 1);
+            fieldAccessors[{parameter.registerOffset,
+                            static_cast<int64_t>(field.byteOffset)}] = {
+                name, field.type.bits};
+        }
+    }
     output << decompileTyped(engine, read, address, end, architecture_,
                              analyzed->function.name, analyzed->signature,
-                             nameOf, signatureOf);
+                             nameOf, signatureOf, false, nullptr, nullptr,
+                             nullptr, fieldAccessors.empty() ? nullptr : &fieldAccessors);
     return output.str();
 }
 

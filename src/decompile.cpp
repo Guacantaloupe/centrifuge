@@ -1212,10 +1212,29 @@ const auto containsIdentifier = [](const std::string& s,
 std::string collapseAbiPrologue(std::string text, const std::string& architecture,
                                 const FunctionSignature& sig) {
     struct Binding { std::string spelling; std::string reg; std::string param; };
+    // Parameter names that collide with an architectural register name
+    // must not be propagated: substituting "rdi" -> "rcx" would corrupt
+    // every reference to the actual rcx register.
+    std::set<std::string> reserved;
+    {
+        const int registerCount =
+            architecture.rfind("x86", 0) == 0 ? 16 : 32;
+        for (int i = 0; i < registerCount; ++i) {
+            const uint64_t off = static_cast<uint64_t>(i) * 8;
+            // Architectural names only: arg0..argN are ABI role names and
+            // ARE the normal parameter naming, so they must stay eligible.
+            reserved.insert(registerName(architecture, off, 8));
+        }
+        reserved.insert("stack_ptr");
+        reserved.insert("frame_ptr");
+        reserved.insert("ret_val");
+    }
     std::vector<Binding> bindings;
     for (const FunctionParameter& p : sig.parameters) {
-        if (p.onStack) continue;
-        const std::string reg = registerName(architecture, p.registerOffset, 8);
+        const std::string reg = p.onStack
+            ? localName(p.stackOffset)
+            : registerName(architecture, p.registerOffset, 8);
+        if (reserved.count(p.name)) continue;
         const bool already64 =
             (p.type.kind == TypeKind::UNSIGNED_INT ||
              p.type.kind == TypeKind::SIGNED_INT) && p.type.bits == 64;
@@ -1287,8 +1306,29 @@ std::string collapseAbiPrologue(std::string text, const std::string& architectur
             }
     }
     if (found.empty()) return text;
+    // Brace depth per line (window-closing re-stores at body depth make the
+    // binding dead regardless of later references: the re-store dominates
+    // every path that follows it).
+    std::vector<int> depth(lines.size(), 0);
+    {
+        int running = 0;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            depth[i] = running;
+            for (char c : lines[i]) {
+                if (c == '{') ++running;
+                else if (c == '}') --running;
+            }
+        }
+    }
+    int bodyDepth = -1;
+    for (size_t i = 0; i < lines.size(); ++i)
+        if (lines[i].find('{') != std::string::npos) {
+            bodyDepth = depth[i] + 1;
+            break;
+        }
     for (const auto& kv : found) {
         const Binding& b = *kv.second;
+        bool closedByTopStore = false;
         for (size_t j = kv.first + 1; j < lines.size(); ++j) {
             const std::string u = ltrim(lines[j]);
             if (u.rfind("L0x", 0) == 0 && u.back() == ':') {
@@ -1298,10 +1338,30 @@ std::string collapseAbiPrologue(std::string text, const std::string& architectur
             if (u.find('{') != std::string::npos ||
                 u.find('}') != std::string::npos) break;
             std::string v2, r2;
-            if (matchStore(lines[j], v2, r2) && v2 == b.reg) break;
+            if (matchStore(lines[j], v2, r2) && v2 == b.reg) {
+                closedByTopStore =
+                    bodyDepth >= 0 && depth[j] == bodyDepth;
+                break;
+            }
             lines[j] = replaceIdentifier(lines[j], b.reg, b.param);
         }
+        // The binding is the register's only initializer: it may only be
+        // deleted when no reference survives outside the substituted
+        // window (a read past a closed window still observes it) - unless
+        // the window closed at an unconditional body-level re-store, which
+        // dominates everything after it.  Declaration lines are excluded -
+        // pruneUnusedDecls reclaims identifiers listed only there.
+        const std::string bindingLine = lines[kv.first];
         lines[kv.first].clear();
+        if (closedByTopStore) continue;
+        std::ostringstream rest;
+        for (const std::string& o : lines) {
+            if (o.empty() || &o == &lines[kv.first]) continue;
+            if (ltrim(o).rfind("uint64_t ", 0) == 0) continue;
+            rest << o << "\n";
+        }
+        if (containsIdentifier(rest.str(), b.reg))
+            lines[kv.first] = bindingLine;
     }
     pruneUnusedDecls(lines, containsIdentifier);
     std::ostringstream out;
@@ -1455,6 +1515,150 @@ std::string propagateLocalConstants(std::string text) {
             for (const std::string& l : lines)
                 if (!l.empty()) rebuilt << l << "\n";
             text = rebuilt.str();
+        }
+    }
+    return text;
+}
+
+// Simplify simulated stack-pointer bookkeeping in the assembled wrapper:
+//   1. "const auto recovered_old_N_rsp = stack_ptr;" immediately followed
+//      by "stack_ptr = recovered_old_N_rsp + K;" is the push/pop idiom.
+//      When the snapshot name is unread inside its own brace scope it
+//      folds to "stack_ptr += K;" and the declaration is dropped.  (The
+//      scope-limited read check makes same-named snapshots in sibling
+//      blocks harmless.)
+//   2. A compound adjustment "stack_ptr += K;"/"-= K;" is deleted when no
+//      use of the same name appears before the next full reassignment
+//      (whose right-hand side does not read the name) or the end of the
+//      function - with no observer the adjustment is unobservable on
+//      every path, including loops and forward gotos.  Any other
+//      occurrence (a dereference, a call argument, a capture into
+//      frame_ptr, a read-modify-write assignment) keeps it.  Processed
+//      per name (stack_ptr, frame_ptr) to a fixed point.
+std::string simplifyStackPointer(std::string text) {
+    const auto ltrim = [](const std::string& s) {
+        const size_t a = s.find_first_not_of(" \t");
+        return a == std::string::npos ? std::string() : s.substr(a);
+    };
+    const auto isNumber = [](const std::string& s) {
+        return !s.empty() &&
+            std::all_of(s.begin(), s.end(), [](char c) {
+                return std::isdigit(static_cast<unsigned char>(c));
+            });
+    };
+    const auto splitLines = [](const std::string& src) {
+        std::vector<std::string> out;
+        std::istringstream in(src);
+        std::string ln;
+        while (std::getline(in, ln)) out.push_back(ln);
+        return out;
+    };
+    const auto joinLines = [](const std::vector<std::string>& lines) {
+        std::ostringstream out;
+        for (const std::string& l : lines)
+            if (!l.empty()) out << l << "\n";
+        return out.str();
+    };
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        std::vector<std::string> lines = splitLines(text);
+        // Brace depth at the START of each line.
+        std::vector<int> depth(lines.size(), 0);
+        int running = 0;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            depth[i] = running;
+            for (char c : lines[i]) {
+                if (c == '{') ++running;
+                else if (c == '}') --running;
+            }
+        }
+        // 1) snapshot idiom, scope-limited.
+        for (size_t i = 0; i + 1 < lines.size(); ++i) {
+            if (lines[i].empty()) continue;
+            const std::string t = ltrim(lines[i]);
+            const std::string prefix = "const auto ";
+            if (t.rfind(prefix, 0) != 0 || t.back() != ';') continue;
+            const std::string decl = t.substr(prefix.size(), t.size() - 1 -
+                                                prefix.size());
+            const size_t eq = decl.find(" = ");
+            if (eq == std::string::npos) continue;
+            const std::string snap = decl.substr(0, eq);
+            const std::string base = decl.substr(eq + 3);
+            if (snap.rfind("recovered_old_", 0) != 0) continue;
+            if (base != "stack_ptr" && base != "frame_ptr") continue;
+            const std::string u = ltrim(lines[i + 1]);
+            if (u.rfind(base + " = ", 0) != 0 || u.back() != ';') continue;
+            const std::string rhs = u.substr(base.size() + 3, u.size() - 1 -
+                                             (base.size() + 3));
+            if (rhs.rfind(snap + " + ", 0) != 0 &&
+                rhs.rfind(snap + " - ", 0) != 0)
+                continue;
+            const std::string k = rhs.substr(snap.size() + 3);
+            if (!isNumber(k)) continue;
+            // The snapshot's scope runs to the line whose depth drops
+            // below the declaration's; references outside it bind to
+            // other declarations and are irrelevant here.
+            const int d = depth[i];
+            size_t scopeEnd = lines.size();
+            for (size_t j = i + 1; j < lines.size(); ++j)
+                if (depth[j] < d) {
+                    scopeEnd = j;
+                    break;
+                }
+            bool read = false;
+            for (size_t j = i + 1; j < scopeEnd; ++j) {
+                if (lines[j].empty() || j == i + 1) continue;
+                if (containsIdentifier(lines[j], snap)) {
+                    read = true;
+                    break;
+                }
+            }
+            if (read) continue;
+            const std::string indent =
+                lines[i + 1].substr(0, lines[i + 1].size() - u.size());
+            const char op = rhs[snap.size() + 1]; // '+' or '-'
+            lines[i + 1] = indent + base + " " + op + "= " + k + ";";
+            lines[i].clear();
+            changed = true;
+        }
+        // 2) dead compound adjustments, per name.
+        for (const char* nameC : {"stack_ptr", "frame_ptr"}) {
+            const std::string name = nameC;
+            for (size_t i = 0; i < lines.size(); ++i) {
+                if (lines[i].empty()) continue;
+                const std::string t = ltrim(lines[i]);
+                const std::string plus = name + " += ";
+                const std::string minus = name + " -= ";
+                if (t.rfind(plus, 0) != 0 && t.rfind(minus, 0) != 0)
+                    continue;
+                if (t.back() != ';') continue;
+                bool dead = true;
+                for (size_t j = i + 1; j < lines.size(); ++j) {
+                    if (lines[j].empty()) continue;
+                    if (lines[j].find(name) == std::string::npos) continue;
+                    const std::string v = ltrim(lines[j]);
+                    if (v.rfind(name + " = ", 0) == 0 &&
+                        v.back() == ';') {
+                        const std::string r = v.substr(name.size() + 3,
+                                                       v.size() - 1 -
+                                                       (name.size() + 3));
+                        dead = r.find(name) == std::string::npos;
+                    } else {
+                        dead = false; // a read, capture, or rmw observes it
+                    }
+                    break;
+                }
+                if (dead) {
+                    lines[i].clear();
+                    changed = true;
+                }
+            }
+        }
+        if (changed) {
+            text = joinLines(lines);
+            pruneUnusedDecls(lines, containsIdentifier);
+            text = joinLines(lines);
         }
     }
     return text;
@@ -6241,10 +6445,13 @@ std::string decompileTyped(
     // expression cannot stand in for those.
     // The ABI prologue hop is collapsed last of all: the binding lines it
     // propagates through are synthesized by this wrapper, so they only
-    // exist in the fully assembled text.  Constant propagation runs after
-    // it so bindings-turned-stores ("rcx = 0;") fold into call sites.
-    return propagateLocalConstants(collapseAbiPrologue(
-        foldAssignBeforeReturn(out.str()), architecture, effectiveSignature));
+    // exist in the fully assembled text.  Constant propagation runs first
+    // so dead synthesized stores ("rcx = 0;") disappear before the
+    // binding's keep-or-drop decision; stack-pointer bookkeeping is
+    // simplified last so folded pushes can pair up with the restore.
+    return simplifyStackPointer(collapseAbiPrologue(
+        propagateLocalConstants(foldAssignBeforeReturn(out.str())),
+        architecture, effectiveSignature));
 }
 
 } // namespace centrifuge

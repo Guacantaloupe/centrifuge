@@ -47,7 +47,8 @@ std::string decompile(
     const std::function<bool(uint64_t)>& guardSlotOf = nullptr,
     const std::string& entryName = "",
     const FunctionSignature* callerSignature = nullptr,
-    const FieldAccessorMap* fieldAccessors = nullptr);
+    const FieldAccessorMap* fieldAccessors = nullptr,
+    const std::map<uint64_t, DataType>* callResultTypes = nullptr);
 
 // Emits a complete C-like function with the recovered declaration and ABI
 // register aliases.  Direct calls use propagated callee signatures.
@@ -65,6 +66,7 @@ std::string decompileTyped(
     const StackFrameModel* stackModel = nullptr,
     const GlobalObjectRecovery* globals = nullptr,
     const std::function<bool(uint64_t)>& guardSlotOf = nullptr,
-    const FieldAccessorMap* fieldAccessors = nullptr);
+    const FieldAccessorMap* fieldAccessors = nullptr,
+    const std::map<uint64_t, DataType>* callResultTypes = nullptr);
 
 } // namespace centrifuge

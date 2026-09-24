@@ -237,8 +237,16 @@ public:
     void inferTypes();
     FunctionSignature inferSignature() const;
     void optimize();
+    // WS3: struct/union layouts recovered for call-result SSA values, keyed
+    // by call instruction address.  Lets the emitter type a local holding a
+    // call result (e.g. allocator-style factories) for member-access
+    // naming without re-running the analysis.
+    const std::map<uint64_t, DataType>& callResultTypes() const {
+        return callResultTypes_;
+    }
 
 private:
+    std::map<uint64_t, DataType> callResultTypes_;
     std::string callingConvention_;
     std::map<uint64_t, std::map<std::pair<uint64_t, int>, SsaId>> outgoing_;
     std::map<std::pair<uint64_t, int>, SsaId> parameters_;
@@ -334,6 +342,9 @@ struct AnalyzedFunction {
     size_t phiNodes = 0;
     size_t liveOperations = 0;
     FunctionEffects effects;
+    // WS3: struct/union layouts recovered for call results (call address ->
+    // aggregate type), used for member-access naming on locals.
+    std::map<uint64_t, DataType> callResultTypes;
     bool complete = false;
     bool complexityLimited = false;
     std::string incompleteReason;

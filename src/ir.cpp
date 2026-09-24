@@ -670,6 +670,21 @@ bool FunctionIR::build(const CfgBuilder& cfg, const std::string& architecture,
                         values_.at(so.output).storage == SsaValue::REGISTER)
                         state[def->second.key] = so.output;
                 }
+                if ((op.op == POp::CALL || op.op == POp::CALLIND) &&
+                    so.output) {
+                    // Route the call result into the return register's
+                    // state.  The CALL output is a temporary keyed by a
+                    // synthetic RegKey, so without this every post-call
+                    // read of the return register resolves to the stale
+                    // pre-call value: downstream uses (spills, field
+                    // dereferences, returns) become invisible to SSA
+                    // consumers such as return-consumption evidence and
+                    // call-result field attribution.
+                    const uint64_t retOff =
+                        arch_.rfind("riscv", 0) == 0 ? 10 * 8 : 0;
+                    state[{retOff, 8}] = so.output;
+                    state[{retOff, 4}] = so.output;
+                }
                 if (op.op == POp::LOAD && so.output) {
                     std::set<uint64_t> visiting;
                     const auto offset = stackOffsetOf(op.in0, visiting);
@@ -947,10 +962,37 @@ void FunctionIR::inferTypes() {
         if (v && v->storage == SsaValue::REGISTER)
             provenance[parameter.second] = {parameter.second, 0};
     }
+    // WS3: call results are also field-evidence roots.  A factory/allocator
+    // return held in the return register and dereferenced at constant
+    // offsets carries the same layout information as a pointer parameter;
+    // seed it so the fixed point below propagates through result copies.
+    for (const SsaBlock& block : blocks_)
+        for (const SsaOp& op : block.ops)
+            if ((op.op == POp::CALL || op.op == POp::CALLIND) && op.output)
+                provenance[op.output] = {op.output, 0};
     for (int pass = 0; pass < 8; ++pass) {
         bool progress = false;
-        for (const SsaBlock& block : blocks_)
+        for (const SsaBlock& block : blocks_) {
+            // WS3: propagate provenance through block-boundary phis.  A call
+            // result dereferenced in a successor block reaches the LOAD only
+            // via a phi of the call output, which the op-only propagation
+            // below never sees.  Require every incoming value to agree on
+            // (root, delta) so conflicting merges stay anonymous.
+            auto propagatePhi = [&](const SsaOp& phi) {
+                if (!phi.output || phi.inputs.empty()) return;
+                const auto first = provenance.find(phi.inputs[0]);
+                if (first == provenance.end()) return;
+                for (size_t i = 1; i < phi.inputs.size(); ++i) {
+                    const auto it = provenance.find(phi.inputs[i]);
+                    if (it == provenance.end() || it->second != first->second)
+                        return;
+                }
+                progress |=
+                    provenance.emplace(phi.output, first->second).second;
+            };
+            for (const SsaOp& phi : block.phis) propagatePhi(phi);
             for (const SsaOp& op : block.ops) {
+                if (op.phi) propagatePhi(op);
                 if (!op.output || op.inputs.empty()) continue;
                 if (op.op == POp::COPY && provenance.count(op.inputs[0]))
                     progress |= provenance.emplace(op.output,
@@ -972,6 +1014,7 @@ void FunctionIR::inferTypes() {
                     progress |= provenance.emplace(op.output, derived).second;
                 }
             }
+        }
         if (!progress) break;
     }
     std::map<SsaId, std::vector<TypeField>> accessedFields;
@@ -1081,6 +1124,37 @@ void FunctionIR::inferTypes() {
             }
         };
         for (auto& kv : values_) uniquify(kv.second.type);
+    }
+    // WS3: export struct layouts recovered for call results so the emitter
+    // can name members on locals holding factory/allocator returns.  The
+    // layout attaches to the base of an address chain, which may be a copy
+    // of the call output rather than the output itself, so follow the
+    // provenance chain to the root before attributing.
+    callResultTypes_.clear();
+    std::map<SsaId, uint64_t> callOutputAddress;
+    for (const SsaBlock& block : blocks_)
+        for (const SsaOp& op : block.ops)
+            if ((op.op == POp::CALL || op.op == POp::CALLIND) &&
+                op.output)
+                callOutputAddress[op.output] = op.address;
+    for (const auto& kv : values_) {
+        const DataType& type = kv.second.type;
+        if (type.kind != TypeKind::POINTER || !type.detail ||
+            !type.detail->elementType)
+            continue;
+        const DataType& element = *type.detail->elementType;
+        if (element.kind != TypeKind::STRUCT &&
+            element.kind != TypeKind::UNION)
+            continue;
+        SsaId root = kv.first;
+        for (int hop = 0; hop < 16; ++hop) {
+            const auto pit = provenance.find(root);
+            if (pit == provenance.end()) break;
+            root = pit->second.first;
+        }
+        const auto callIt = callOutputAddress.find(root);
+        if (callIt == callOutputAddress.end()) continue;
+        callResultTypes_.emplace(callIt->second, element);
     }
 }
 
@@ -2167,6 +2241,7 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
         analyzed.blocks = ir.blocks().size();
         analyzed.phiNodes = ir.phiCount();
         analyzed.liveOperations = ir.liveOpCount();
+        analyzed.callResultTypes = ir.callResultTypes();
         analyzed.complete = true;
         size_t indirectCalls = 0;
         bool hasSystemCall = false;
@@ -2479,7 +2554,22 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                 // dispatchers keep their return: decompileTyped promotes
                 // them back to a 64-bit value (the dispatch forwards rax),
                 // and a cross-unit void downgrade would conflict with it.
-                if (kv.second.sites > 0 && !kv.second.anyReturnValue &&
+                // The inverse direction upgrades a void callee when callers
+                // consume its result: import thunks and tail-jump wrappers
+                // recover void from their body alone (a bare jump has no
+                // explicit return value), but a caller binding the result
+                // is definitive evidence the value exists.  A dereferenced
+                // result upgrades straight to a pointer.
+                if (kv.second.sites > 0 && kv.second.anyReturnValue &&
+                    sig.returnType.kind == TypeKind::VOID_TYPE &&
+                    !tailDispatchers.count(kv.first)) {
+                    sig.returnType = kv.second.returnDereferenced
+                        ? DataType{TypeKind::POINTER, 64, 1}
+                        : DataType{TypeKind::UNSIGNED_INT, 64, 1};
+                    if (sig.returnComponents.size() == 1)
+                        sig.returnComponents[0] = sig.returnType;
+                    changed = true;
+                } else if (kv.second.sites > 0 && !kv.second.anyReturnValue &&
                     !tailDispatchers.count(kv.first) &&
                     (sig.returnType.kind == TypeKind::UNSIGNED_INT ||
                      sig.returnType.kind == TypeKind::SIGNED_INT ||
@@ -2589,6 +2679,10 @@ std::string ProgramAnalysis::decompileFunction(const Program& program,
         if (callee && callee->complete)
             output << callee->signature.declaration(callee->function.name) << ";\n";
     }
+    // WS3: struct layouts recovered for this function's own call results.
+    // The emitter names members through explicit casts, which need the
+    // complete type visible before the body.
+    for (const auto& kv : analyzed->callResultTypes) emitType(kv.second);
     if (!analyzed->callees.empty()) output << "\n";
     // WS3: member accessors for pointer parameters whose recovered type
     // carries a struct layout.  The emitter rewrites entry-block
@@ -2616,7 +2710,12 @@ std::string ProgramAnalysis::decompileFunction(const Program& program,
     output << decompileTyped(engine, read, address, end, architecture_,
                              analyzed->function.name, analyzed->signature,
                              nameOf, signatureOf, false, nullptr, nullptr,
-                             nullptr, fieldAccessors.empty() ? nullptr : &fieldAccessors);
+                             nullptr,
+                             fieldAccessors.empty() ? nullptr
+                                                    : &fieldAccessors,
+                             analyzed->callResultTypes.empty()
+                                 ? nullptr
+                                 : &analyzed->callResultTypes);
     return output.str();
 }
 

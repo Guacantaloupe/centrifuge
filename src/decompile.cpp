@@ -2301,6 +2301,18 @@ public:
     // register: the paramK CExpr carries a registerRef, so regExpr
     // invalidates it at the next read expression.
     std::map<uint64_t, int> paramCopies;
+    // WS3: struct layouts of call results (call instruction address ->
+    // aggregate type), consulted when a call returns to type the result
+    // register for member-access naming.
+    const std::map<uint64_t, DataType>* callResultTypes = nullptr;
+    // Registers currently holding a call result with a recovered struct
+    // layout (storage -> aggregate type).  Like paramCopies, entries must
+    // survive unrelated reads and die on rewrite/call boundaries.
+    std::map<uint64_t, DataType> callResultStructs;
+    // Stash for the call-result association until the return register's
+    // pending write flushes (erase-then-record in the flush loop would
+    // otherwise drop it immediately).
+    std::map<uint64_t, DataType> pendingCallStructs;
     // WS3: when a LOAD/STORE address is an untouched incoming-parameter
     // register plus a constant displacement, and the recovered parameter
     // type carries a member at that offset whose width matches the
@@ -2308,7 +2320,8 @@ public:
     // instead of *(T *)(base + K).  Empty string keeps the raw cast form.
     std::string memberAccess(const PcodeInsn& pi, uint64_t addrId,
                              int valueSize) const {
-        if (!fieldAccessors || !entryBlock) return {};
+        if (!fieldAccessors && callResultStructs.empty()) return {};
+        if (!entryBlock && callResultStructs.empty()) return {};
         const Varnode* v = pi.find(addrId);
         if (!v) return {};
         uint64_t baseReg = 0;
@@ -2343,35 +2356,55 @@ public:
         } else {
             return {};
         }
-        // Members are only recovered at non-negative offsets.  The base
-        // register names an incoming parameter either directly (untouched
+        // Members are only recovered at non-negative offsets.  Parameter
+        // bases name an incoming parameter either directly (untouched
         // entry-block read renders as paramK) or through a plain copy
-        // (`ret_val = paramK`) whose block-local definition text is the
-        // bare token - in both cases the access attributes to that
-        // parameter's recovered layout.
+        // (`reg = paramK`); both forms only exist in the entry block.
+        // Call-result bases render through an explicit cast and work in
+        // any block of this emitter's window.
         if (disp < 0) return {};
+        const auto csit0 = callResultStructs.find(baseReg);
         const auto pit = paramIndex.find(baseReg);
-        if (pit == paramIndex.end()) {
+        if (pit == paramIndex.end() && csit0 == callResultStructs.end()) {
             const auto cit = paramCopies.find(baseReg);
-            if (cit == paramCopies.end()) return {};
-            bool resolved = false;
+            if (cit == paramCopies.end() || !entryBlock ||
+                !fieldAccessors)
+                return {};
             for (const auto& kv : paramIndex)
                 if (kv.second == cit->second) {
-                    baseReg = kv.first;
-                    resolved = true;
-                    break;
+                    const auto it =
+                        fieldAccessors->find({kv.first, disp});
+                    if (it == fieldAccessors->end()) return {};
+                    if (it->second.second != valueSize * 8) return {};
+                    return "param" + std::to_string(cit->second) + "->" +
+                           it->second.first;
                 }
-            if (!resolved) return {};
-        } else if (paramDefined.count(baseReg)) {
             return {};
         }
-        const auto it = fieldAccessors->find({baseReg, disp});
-        if (it == fieldAccessors->end()) return {};
-        if (it->second.second != valueSize * 8) return {};
-        for (const auto& kv : paramIndex)
-            if (kv.first == baseReg)
-                return "param" + std::to_string(kv.second) + "->" +
-                       it->second.first;
+        if (pit != paramIndex.end()) {
+            if (!entryBlock || paramDefined.count(baseReg) ||
+                !fieldAccessors)
+                return {};
+            const auto it = fieldAccessors->find({baseReg, disp});
+            if (it == fieldAccessors->end()) return {};
+            if (it->second.second != valueSize * 8) return {};
+            return "param" + std::to_string(pit->second) + "->" +
+                   it->second.first;
+        }
+        const DataType& agg = csit0->second;
+        if (!agg.detail) return {};
+        std::map<std::string, int> usedNames;
+        for (const TypeField& f : agg.detail->fields) {
+            std::string nm = f.name;
+            const int seen = usedNames[nm]++;
+            if (seen > 0) nm += "_" + std::to_string(seen + 1);
+            if (static_cast<int64_t>(f.byteOffset) != disp) continue;
+            if (f.type.bits != valueSize * 8) return {};
+            const std::string kw =
+                agg.kind == TypeKind::UNION ? "union" : "struct";
+            return "((" + kw + " " + agg.detail->name + " *)" +
+                   registerName(architecture, baseReg, 8) + ")->" + nm;
+        }
         return {};
     }
     // True for data-segment slots whose value is a `jmp rax` trampoline
@@ -2600,12 +2633,30 @@ public:
         // been captured; no pre-call definition is valid for later inlining.
         regExpr.clear();
         paramCopies.clear();
+        callResultStructs.clear();
         regConst.clear();
         if (signature && signature->returnType.kind == TypeKind::VOID_TYPE)
             line(call + ";");
+        else if (signature &&
+                 signature->returnType.kind == TypeKind::POINTER)
+            // The recovered register locals are uint64_t; a pointer-returning
+            // callee needs an explicit conversion before the pending write
+            // to the return register lands in C.
+            pending.emplace_back(returnRegisterOffset(architecture),
+                                 CExpr{"(uint64_t)(" + call + ")", 8, false});
         else
             pending.emplace_back(returnRegisterOffset(architecture),
                                  CExpr{call, 8, false});
+        // WS3: when the caller's own analysis recovered a struct layout for
+        // this call's result, stash it for the return-register flush so the
+        // emitter can later name members on the local holding the result.
+        if (callResultTypes && signature &&
+            signature->returnType.kind != TypeKind::VOID_TYPE) {
+            const auto crt = callResultTypes->find(pi.addr);
+            if (crt != callResultTypes->end())
+                pendingCallStructs[returnRegisterOffset(architecture)] =
+                    crt->second;
+        }
         return true;
     }
 
@@ -2658,6 +2709,7 @@ public:
         pending.clear();
         regExpr.clear();
         paramCopies.clear();
+        callResultStructs.clear();
         if (entryBlock) {
             paramIndex.clear();
             paramDefined.clear();
@@ -2901,6 +2953,7 @@ public:
             // entry-parameter aliases. Conservatively forget all expressions.
             regExpr.clear();
             paramCopies.clear();
+            callResultStructs.clear();
             if (repeat) paramDefined.insert(8);
             if (operation == 1 || operation == 2 || operation == 4)
                 paramDefined.insert(48);
@@ -3080,6 +3133,7 @@ public:
                     }
                     regExpr.clear();
                     paramCopies.clear();
+                    callResultStructs.clear();
                     regConst.clear();
                     continue;
                 }
@@ -4958,6 +5012,13 @@ public:
             const uint64_t written = registerStorageOffset(
                 architecture, write.first, write.second.size);
             paramCopies.erase(written);
+            {
+                const auto pcs = pendingCallStructs.find(written);
+                if (pcs != pendingCallStructs.end()) {
+                    callResultStructs[written] = pcs->second;
+                    pendingCallStructs.erase(pcs);
+                }
+            }
             if (entryBlock && paramIndex.count(written))
                 paramDefined.insert(written);
             if (liveFlags && written >= 4096 && written <= 4101 &&
@@ -5263,6 +5324,199 @@ private:
     }
 };
 
+// WS3: recover struct layouts for locals/registers holding call results.
+// A direct call's result (ret_val) that is spilled into a local and then
+// dereferenced at constant offsets carries the same field evidence as a
+// pointer parameter.  The MidIR cannot attribute these accesses: the CALL
+// output is a temporary that never enters the post-call register state (the
+// ABI binding at the emitter is the only place the value exists), so the
+// accesses root at the spill slot instead of the call.  Collect the evidence
+// from the emitted text instead - track ret_val liveness and simple alias
+// copies line by line, gather *(T *)(X + K) accesses on aliased names per
+// call site, synthesize a struct per qualifying site, and rewrite the
+// accesses to ((struct S *)X)->field_K member form.
+std::string recoverCallResultMembers(std::string text,
+                                     const std::string& functionName) {
+    std::vector<std::string> lines;
+    {
+        std::istringstream in(text);
+        std::string ln;
+        while (std::getline(in, ln)) lines.push_back(ln);
+    }
+    if (lines.empty()) return text;
+
+    // Dereference forms the emitter produces for pointer arithmetic:
+    //   load:  (*(T *)(var + K))        or  (*(T *)(var))
+    //   store: *((T *)(var + K)) = v;   or  *((T *)(var)) = v;
+    static const std::regex derefRe(
+        R"(\*\s*(\()?\((u?int[0-9]+_t|void|char|float|double) \*\)\s*\(\s*([A-Za-z_]\w*)\s*(?:\+\s*(0[xX][0-9a-fA-F]+|[0-9]+))?\s*\))");
+    static const std::regex assignRe(R"(^\s*([A-Za-z_]\w*) = ([A-Za-z_]\w*);\s*$)");
+    static const std::regex callRe(
+        R"(^\s*ret_val = (?:\([^()]*\)\s*)?FUN_[0-9a-fA-F]+\()");
+
+    struct Site {
+        // offset -> C type of the access; std::map keeps offsets ordered and
+        // collapses repeated observations of one field.
+        std::map<uint64_t, std::string> fields;
+    };
+    std::vector<Site> sites;
+    // Alias state: identifier -> call-site index it currently holds.
+    std::map<std::string, size_t> alias;
+    // Call-site index ret_val currently holds (separate: ret_val is rebound
+    // by every call, not just by plain copies).
+    long retValSite = -1;
+    // Alias state snapshot at the start of each line, for the rewrite pass.
+    std::vector<std::map<std::string, size_t>> lineAlias(lines.size());
+    std::vector<long> lineRetValSite(lines.size(), -1);
+
+    auto widthOf = [](const std::string& type) -> int {
+        if (type == "void" || type == "double" || type == "uint64_t" ||
+            type == "int64_t")
+            return 64;
+        if (type == "float" || type.rfind("uint32_t", 0) == 0 ||
+            type.rfind("int32_t", 0) == 0)
+            return 32;
+        if (type.rfind("uint16_t", 0) == 0 || type.rfind("int16_t", 0) == 0)
+            return 16;
+        return 8;
+    };
+
+    for (size_t li = 0; li < lines.size(); ++li) {
+        const std::string& ln = lines[li];
+        // Gather field evidence before applying this line's assignments:
+        // dereferences on the right-hand side read the pre-line state.
+        // ret_val itself is looked up in its own liveness slot.
+        for (auto it = std::sregex_iterator(ln.begin(), ln.end(), derefRe);
+             it != std::sregex_iterator(); ++it) {
+            const std::string var = (*it)[3];
+            long site = -1;
+            if (var == "ret_val") {
+                site = retValSite;
+            } else {
+                const auto ait = alias.find(var);
+                if (ait != alias.end()) site = static_cast<long>(ait->second);
+            }
+            if (site < 0) continue;
+            uint64_t off = 0;
+            if ((*it)[4].matched)
+                off = std::stoull((*it)[4].str(), nullptr, 0);
+            sites[static_cast<size_t>(site)].fields.emplace(
+                off, (*it)[2].str());
+        }
+        lineAlias[li] = alias;
+        lineRetValSite[li] = retValSite;
+
+        std::smatch m;
+        const bool isCallLine = std::regex_search(ln, callRe);
+        if (isCallLine) {
+            sites.push_back(Site{});
+            retValSite = static_cast<long>(sites.size()) - 1;
+        }
+        if (std::regex_match(ln, m, assignRe)) {
+            const std::string lhs = m[1].str();
+            const std::string rhs = m[2].str();
+            if (lhs == "ret_val") {
+                const auto ait = alias.find(rhs);
+                retValSite = ait != alias.end()
+                                 ? static_cast<long>(ait->second)
+                                 : -1;
+            } else if (rhs == "ret_val") {
+                if (retValSite >= 0)
+                    alias[lhs] = static_cast<size_t>(retValSite);
+                else
+                    alias.erase(lhs);
+            } else {
+                const auto ait = alias.find(rhs);
+                if (ait != alias.end())
+                    alias[lhs] = ait->second;
+                else
+                    alias.erase(lhs);
+            }
+        } else if (!isCallLine) {
+            // Any other write to ret_val kills its call-result identity.
+            const size_t first = ln.find_first_not_of(" \t");
+            if (first != std::string::npos &&
+                ln.compare(first, 9, "ret_val =") == 0)
+                retValSite = -1;
+        }
+    }
+
+    // Qualifying sites: at least two distinct fields, or a single wide
+    // (>128-bit) blit - the same threshold the parameter evidence path
+    // uses, so single narrow dereferences stay scalar.
+    std::map<size_t, std::string> siteNames;
+    for (size_t si = 0; si < sites.size(); ++si) {
+        const Site& site = sites[si];
+        if (site.fields.empty()) continue;
+        int maxBits = 0;
+        for (const auto& kv : site.fields) maxBits = std::max(maxBits, widthOf(kv.second));
+        if (site.fields.size() < 2 && maxBits <= 128) continue;
+        std::string base = functionName;
+        for (char& c : base)
+            if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+        siteNames[si] = "recovered_callret_" + base + "_" +
+                        std::to_string(si);
+    }
+
+    // Rewrite accesses on aliased names to member form.
+    for (size_t li = 0; li < lines.size(); ++li) {
+        std::string& ln = lines[li];
+        std::string rebuilt;
+        size_t last = 0;
+        bool changed = false;
+        for (auto it = std::sregex_iterator(ln.begin(), ln.end(), derefRe);
+             it != std::sregex_iterator(); ++it) {
+            const std::string var = (*it)[3];
+            long site = -1;
+            if (var == "ret_val") {
+                site = lineRetValSite[li];
+            } else {
+                const auto ait = lineAlias[li].find(var);
+                if (ait != lineAlias[li].end())
+                    site = static_cast<long>(ait->second);
+            }
+            if (site < 0 || !siteNames.count(static_cast<size_t>(site)))
+                continue;
+            uint64_t off = 0;
+            if ((*it)[4].matched)
+                off = std::stoull((*it)[4].str(), nullptr, 0);
+            rebuilt += ln.substr(last, it->position() - last);
+            rebuilt += "((struct " +
+                       siteNames[static_cast<size_t>(site)] + " *)" + var +
+                       ")->field_" + std::to_string(off);
+            // The wrapped store form *((T *)(V + K)) carries one closing
+            // paren beyond the address group; consume it so the splice
+            // stays balanced.
+            size_t consumed = it->length();
+            if ((*it)[1].matched) ++consumed;
+            last = it->position() + consumed;
+            changed = true;
+        }
+        if (changed) {
+            rebuilt += ln.substr(last);
+            ln = rebuilt;
+        }
+    }
+
+    // Emit the synthesized layouts right after the opening brace so the
+    // member accesses below always see a complete type.
+    std::ostringstream out;
+    for (size_t li = 0; li < lines.size(); ++li) {
+        out << lines[li] << "\n";
+        if (li == 0 && lines[0].find('{') != std::string::npos) {
+            for (const auto& kv : siteNames) {
+                const Site& site = sites[kv.first];
+                out << "    struct " << kv.second << " {\n";
+                for (const auto& field : site.fields)
+                    out << "        " << field.second << " field_"
+                        << field.first << ";\n";
+                out << "    };\n";
+            }
+        }
+    }
+    return out.str();
+}
+
 } // namespace
 
 std::string decompile(
@@ -5276,7 +5530,8 @@ std::string decompile(
     const GlobalObjectRecovery* globals,
     const std::function<bool(uint64_t)>& guardSlotOf,
     const std::string& entryName, const FunctionSignature* callerSignature,
-    const FieldAccessorMap* fieldAccessors) {
+    const FieldAccessorMap* fieldAccessors,
+    const std::map<uint64_t, DataType>* callResultTypes) {
     CfgBuilder cfg;
     if (!cfg.build(eng, read, start, end)) return "// failed to build CFG\n";
 
@@ -5610,6 +5865,7 @@ std::string decompile(
                     body.signatureOf = signatureOf;
                     body.callerSignature = callerSignature;
                     body.fieldAccessors = fieldAccessors;
+                    body.callResultTypes = callResultTypes;
                     body.architecture = architecture;
                     body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -5653,6 +5909,7 @@ body.pushSlots = &pushSlots;
                 body.signatureOf = signatureOf;
                 body.callerSignature = callerSignature;
                 body.fieldAccessors = fieldAccessors;
+                body.callResultTypes = callResultTypes;
                 body.architecture = architecture;
                 body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -5744,6 +6001,7 @@ body.pushSlots = &pushSlots;
                         header.signatureOf = signatureOf;
                         header.callerSignature = callerSignature;
                         header.fieldAccessors = fieldAccessors;
+                        header.callResultTypes = callResultTypes;
                         header.architecture = architecture;
                         header.useRecoveredRuntime = useRecoveredRuntime;
                         header.stackModel = stackModel;
@@ -5802,6 +6060,7 @@ header.pushSlots = &pushSlots;
         be.signatureOf = signatureOf;
         be.callerSignature = callerSignature;
         be.fieldAccessors = fieldAccessors;
+        be.callResultTypes = callResultTypes;
         be.architecture = architecture;
         be.useRecoveredRuntime = useRecoveredRuntime;
                     be.stackModel = stackModel;
@@ -5851,6 +6110,7 @@ be.pushSlots = &pushSlots;
                 thenBody.signatureOf = signatureOf;
                 thenBody.callerSignature = callerSignature;
                 thenBody.fieldAccessors = fieldAccessors;
+                thenBody.callResultTypes = callResultTypes;
                 thenBody.architecture = architecture;
                 thenBody.useRecoveredRuntime = useRecoveredRuntime;
                     thenBody.stackModel = stackModel;
@@ -5878,6 +6138,7 @@ thenBody.pushSlots = &pushSlots;
                 elseBody.signatureOf = signatureOf;
                 elseBody.callerSignature = callerSignature;
                 elseBody.fieldAccessors = fieldAccessors;
+                elseBody.callResultTypes = callResultTypes;
                 elseBody.architecture = architecture;
                 elseBody.useRecoveredRuntime = useRecoveredRuntime;
                     elseBody.stackModel = stackModel;
@@ -5921,6 +6182,7 @@ elseBody.pushSlots = &pushSlots;
                 te.signatureOf = signatureOf;
                 te.callerSignature = callerSignature;
                 te.fieldAccessors = fieldAccessors;
+                te.callResultTypes = callResultTypes;
                 te.architecture = architecture;
                 te.useRecoveredRuntime = useRecoveredRuntime;
                     te.stackModel = stackModel;
@@ -6291,12 +6553,13 @@ std::string decompileTyped(
     bool useRecoveredRuntime, const StackFrameModel* stackModel,
     const GlobalObjectRecovery* globals,
     const std::function<bool(uint64_t)>& guardSlotOf,
-    const FieldAccessorMap* fieldAccessors) {
+    const FieldAccessorMap* fieldAccessors,
+    const std::map<uint64_t, DataType>* callResultTypes) {
     std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
                                  architecture, useRecoveredRuntime,
                                  stackModel, globals, guardSlotOf,
                                  /*entryName=*/"", &signature,
-                                 fieldAccessors);
+                                 fieldAccessors, callResultTypes);
     // A data-slot trampoline (indirect tail call) forwards the callee's
     // return value through rax, so it must never decompile to void: the
     // typed wrapper's void-return rewrite would turn the dispatch into a
@@ -6674,8 +6937,13 @@ std::string decompileTyped(
     // so dead synthesized stores ("rcx = 0;") disappear before the
     // binding's keep-or-drop decision; stack-pointer bookkeeping is
     // simplified last so folded pushes can pair up with the restore.
+    // Call-result member recovery runs on the folded text: it tracks
+    // ret_val liveness and alias copies to attribute spilled call-result
+    // dereferences, which the MidIR cannot see (the CALL output never
+    // enters post-call register state).
     return simplifyStackPointer(collapseAbiPrologue(
-        propagateLocalConstants(foldAssignBeforeReturn(out.str())),
+        propagateLocalConstants(recoverCallResultMembers(
+            foldAssignBeforeReturn(out.str()), functionName)),
         architecture, effectiveSignature));
 }
 

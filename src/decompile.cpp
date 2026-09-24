@@ -1121,6 +1121,170 @@ std::string foldAssignBeforeReturn(const std::string& body) {
     return out.str();
 }
 
+// Collapse the ABI prologue hop the typed wrapper synthesizes
+// ("rdi = (uint64_t)arg0;") by propagating the parameter name into the
+// register's straight-line window and deleting the binding.  The window
+// closes at the register's first re-store, at any brace boundary (a
+// conditional redefinition may not execute), and at any label that is the
+// target of a goto somewhere in the function (a backward edge can re-enter
+// the window with the register redefined).  Register declarations left
+// without a single reference afterwards are pruned.
+std::string collapseAbiPrologue(std::string text, const std::string& architecture,
+                                const FunctionSignature& sig) {
+    struct Binding { std::string spelling; std::string reg; std::string param; };
+    std::vector<Binding> bindings;
+    for (const FunctionParameter& p : sig.parameters) {
+        if (p.onStack) continue;
+        const std::string reg = registerName(architecture, p.registerOffset, 8);
+        const bool already64 =
+            (p.type.kind == TypeKind::UNSIGNED_INT ||
+             p.type.kind == TypeKind::SIGNED_INT) && p.type.bits == 64;
+        const bool signedNarrow =
+            p.type.kind == TypeKind::SIGNED_INT && p.type.bits < 64;
+        const std::string cast = already64 ? ""
+            : signedNarrow ? "(uint64_t)(uintptr_t)" : "(uint64_t)";
+        bindings.push_back({reg + " = " + cast + p.name + ";", reg, p.name});
+    }
+    if (bindings.empty()) return text;
+    std::vector<std::string> lines;
+    {
+        std::istringstream in(text);
+        std::string ln;
+        while (std::getline(in, ln)) lines.push_back(ln);
+    }
+    const auto ltrim = [](const std::string& s) {
+        const size_t a = s.find_first_not_of(" \t");
+        return a == std::string::npos ? std::string() : s.substr(a);
+    };
+    const auto matchStore = [](const std::string& raw, std::string& var,
+                               std::string& rhs) {
+        const size_t start = raw.find_first_not_of(" \t");
+        if (start == std::string::npos) return false;
+        const std::string t = raw.substr(start);
+        const size_t eq = t.find(" = ");
+        if (eq == std::string::npos || t.back() != ';') return false;
+        var = t.substr(0, eq);
+        if (var.empty() ||
+            !std::all_of(var.begin(), var.end(), [](char c) {
+                return std::isalnum(static_cast<unsigned char>(c)) ||
+                       c == '_';
+            }))
+            return false;
+        rhs = t.substr(eq + 3, t.size() - 1 - (eq + 3));
+        return true;
+    };
+    const auto containsId = [](const std::string& s, const std::string& id) {
+        size_t at = 0;
+        while ((at = s.find(id, at)) != std::string::npos) {
+            const bool lb = at == 0 ||
+                !(std::isalnum(static_cast<unsigned char>(s[at - 1])) ||
+                  s[at - 1] == '_');
+            const size_t end = at + id.size();
+            const bool rb = end >= s.size() ||
+                !(std::isalnum(static_cast<unsigned char>(s[end])) ||
+                  s[end] == '_');
+            if (lb && rb) return true;
+            at = end;
+        }
+        return false;
+    };
+    std::set<std::string> targeted;
+    for (const std::string& ln : lines) {
+        const std::string t = ltrim(ln);
+        if (t.rfind("goto ", 0) == 0 && t.back() == ';')
+            targeted.insert(t.substr(5, t.size() - 6));
+    }
+    // Locate binding lines; they only exist in the prologue, before the
+    // first body label.
+    std::vector<std::pair<size_t, const Binding*>> found;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string t = ltrim(lines[i]);
+        if (t.rfind("L0x", 0) == 0 && t.back() == ':') break;
+        for (const Binding& b : bindings)
+            if (t == b.spelling) {
+                found.push_back({i, &b});
+                break;
+            }
+    }
+    if (found.empty()) return text;
+    for (const auto& kv : found) {
+        const Binding& b = *kv.second;
+        for (size_t j = kv.first + 1; j < lines.size(); ++j) {
+            const std::string u = ltrim(lines[j]);
+            if (u.rfind("L0x", 0) == 0 && u.back() == ':') {
+                if (targeted.count(u.substr(0, u.size() - 1))) break;
+                continue;
+            }
+            if (u.find('{') != std::string::npos ||
+                u.find('}') != std::string::npos) break;
+            std::string v2, r2;
+            if (matchStore(lines[j], v2, r2) && v2 == b.reg) break;
+            lines[j] = replaceIdentifier(lines[j], b.reg, b.param);
+        }
+        lines[kv.first].clear();
+    }
+    // Prune identifiers from plain "uint64_t a = 0, b = 0;" declaration
+    // lines that no longer appear anywhere else in the function.
+    std::ostringstream joined;
+    for (const std::string& l : lines)
+        if (!l.empty()) joined << l << "\n";
+    const std::string whole = joined.str();
+    for (std::string& l : lines) {
+        const std::string indent = l.substr(0, l.find_first_not_of(" \t"));
+        const std::string t = ltrim(l);
+        if (t.rfind("uint64_t ", 0) != 0 || t.back() != ';') continue;
+        const std::string rest = t.substr(9, t.size() - 10);
+        std::vector<std::pair<std::string, bool>> items; // name, hadInit
+        size_t pos = 0;
+        bool malformed = false;
+        while (pos <= rest.size()) {
+            size_t comma = rest.find(", ", pos);
+            const std::string item = rest.substr(
+                pos, comma == std::string::npos ? std::string::npos
+                                                : comma - pos);
+            const size_t eqz = item.find(" = 0");
+            const bool hadInit = eqz != std::string::npos;
+            const std::string name = hadInit ? item.substr(0, eqz) : item;
+            if (name.empty() ||
+                !std::all_of(name.begin(), name.end(), [](char c) {
+                    return std::isalnum(static_cast<unsigned char>(c)) ||
+                           c == '_';
+                })) {
+                malformed = true;
+                break;
+            }
+            items.push_back({name, hadInit});
+            if (comma == std::string::npos) break;
+            pos = comma + 2;
+        }
+        if (malformed) continue;
+        // Usage check against every OTHER line.
+        std::ostringstream others;
+        for (const std::string& o : lines)
+            if (&o != &l && !o.empty()) others << o << "\n";
+        const std::string elsewhere = others.str();
+        std::vector<std::pair<std::string, bool>> kept;
+        for (const auto& item : items)
+            if (containsId(elsewhere, item.first)) kept.push_back(item);
+        if (kept.size() == items.size()) continue;
+        if (kept.empty()) {
+            l.clear();
+            continue;
+        }
+        std::ostringstream rebuilt;
+        rebuilt << indent << "uint64_t ";
+        for (size_t i = 0; i < kept.size(); ++i)
+            rebuilt << (i ? ", " : "") << kept[i].first
+                    << (kept[i].second ? " = 0" : "");
+        rebuilt << ";";
+        l = rebuilt.str();
+    }
+    std::ostringstream out;
+    for (const std::string& l : lines)
+        if (!l.empty()) out << l << "\n";
+    return out.str();
+}
+
 // Drop a store to a plain scalar when a later store to the same
 // variable in the same basic block overwrites it before any read.
 // "Same basic block" is established textually: the scan stops at label
@@ -5566,6 +5730,47 @@ std::string decompileTyped(
                 return registerName(architecture, offset, 8);
         return role;
     };
+    // Bind raw incoming-argument reads (paramN tokens emitted for
+    // entry-block register reads before any definition) to the real
+    // signature parameter names, and drop the evidence comment.  A slot
+    // whose read survived but whose parameter inferSignature dropped gets
+    // a synthetic parameter so the output stays compilable.
+    {
+        // Drop the evidence comment FIRST: it spells every slot
+        // ("param1=rdi, ...") and would otherwise fake reads for all of
+        // them.
+        std::istringstream in(body);
+        std::ostringstream cleaned;
+        std::string ln;
+        while (std::getline(in, ln)) {
+            const size_t first = ln.find_first_not_of(" \t");
+            if (first != std::string::npos &&
+                ln.compare(first, 10, "// params:") == 0)
+                continue;
+            cleaned << ln << "\n";
+        }
+        body = cleaned.str();
+        const auto argRegs = defaultArgumentRegisters(architecture);
+        for (size_t i = 0; i < argRegs.size(); ++i) {
+            const std::string token = "param" + std::to_string(i + 1);
+            if (body.find(token) == std::string::npos) continue;
+            std::string target;
+            for (const FunctionParameter& p : effectiveSignature.parameters)
+                if (!p.onStack && p.registerOffset == argRegs[i]) {
+                    target = p.name;
+                    break;
+                }
+            if (target.empty()) {
+                FunctionParameter synth;
+                synth.name = "arg" + std::to_string(i);
+                synth.registerOffset = argRegs[i];
+                synth.type = DataType{TypeKind::UNSIGNED_INT, 64, 1};
+                target = synth.name;
+                effectiveSignature.parameters.push_back(synth);
+            }
+            body = replaceIdentifier(body, token, target);
+        }
+    }
     if (effectiveSignature.returnType.kind == TypeKind::VOID_TYPE &&
         (body.find("return recovered_dispatch(") != std::string::npos ||
          body.find("return ((uint64_t (*)(...))") !=
@@ -5859,7 +6064,11 @@ std::string decompileTyped(
     // still read "return <machine-reg>;" here - void, pointer, and
     // multi-component struct returns were already rewritten, and a bare
     // expression cannot stand in for those.
-    return foldAssignBeforeReturn(out.str());
+    // The ABI prologue hop is collapsed last of all: the binding lines it
+    // propagates through are synthesized by this wrapper, so they only
+    // exist in the fully assembled text.
+    return collapseAbiPrologue(foldAssignBeforeReturn(out.str()), architecture,
+                               effectiveSignature);
 }
 
 } // namespace centrifuge

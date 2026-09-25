@@ -125,6 +125,16 @@ it to **symbolic values** (expression trees over registers/memory):
   `/* symbolic: probe returns in [0x0, 0x1] (2 explored returns) */`.
   The call statement itself is preserved (summaries cover returns, not
   side effects).  `SYMSUM_DUMP=1` prints the harvested table.
+- Symbolic value range propagation (WS7): at every symbolic conditional
+  fork the engine now structurally evaluates the condition operand
+  intervals through the expression tree (each input byte starts as
+  [0,255]; the eval stays precise through arithmetic and wraps to the
+  full width when it cannot), merged across all explored evaluations of
+  that branch.  On a complete run the emitter quotes the propagated
+  range above the emitted conditional, e.g.
+  `/* symbolic: condition operand in [0, 1] compared to [0, 0] over 1
+  explored evaluation(s) */` - real range evidence for the recovered
+  comparison (bitwise-and with 1 really is [0,1]), not a semantic change.
 
 Still open: state merging (item 5), CMOV/select concretization in the
 executor (limits coverage of register-indirect dispatches selected by

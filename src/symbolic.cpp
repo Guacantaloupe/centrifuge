@@ -1419,6 +1419,7 @@ public:
                   });
         res.coverage.outcomes = branchOutcomes_;
         res.coverage.visitedPcs = visitedPcs_;
+        res.coverage.condRanges = condRanges_;
         for (const auto& kv : retObs_) {
             CallReturnSummary s;
             s.callAddr = kv.first;
@@ -1694,6 +1695,47 @@ private:
                         branchOutcomes_[curPc] |= 1u;
                     }
                 } else if (dv && dv->kind == Varnode::CONST) {
+                    // Symbolic value range propagation: structurally
+                    // evaluate the condition's operand interval (input
+                    // bytes start as [0,255]; the eval walks the
+                    // expression tree and wraps to the full width when it
+                    // can no longer stay precise) and merge it into the
+                    // per-branch table.  This is what the decompiler
+                    // quotes as range evidence at the emitted conditional.
+                    {
+                        CondRangeInfo& ri = condRanges_[curPc];
+                        const Domains freeDom;  // every input byte [0,255]
+                        if (cond->kind == NK::Cmp) {
+                            ri.isCmp = true;
+                            const Interval l = ivEval(cond->a, freeDom);
+                            const Interval r = ivEval(cond->b, freeDom);
+                            if (!l.empty && !r.empty) {
+                                if (ri.evaluations == 0) {
+                                    ri.lo = l.lo;
+                                    ri.hi = l.hi;
+                                    ri.rhsLo = r.lo;
+                                    ri.rhsHi = r.hi;
+                                } else {
+                                    ri.lo = std::min(ri.lo, l.lo);
+                                    ri.hi = std::max(ri.hi, l.hi);
+                                    ri.rhsLo = std::min(ri.rhsLo, r.lo);
+                                    ri.rhsHi = std::max(ri.rhsHi, r.hi);
+                                }
+                            }
+                        } else {
+                            const Interval l = ivEval(cond, freeDom);
+                            if (!l.empty) {
+                                if (ri.evaluations == 0) {
+                                    ri.lo = l.lo;
+                                    ri.hi = l.hi;
+                                } else {
+                                    ri.lo = std::min(ri.lo, l.lo);
+                                    ri.hi = std::max(ri.hi, l.hi);
+                                }
+                            }
+                        }
+                        ++ri.evaluations;
+                    }
                     // Fork on the symbolic condition.
                     SymState taken = st;
                     taken.constraints = st.constraints;
@@ -2216,6 +2258,9 @@ private:
     // every pc any state executed.
     std::map<uint64_t, unsigned> branchOutcomes_;
     std::set<uint64_t> visitedPcs_;
+    // Per-branch condition-operand intervals (see BranchCoverage::condRanges
+    // in symbolic.hpp), merged over every explored evaluation.
+    std::map<uint64_t, CondRangeInfo> condRanges_;
     bool exploreMode_ = false;
 };
 

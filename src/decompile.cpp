@@ -6603,6 +6603,30 @@ be.pushSlots = &pushSlots;
                 return;
             }
         }
+        // WS7 symbolic range propagation: quote the interval the engine
+        // propagated for the condition's operand(s) at conditionals that
+        // survived the fold above (both directions explored).  The comment
+        // is range evidence for the reader - no semantics change.
+        if (symCoverage && symCoverage->complete &&
+            symCoverage->condRanges && term->kind == Insn::JCC &&
+            term->targetKnown && b->succs.size() == 2) {
+            const auto cr = symCoverage->condRanges->find(term->addr);
+            if (cr != symCoverage->condRanges->end() &&
+                cr->second.evaluations > 0) {
+                std::string note = "/* symbolic: condition operand in [" +
+                                   std::to_string(cr->second.lo) + ", " +
+                                   std::to_string(cr->second.hi) + "]";
+                if (cr->second.isCmp)
+                    note += " compared to [" +
+                            std::to_string(cr->second.rhsLo) + ", " +
+                            std::to_string(cr->second.rhsHi) + "]";
+                note += " over " +
+                        std::to_string(cr->second.evaluations) +
+                        " explored evaluation(s) */";
+                for (int i = 0; i <= depth; ++i) out << "    ";
+                out << note << "\n";
+            }
+        }
         // WS7 switch recovery: an indirect branch covered by a recovered
         // jump table (static image scan and/or symbolic-exploration
         // targets) restructures into a C switch.  The case bodies are

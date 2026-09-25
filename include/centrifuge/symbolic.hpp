@@ -83,9 +83,25 @@ struct IndirectSite {
 // state executed.  Coverage is an under-approximation of real behavior:
 // unobserved directions/blocks are dead code evidence, not proof, and are
 // only safe to act on when the run completed without budget exhaustion.
+struct CondRangeInfo {
+    uint64_t lo = 0, hi = 0;        // merged unsigned interval of the
+                                    // condition's left operand (or of the
+                                    // condition itself when not a compare)
+    uint64_t rhsLo = 0, rhsHi = 0;  // right-operand interval when isCmp
+    uint64_t evaluations = 0;       // explored evaluations merged
+    bool isCmp = false;             // condition was a comparison node
+};
+
 struct BranchCoverage {
     std::map<uint64_t, unsigned> outcomes;  // branch addr -> bit0 fall, bit1 taken
     std::set<uint64_t> visitedPcs;
+    // Symbolic value range propagation: per conditional-branch address, the
+    // interval of the branch condition's operand(s) structurally propagated
+    // through the symbolic expression (input bytes start as [0, 255] each),
+    // merged over every explored evaluation at that branch.  An
+    // under-approximation like `outcomes` - sound to quote only on a
+    // complete run.
+    std::map<uint64_t, CondRangeInfo> condRanges;
 };
 
 // Cross-function return-value summary for one call site, harvested while

@@ -48,9 +48,22 @@ using SymIndirectSites = std::map<uint64_t, SymIndirectSiteInfo>;
 // fold.  `visitedPcs` lets the emitter mark blocks no explored state ever
 // reached.  Both are under-approximations, so `complete` gates on the
 // exploration run having finished without budget exhaustion.
+// Symbolic value-range evidence for one conditional branch address (see
+// symbolic.hpp CondRangeInfo): the interval the symbolic engine
+// structurally propagated for the condition's operand(s), merged over the
+// explored evaluations.  Quoted as an annotation at the emitted
+// conditional on complete runs only.
+struct SymCondRangeInfo {
+    uint64_t lo = 0, hi = 0;
+    uint64_t rhsLo = 0, rhsHi = 0;
+    uint64_t evaluations = 0;
+    bool isCmp = false;
+};
+
 struct SymBranchCoverage {
     const std::map<uint64_t, unsigned>* outcomes = nullptr;
     const std::set<uint64_t>* visitedPcs = nullptr;
+    const std::map<uint64_t, SymCondRangeInfo>* condRanges = nullptr;
     bool complete = false;
 };
 

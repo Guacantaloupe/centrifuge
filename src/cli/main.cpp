@@ -926,6 +926,7 @@ int cmdSpec(int argc, char** argv) {
         // and blocks no state reached are annotated.
         SymIndirectSites symSites;
         SymBranchCoverage symCoverage;
+        std::map<uint64_t, SymCondRangeInfo> symCondRanges;
         std::vector<SymCallSummaryInfo> symCallSummaries;
         // Must outlive the decompile call below: the coverage struct hands
         // out pointers into the explore result's maps.
@@ -944,6 +945,18 @@ int cmdSpec(int argc, char** argv) {
                     SymIndirectSiteInfo{site.isCall, site.targets};
             symCoverage.outcomes = &symRes.coverage.outcomes;
             symCoverage.visitedPcs = &symRes.coverage.visitedPcs;
+            for (const auto& kv : symRes.coverage.condRanges) {
+                SymCondRangeInfo info;
+                info.lo = kv.second.lo;
+                info.hi = kv.second.hi;
+                info.rhsLo = kv.second.rhsLo;
+                info.rhsHi = kv.second.rhsHi;
+                info.evaluations = kv.second.evaluations;
+                info.isCmp = kv.second.isCmp;
+                symCondRanges[kv.first] = info;
+            }
+            if (!symCondRanges.empty())
+                symCoverage.condRanges = &symCondRanges;
             // Coverage only proves absence when the run finished without
             // budget exhaustion ("exploration complete (...)"; prune-based
             // early exits make unobserved directions merely "unknown").
@@ -987,6 +1000,17 @@ int cmdSpec(int argc, char** argv) {
                 for (const auto& kv : symRes.coverage.outcomes)
                     std::fprintf(stderr, "//   branch 0x%llx outcomes=0x%x\n",
                                  (unsigned long long)kv.first, kv.second);
+                for (const auto& kv : symRes.coverage.condRanges)
+                    std::fprintf(stderr,
+                                 "//   branch 0x%llx range [%llu, %llu]"
+                                 "%s [%llu, %llu] x %llu eval(s)\n",
+                                 (unsigned long long)kv.first,
+                                 (unsigned long long)kv.second.lo,
+                                 (unsigned long long)kv.second.hi,
+                                 kv.second.isCmp ? " vs" : "",
+                                 (unsigned long long)kv.second.rhsLo,
+                                 (unsigned long long)kv.second.rhsHi,
+                                 (unsigned long long)kv.second.evaluations);
                 std::fprintf(stderr, "//   visited: %zu pcs\n",
                              symRes.coverage.visitedPcs.size());
             }

@@ -95,6 +95,16 @@ it to **symbolic values** (expression trees over registers/memory):
   native-subsystem entry named `DriverEntry`, ~50 ntoskrnl/hal import
   prototypes (IoCreateDevice, ExAllocatePool2, Rtl*, Ke*, Mm*, HAL port I/O).
 
+- Decompiler analysis engine (WS7): the exploration run now also records
+  branch-direction coverage (per-branch bitmask of executed successors) and
+  the set of visited pcs.  `decompile-native --sym-explore` uses it for
+  unreachable-branch elimination: a conditional observed in only one
+  direction emits that direction directly with a `/* symbolic: branch
+  always ... */` annotation and the dead arm disappears; blocks no explored
+  state reached are annotated too.  Gated on a complete run (budget
+  exhaustion disables elimination, since unobserved then means "unknown",
+  not "dead").
+
 Still open: state merging (item 5), switch structuring from multi-target
 jump sites, CMOV/select concretization in the executor (limits coverage of
 register-indirect dispatches selected by cmov).

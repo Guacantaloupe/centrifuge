@@ -841,11 +841,14 @@ int cmdSpec(int argc, char** argv) {
         std::vector<std::string> positional;
         bool symExplore = false;
         ReachOptions symOpt;
+        bool symStartGiven = false;
         for (int i = 6; i < argc; ++i) {
             const std::string a = argv[i];
             if (a == "--sym-explore") symExplore = true;
-            else if (a == "--sym-start" && i + 1 < argc)
+            else if (a == "--sym-start" && i + 1 < argc) {
                 symOpt.startAddress = std::stoull(argv[++i], nullptr, 0);
+                symStartGiven = true;
+            }
             else if (a == "--stdin" && i + 1 < argc) {
                 symOpt.symbolicStdin = true;
                 symOpt.stdinLength = std::stoull(argv[++i], nullptr, 0);
@@ -917,22 +920,50 @@ int cmdSpec(int argc, char** argv) {
             if (s.isFunction && s.addr == addr) { entryName = s.name; break; }
         // WS6 symbolic-assisted decompilation: bounded symbolic exploration
         // resolves indirect call sites; single-target sites devirtualize
-        // into direct named calls in the output below.
+        // into direct named calls in the output below.  The same run's
+        // branch-direction coverage feeds unreachable-branch elimination:
+        // conditionals observed in only one direction lose their dead arm,
+        // and blocks no state reached are annotated.
         SymIndirectSites symSites;
+        SymBranchCoverage symCoverage;
+        // Must outlive the decompile call below: the coverage struct hands
+        // out pointers into the explore result's maps.
+        IndirectExploreResult symRes;
         if (symExplore) {
-            if (!symOpt.startAddress) symOpt.startAddress = addr;
-            const auto res = exploreIndirectTargets(*eng, *prog, symOpt);
+            // No explicit --sym-start: leave the start at 0 so the engine
+            // resolves it (main symbol first, which also seeds the argc /
+            // symbolic-argv model, then the entry point) instead of
+            // pinning it to the decompile target.
+            if (!symStartGiven) symOpt.startAddress = 0;
+            symRes = exploreIndirectTargets(*eng, *prog, symOpt);
             std::fprintf(stderr, "// sym-explore: %s; %zu site(s)\n",
-                         res.reason.c_str(), res.sites.size());
-            for (const auto& site : res.sites)
+                         symRes.reason.c_str(), symRes.sites.size());
+            for (const auto& site : symRes.sites)
                 symSites[site.addr] =
                     SymIndirectSiteInfo{site.isCall, site.targets};
+            symCoverage.outcomes = &symRes.coverage.outcomes;
+            symCoverage.visitedPcs = &symRes.coverage.visitedPcs;
+            // Coverage only proves absence when the run finished without
+            // budget exhaustion ("exploration complete (...)"; prune-based
+            // early exits make unobserved directions merely "unknown").
+            symCoverage.complete =
+                symRes.reason.rfind("exploration complete", 0) == 0;
+            if (std::getenv("SYMCOV_DUMP")) {
+                std::fprintf(stderr, "// sym-coverage: complete=%d\n",
+                             (int)symCoverage.complete);
+                for (const auto& kv : symRes.coverage.outcomes)
+                    std::fprintf(stderr, "//   branch 0x%llx outcomes=0x%x\n",
+                                 (unsigned long long)kv.first, kv.second);
+                std::fprintf(stderr, "//   visited: %zu pcs\n",
+                             symRes.coverage.visitedPcs.size());
+            }
         }
         std::printf("%s", decompile(*eng, reader, addr, end, nameOf,
                                      signatureOf, arch, false, &model,
                                      &globals, nullptr, entryName, nullptr,
                                      nullptr, nullptr, nullptr,
-                                     symSites.empty() ? nullptr : &symSites)
+                                     symSites.empty() ? nullptr : &symSites,
+                                     symExplore ? &symCoverage : nullptr)
                         .c_str());
         return 0;
     }

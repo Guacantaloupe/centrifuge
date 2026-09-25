@@ -11,7 +11,9 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -72,11 +74,30 @@ struct IndirectSite {
     std::vector<uint64_t> targets;  // concrete targets, sorted ascending
 };
 
+// Branch-direction coverage harvested during exploration, keyed by the
+// machine address of the branching instruction.  `outcomes` maps a branch
+// address to a bitmask of the successors symbolic execution actually
+// executed from it: bit0 = fall-through, bit1 = jump target.  A value of
+// exactly one bit means every explored execution agreed on a single
+// direction.  `visitedPcs` is the set of instruction addresses any explored
+// state executed.  Coverage is an under-approximation of real behavior:
+// unobserved directions/blocks are dead code evidence, not proof, and are
+// only safe to act on when the run completed without budget exhaustion.
+struct BranchCoverage {
+    std::map<uint64_t, unsigned> outcomes;  // branch addr -> bit0 fall, bit1 taken
+    std::set<uint64_t> visitedPcs;
+};
+
 struct IndirectExploreResult {
     std::vector<IndirectSite> sites;
     uint64_t statesExplored = 0;
     uint64_t statesPruned = 0;
     std::string reason;
+    // Branch-direction / pc coverage observed while exploring.  Only
+    // meaningful when `reason` reports a complete exploration; on budget
+    // exhaustion the absence of a direction may mean "not explored", not
+    // "unreachable".
+    BranchCoverage coverage;
 };
 
 // Bounded symbolic exploration from the entry point (or options.startAddress)

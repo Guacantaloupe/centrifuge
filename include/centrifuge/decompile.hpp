@@ -10,6 +10,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -38,6 +39,20 @@ struct SymIndirectSiteInfo {
 };
 using SymIndirectSites = std::map<uint64_t, SymIndirectSiteInfo>;
 
+// Symbolic-assisted unreachable-branch elimination (see symbolic.hpp
+// BranchCoverage).  `outcomes` maps a branch instruction address to the
+// bitmask of directions symbolic execution observed (bit0 = fall-through,
+// bit1 = target).  A branch whose bitmask is exactly one bit had its other
+// edge never executed: the emitter drops the dead arm and annotates the
+// fold.  `visitedPcs` lets the emitter mark blocks no explored state ever
+// reached.  Both are under-approximations, so `complete` gates on the
+// exploration run having finished without budget exhaustion.
+struct SymBranchCoverage {
+    const std::map<uint64_t, unsigned>* outcomes = nullptr;
+    const std::set<uint64_t>* visitedPcs = nullptr;
+    bool complete = false;
+};
+
 // Decompile the function starting at `start` (until RET/undecodable/`end`).
 // `nameOf` resolves call-target addresses to function names ("" = indirect).
 // `stackModel` (optional) enables the Native Source Recovery Backend:
@@ -60,7 +75,8 @@ std::string decompile(
     const FieldAccessorMap* fieldAccessors = nullptr,
     const std::map<uint64_t, DataType>* callResultTypes = nullptr,
     const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites = nullptr,
-    const SymIndirectSites* symIndirectSites = nullptr);
+    const SymIndirectSites* symIndirectSites = nullptr,
+    const SymBranchCoverage* symCoverage = nullptr);
 
 // Emits a complete C-like function with the recovered declaration and ABI
 // register aliases.  Direct calls use propagated callee signatures.
@@ -82,6 +98,7 @@ std::string decompileTyped(
     const std::map<uint64_t, DataType>* callResultTypes = nullptr,
     const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites =
         nullptr,
-    const SymIndirectSites* symIndirectSites = nullptr);
+    const SymIndirectSites* symIndirectSites = nullptr,
+    const SymBranchCoverage* symCoverage = nullptr);
 
 } // namespace centrifuge

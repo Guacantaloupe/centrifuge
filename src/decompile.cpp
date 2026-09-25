@@ -2321,6 +2321,9 @@ public:
     // WS6: indirect call/jump sites resolved by symbolic exploration
     // (instruction address -> observed concrete targets).
     const SymIndirectSites* symIndirectSites = nullptr;
+    // WS6: branch-direction coverage from symbolic exploration; a branch
+    // observed in only one direction has its dead arm eliminated.
+    const SymBranchCoverage* symCoverage = nullptr;
     // WS3: when a LOAD/STORE address is an untouched incoming-parameter
     // register plus a constant displacement, and the recovered parameter
     // type carries a member at that offset whose width matches the
@@ -5956,7 +5959,8 @@ std::string decompile(
     const FieldAccessorMap* fieldAccessors,
     const std::map<uint64_t, DataType>* callResultTypes,
     const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites,
-    const SymIndirectSites* symIndirectSites) {
+    const SymIndirectSites* symIndirectSites,
+    const SymBranchCoverage* symCoverage) {
     CfgBuilder cfg;
     if (!cfg.build(eng, read, start, end)) return "// failed to build CFG\n";
 
@@ -6274,6 +6278,13 @@ std::string decompile(
             for (int i = 0; i < depth; ++i) out << "    ";
             out << labelName(a) << ":\n";
         }
+        // WS6: annotate blocks no explored state ever reached (dead-code
+        // evidence from symbolic exploration; gated on a complete run).
+        if (symCoverage && symCoverage->complete && symCoverage->visitedPcs &&
+            !symCoverage->visitedPcs->count(a)) {
+            for (int i = 0; i < depth; ++i) out << "    ";
+            out << "/* symbolic: block not reached by exploration */\n";
+        }
 
         const NaturalLoop* loop = cfg.loopByHeader(a);
         if (loop && loop->blocks.size() == 1) {
@@ -6293,6 +6304,7 @@ std::string decompile(
                     body.callResultTypes = callResultTypes;
                     body.virtualCallSites = virtualCallSites;
                     body.symIndirectSites = symIndirectSites;
+                    body.symCoverage = symCoverage;
                     body.architecture = architecture;
                     body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -6339,6 +6351,7 @@ body.pushSlots = &pushSlots;
                 body.callResultTypes = callResultTypes;
                 body.virtualCallSites = virtualCallSites;
                 body.symIndirectSites = symIndirectSites;
+                body.symCoverage = symCoverage;
                 body.architecture = architecture;
                 body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -6433,6 +6446,7 @@ body.pushSlots = &pushSlots;
                         header.callResultTypes = callResultTypes;
                         header.virtualCallSites = virtualCallSites;
                         header.symIndirectSites = symIndirectSites;
+                        header.symCoverage = symCoverage;
                         header.architecture = architecture;
                         header.useRecoveredRuntime = useRecoveredRuntime;
                         header.stackModel = stackModel;
@@ -6494,6 +6508,7 @@ header.pushSlots = &pushSlots;
         be.callResultTypes = callResultTypes;
         be.virtualCallSites = virtualCallSites;
         be.symIndirectSites = symIndirectSites;
+        be.symCoverage = symCoverage;
         be.architecture = architecture;
         be.useRecoveredRuntime = useRecoveredRuntime;
                     be.stackModel = stackModel;
@@ -6524,6 +6539,25 @@ be.pushSlots = &pushSlots;
             out << "return " << be.retValue() << ";\n";
             return;
         }
+        // WS6 symbolic-assisted unreachable-branch elimination: when the
+        // coverage run completed and observed only one direction of this
+        // conditional, emit that direction directly and drop the dead arm
+        // (annotated, so the fold is visible in the output).
+        if (symCoverage && symCoverage->complete &&
+            symCoverage->outcomes && term->kind == Insn::JCC &&
+            term->targetKnown && b->succs.size() == 2) {
+            const auto cov = symCoverage->outcomes->find(term->addr);
+            if (cov != symCoverage->outcomes->end() &&
+                (cov->second == 1u || cov->second == 2u)) {
+                const bool onlyTaken = cov->second == 2u;
+                const uint64_t live = onlyTaken ? term->target : b->succs[0];
+                for (int i = 0; i <= depth; ++i) out << "    ";
+                out << "/* symbolic: branch always "
+                    << (onlyTaken ? "taken" : "fall-through") << " */\n";
+                emitBlock(live, depth);
+                return;
+            }
+        }
         if (term->kind == Insn::JCC && term->targetKnown &&
             b->succs.size() == 2) {
             const uint64_t target = term->target;
@@ -6546,6 +6580,7 @@ be.pushSlots = &pushSlots;
                 thenBody.callResultTypes = callResultTypes;
                 thenBody.virtualCallSites = virtualCallSites;
                 thenBody.symIndirectSites = symIndirectSites;
+                thenBody.symCoverage = symCoverage;
                 thenBody.architecture = architecture;
                 thenBody.useRecoveredRuntime = useRecoveredRuntime;
                     thenBody.stackModel = stackModel;
@@ -6576,6 +6611,7 @@ thenBody.pushSlots = &pushSlots;
                 elseBody.callResultTypes = callResultTypes;
                 elseBody.virtualCallSites = virtualCallSites;
                 elseBody.symIndirectSites = symIndirectSites;
+                elseBody.symCoverage = symCoverage;
                 elseBody.architecture = architecture;
                 elseBody.useRecoveredRuntime = useRecoveredRuntime;
                     elseBody.stackModel = stackModel;
@@ -6622,6 +6658,7 @@ elseBody.pushSlots = &pushSlots;
                 te.callResultTypes = callResultTypes;
                 te.virtualCallSites = virtualCallSites;
                 te.symIndirectSites = symIndirectSites;
+                te.symCoverage = symCoverage;
                 te.architecture = architecture;
                 te.useRecoveredRuntime = useRecoveredRuntime;
                     te.stackModel = stackModel;
@@ -6687,6 +6724,7 @@ te.pushSlots = &pushSlots;
                     armBody.callResultTypes = callResultTypes;
                     armBody.virtualCallSites = virtualCallSites;
                     armBody.symIndirectSites = symIndirectSites;
+                    armBody.symCoverage = symCoverage;
                     armBody.architecture = architecture;
                     armBody.useRecoveredRuntime = useRecoveredRuntime;
                     armBody.stackModel = stackModel;
@@ -7143,13 +7181,15 @@ std::string decompileTyped(
     const FieldAccessorMap* fieldAccessors,
     const std::map<uint64_t, DataType>* callResultTypes,
     const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites,
-    const SymIndirectSites* symIndirectSites) {
+    const SymIndirectSites* symIndirectSites,
+    const SymBranchCoverage* symCoverage) {
     std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
                                  architecture, useRecoveredRuntime,
                                  stackModel, globals, guardSlotOf,
                                  /*entryName=*/"", &signature,
                                  fieldAccessors, callResultTypes,
-                                 virtualCallSites, symIndirectSites);
+                                 virtualCallSites, symIndirectSites,
+                                 symCoverage);
     // A data-slot trampoline (indirect tail call) forwards the callee's
     // return value through rax, so it must never decompile to void: the
     // typed wrapper's void-return rewrite would turn the dispatch into a

@@ -1026,6 +1026,13 @@ struct SymState {
     uint32_t inputCount = 0;        // next fresh input byte index
     std::map<uint64_t, uint32_t> visits;
     std::vector<uint64_t> path;
+    // Coverage provenance: when this state was spawned by a symbolic
+    // CBRANCH fork, branchFrom is the forking branch's machine address and
+    // branchDir records which direction it took (0 = fall-through,
+    // 1 = jump target).  Recorded into branchOutcomes_ when the state is
+    // popped for execution, so only directions that genuinely ran count.
+    uint64_t branchFrom = 0;
+    int branchDir = -1;
 
     Sym getReg(uint64_t offset) const {
         const auto it = regs.find(offset);
@@ -1310,6 +1317,11 @@ public:
             SymState st = std::move(queue.front());
             queue.pop_front();
             ++explored;
+            // Branch-direction coverage: a spawned direction counts once
+            // the state actually starts executing.
+            if (st.branchDir >= 0)
+                branchOutcomes_[st.branchFrom] |= (1u << st.branchDir);
+            visitedPcs_.insert(st.pc);
             const bool symTrace = std::getenv("SYMTRACE") != nullptr;
             if (symTrace)
                 std::fprintf(stderr, "[sym] step pc=%llx steps=%llu constr=%zu\n",
@@ -1400,6 +1412,8 @@ public:
                   [](const IndirectSite& a, const IndirectSite& b) {
                       return a.addr < b.addr;
                   });
+        res.coverage.outcomes = branchOutcomes_;
+        res.coverage.visitedPcs = visitedPcs_;
         return res;
     }
 
@@ -1653,9 +1667,15 @@ private:
                 }
                 if (auto c = asConst(cond)) {
                     if (*c != 0 && dv && dv->kind == Varnode::CONST) {
+                        // Concrete condition: this state continues at the
+                        // target, so the taken direction is observed.
+                        branchOutcomes_[curPc] |= 2u;
                         branchTaken = true;
                         hasBranch = true;
                         branchTarget = dv->offset;
+                    } else {
+                        // Concrete not-taken: only fall-through observed.
+                        branchOutcomes_[curPc] |= 1u;
                     }
                 } else if (dv && dv->kind == Varnode::CONST) {
                     // Fork on the symbolic condition.
@@ -1676,7 +1696,11 @@ private:
                     taken.constraints.push_back(tc);
                     notTaken.constraints.push_back(fc);
                     taken.pc = dv->offset;
+                    taken.branchFrom = curPc;
+                    taken.branchDir = 1;
                     notTaken.pc = insn.nextAddr;
+                    notTaken.branchFrom = curPc;
+                    notTaken.branchDir = 0;
                     out.next.push_back(std::move(taken));
                     out.next.push_back(std::move(notTaken));
                     hasBranch = false;  // successors already queued
@@ -2135,6 +2159,11 @@ private:
     // Exploration-mode accumulation: site pc -> concrete targets observed.
     std::map<uint64_t, std::set<uint64_t>> indirectSites_;
     std::map<uint64_t, bool> siteIsCall_;  // site pc -> true for CALLIND
+    // Branch-direction / pc coverage recorded while exploring: branch pc ->
+    // bitmask of executed directions (bit0 fall-through, bit1 target), and
+    // every pc any state executed.
+    std::map<uint64_t, unsigned> branchOutcomes_;
+    std::set<uint64_t> visitedPcs_;
     bool exploreMode_ = false;
 };
 

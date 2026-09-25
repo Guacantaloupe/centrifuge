@@ -115,6 +115,9 @@ struct Program {
     std::string arch;   // "x86-64" | "x86" | "aarch64" | ...
     uint64_t imageBase = 0; // 0 for ELF (position-independent layout)
     uint64_t entryPoint = 0;
+    // PE-only metadata (0 when not applicable / unspecified).
+    uint16_t peSubsystem = 0;       // optional-header Subsystem field
+    uint16_t peCharacteristics = 0; // COFF Characteristics field
     std::vector<Section> sections;
     std::vector<Symbol> symbols;
     std::vector<std::string> importedLibraries;
@@ -125,6 +128,13 @@ struct Program {
     std::vector<ExceptionRegion> exceptionRegions;
     MemoryImage memory;
 };
+
+// True when the PE targets the native subsystem (IMAGE_SUBSYSTEM_NATIVE, 1) —
+// i.e. a Windows kernel driver / KMDF-style image whose entry point is
+// DriverEntry rather than a user-mode CRT startup routine.
+inline bool isKernelDriver(const Program& p) {
+    return p.peSubsystem == 1;
+}
 
 struct LoadOptions {
     // Maximum cumulative number of bytes materialized in the memory image.

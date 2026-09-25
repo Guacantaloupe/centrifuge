@@ -1,4 +1,4 @@
-﻿// centrifuge - a Ghidra reimplementation in C++17
+// centrifuge - a Ghidra reimplementation in C++17
 // analysis.cpp - function discovery
 #include "centrifuge/analysis.hpp"
 
@@ -65,8 +65,19 @@ std::vector<Function> findFunctions(const Program& prog, Disassembler* disasm) {
                 s.isExported ? Function::EXPORT : Function::SYMBOL, s.size);
     }
 
-    if (prog.entryPoint != 0)
-        addFunc(prog.entryPoint, "entry", Function::ENTRY);
+    if (prog.entryPoint != 0) {
+        const char* entryName =
+            isKernelDriver(prog) ? "DriverEntry" : "entry";
+        // The PE loader injects a synthetic "entry" pseudo-symbol; adopt the
+        // richer entry name instead of keeping the placeholder.
+        auto existing = funcs.find(prog.entryPoint);
+        if (existing != funcs.end() && existing->second.src == Function::SYMBOL &&
+            existing->second.name == "entry") {
+            existing->second.name = entryName;
+            existing->second.src = Function::ENTRY;
+        }
+        addFunc(prog.entryPoint, entryName, Function::ENTRY);
+    }
 
     // Index authoritative unwind ranges before recursive discovery.  They are
     // deliberately not all inserted into `funcs` yet: doing so would put every

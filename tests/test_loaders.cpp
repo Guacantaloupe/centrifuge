@@ -9,6 +9,7 @@
 
 #include "centrifuge/loader.hpp"
 #include "centrifuge/memory.hpp"
+#include "centrifuge/analysis.hpp"
 
 using namespace centrifuge;
 
@@ -140,6 +141,27 @@ int main(int argc, char** argv) {
         put64(malformedTls, 0x408, 0x14000204fULL);
         CHECK(rejected(malformedTls),
               "backwards PE TLS template range rejected");
+    }
+
+    {
+        // Native-subsystem (driver) PE: subsystem metadata is recovered and
+        // the entry point is discovered as DriverEntry.
+        auto driverPe = makeTlsPe64();
+        put16(driverPe, 0x98 + 68, 1); // IMAGE_SUBSYSTEM_NATIVE
+        auto driver = loadData(driverPe, "driver-pe64-memory", error);
+        CHECK(driver && driver->peSubsystem == 1 && isKernelDriver(*driver),
+              "PE native subsystem recognized as kernel driver");
+        const auto funcs = findFunctions(*driver, nullptr);
+        bool hasDriverEntry = false;
+        for (const auto& f : funcs)
+            if (f.name == "DriverEntry" && f.src == Function::ENTRY)
+                hasDriverEntry = true;
+        CHECK(hasDriverEntry, "kernel driver entry named DriverEntry");
+        auto consolePe = makeTlsPe64();
+        const auto consoleProg = loadData(consolePe, "console-pe64-memory", error);
+        CHECK(consoleProg && consoleProg->peSubsystem == 0 &&
+                  !isKernelDriver(*consoleProg),
+              "unspecified PE subsystem is not a kernel driver");
     }
 
     LoadOptions tinyLimit;

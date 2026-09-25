@@ -205,6 +205,8 @@ std::optional<Program> loadPeImpl(const std::vector<uint8_t>& d,
     const uint32_t entryRva = rd32(d, optOff + 16);
     const uint32_t sizeOfImage = rd32(d, optOff + 56);
     const uint32_t sizeOfHeaders = rd32(d, optOff + 60);
+    p.peSubsystem = rd16(d, optOff + 68);
+    p.peCharacteristics = coff.characteristics;
     const uint32_t numRvaSizes = rd32(d, optOff + (is64 ? 108 : 92));
     const size_t dataDirOff = optOff + (is64 ? 112 : 96);
     if (is64) {

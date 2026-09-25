@@ -1,0 +1,65 @@
+// centrifuge - a Ghidra reimplementation in C++17
+// symbolic.hpp - a small angr-style symbolic execution engine
+//
+// Executes the program's p-code with symbolic input and derives concrete
+// inputs that drive execution to a target address.  The engine is
+// deliberately bounded: BFS path exploration with per-state step and
+// per-address revisit limits, and a propagator-based bit-vector solver
+// (interval narrowing over the input-byte domains, verified by concrete
+// evaluation).  Unsupported operations prune the path with a recorded
+// reason; irreducible paths are never guessed.
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "centrifuge/loader.hpp"
+#include "centrifuge/sleigh.hpp"
+
+namespace centrifuge {
+
+struct ReachOptions {
+    uint64_t targetAddress = 0;  // address a reaching input must execute
+    uint64_t startAddress = 0;   // 0 = program entry point
+    uint64_t maxStates = 4096;   // queued states before exploration gives up
+    uint64_t maxStepsPerState = 100000;
+    uint64_t loopBound = 32;     // per-state visits of one pc before pruning
+    // Model stdin reads as `length` symbolic bytes: every read/fgets/gets
+    // from fd 0 delivers this many fresh symbolic bytes to the buffer.
+    bool symbolicStdin = false;
+    uint64_t stdinLength = 16;
+    // Additional memory ranges whose bytes start as symbolic inputs.
+    std::vector<std::pair<uint64_t, uint64_t>> symbolicMemory; // addr, len
+    // When non-empty, run concretely with these input bytes (verification
+    // replay): every input() leaf returns the given byte, branches never
+    // fork, and the result reports whether the target was hit.
+    std::vector<uint8_t> concreteInput;
+    // Diagnostic execution trace of the winning path (pc per step).
+    bool trace = false;
+};
+
+struct ReachResult {
+    bool reached = false;
+    std::string reason;  // "found" / why exploration failed
+    // Concrete stdin payload satisfying every path constraint, or the
+    // symbolic-memory seed when no stdin model was requested.
+    std::vector<uint8_t> input;
+    // Index into `input` where stdin-modeled bytes begin (skipping the
+    // argv[1] seed and --sym-mem ranges).
+    uint32_t stdinOffset = 0;
+    uint64_t steps = 0;
+    uint64_t statesExplored = 0;
+    uint64_t statesPruned = 0;
+    std::vector<uint64_t> winningPath;  // pc trace when trace enabled
+};
+
+// Symbolically execute `program` (via `engine`, already spec-loaded) from
+// the entry point (or options.startAddress) and search for an input that
+// makes execution reach options.targetAddress.
+ReachResult reachTarget(const SleighEngine& engine, const Program& program,
+                        const ReachOptions& options);
+
+} // namespace centrifuge

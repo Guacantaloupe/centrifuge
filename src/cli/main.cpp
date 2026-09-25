@@ -23,6 +23,7 @@
 #include "centrifuge/ir.hpp"
 #include "centrifuge/highir.hpp"
 #include "centrifuge/pcode.hpp"
+#include "centrifuge/symbolic.hpp"
 #include "centrifuge/program_graph.hpp"
 #include "centrifuge/project_recovery.hpp"
 #include "centrifuge/sleigh.hpp"
@@ -239,6 +240,9 @@ void usage(const char* argv0) {
     std::printf("  %s spec <spec.slaspec> <file> recover-project <output-dir> "
                 "[abi] [max-functions]\n", argv0);
     std::printf("  %s spec <spec.slaspec> <file> semantic-coverage\n", argv0);
+    std::printf("  %s spec <spec.slaspec> <file> reach <addr> [--start a] [--stdin n]"
+                " [--sym-mem a:n] [--max-states n] [--max-steps n] [--trace]\n",
+                argv0);
     std::printf("  %s spec <spec.slaspec> <file> decompile-typed <addr> [abi]\n",
                 argv0);
     std::printf("  %s spec <spec.slaspec> <file> decompile-native <addr> [end] [abi]\n",
@@ -693,6 +697,68 @@ int cmdSpec(int argc, char** argv) {
         // architectures.  CI/baseline policy decides whether nonzero empty
         // semantics is acceptable; explicit UNIMPLEMENTED is always fatal.
         return coverage.unimplementedOperations ? 2 : 0;
+    }
+    if (cmd == "reach") {
+        // Symbolic reachability: derive a concrete input that drives
+        // execution to the target address.
+        if (argc < 6) { usage(argv[0]); return 1; }
+        uint64_t target = 0;
+        if (!parseAddr(argv[5], target)) {
+            std::fprintf(stderr, "centrifuge: bad address '%s'\n", argv[5]);
+            return 1;
+        }
+        ReachOptions o;
+        o.targetAddress = target;
+        for (int i = 6; i < argc; ++i) {
+            std::string a = argv[i];
+            auto nextVal = [&]() {
+                return i + 1 < argc ? std::string(argv[++i]) : std::string();
+            };
+            if (a == "--start")
+                o.startAddress = std::stoull(nextVal(), nullptr, 0);
+            else if (a == "--stdin") {
+                o.symbolicStdin = true;
+                o.stdinLength = std::stoull(nextVal(), nullptr, 0);
+            } else if (a == "--sym-mem") {
+                auto s = nextVal();
+                auto c = s.find(':');
+                o.symbolicMemory.push_back(
+                    {std::stoull(s.substr(0, c), nullptr, 0),
+                     std::stoull(s.substr(c + 1), nullptr, 0)});
+            } else if (a == "--max-states")
+                o.maxStates = std::stoull(nextVal(), nullptr, 0);
+            else if (a == "--max-steps")
+                o.maxStepsPerState = std::stoull(nextVal(), nullptr, 0);
+            else if (a == "--trace")
+                o.trace = true;
+        }
+        auto res = reachTarget(*eng, *prog, o);
+        // Soundness net: replay the solved model concretely through the
+        // same engine; only a replay that reaches the target counts.
+        if (res.reached && !res.input.empty() && o.concreteInput.empty()) {
+            ReachOptions verify = o;
+            verify.concreteInput = res.input;
+            auto replay = reachTarget(*eng, *prog, verify);
+            res.reason = replay.reached
+                             ? "found (verified by concrete replay)"
+                             : "found (UNVERIFIED: concrete replay missed "
+                               "the target)";
+        }
+        std::printf("%s\n", res.reason.c_str());
+        if (res.reached && !res.input.empty()) {
+            const size_t begin =
+                res.stdinOffset <= res.input.size() ? res.stdinOffset : 0;
+            const size_t n = res.input.size() - begin;
+            std::printf("input (%zu bytes): ", n);
+            for (size_t i = begin; i < res.input.size(); ++i)
+                std::printf("%02x", res.input[i]);
+            std::printf("  |");
+            for (size_t i = begin; i < res.input.size(); ++i)
+                std::printf("%c", res.input[i] >= 32 && res.input[i] < 127
+                                      ? res.input[i] : '.');
+            std::printf("|\n");
+        }
+        return res.reached ? 0 : 2;
     }
     if (cmd == "decompile-typed") {
         if (argc < 6) { usage(argv[0]); return 1; }

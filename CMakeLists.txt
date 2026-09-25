@@ -60,6 +60,7 @@ add_library(centrifuge_core STATIC
   src/highir.cpp
   src/cpp_recovery.cpp
   src/stack_recovery.cpp
+  src/symbolic.cpp
   src/calling_convention.cpp
   src/import_prototype.cpp
   src/global_recovery.cpp

@@ -5642,6 +5642,47 @@ std::string collapseDegenerateBranches(const std::string& text) {
             if (changed) continue;
         }
 
+        // (4) guarded region: `if (c) goto Lx;` whose label is the single-
+        // reference join immediately after a label-free, break-free region
+        // becomes `if (!(c)) { <region> }`.  Jumping out of the new braces
+        // stays legal (all locals are trivial), and no label inside means no
+        // jump can land inside the wrapped region.
+        refs = referenceCounts();
+        static const std::regex ifGotoLineRe(
+            R"(^(\s*)if \((.+)\) goto L(0x[0-9a-fA-F]+);\s*$)");
+        static const std::regex innerLabelRe(R"(^\s*L0x[0-9a-fA-F]+:)");
+        static const std::regex breakRe(R"(\b(break|continue);)");
+        for (size_t i = 0; i < lines.size(); ++i) {
+            std::smatch m;
+            if (!std::regex_match(lines[i], m, ifGotoLineRe)) continue;
+            const std::string label = m[3].str();
+            if (refs[label] != 1) continue;
+            size_t target = 0;
+            for (size_t j = i + 1; j < lines.size(); ++j) {
+                if (lines[j] == "L" + label + ":") {
+                    target = j;
+                    break;
+                }
+            }
+            if (!target) continue;
+            if (target == i + 1) continue; // rule (1) shape
+            bool regionClean = true;
+            for (size_t j = i + 1; j < target; ++j) {
+                if (std::regex_search(lines[j], innerLabelRe) ||
+                    std::regex_search(lines[j], breakRe)) {
+                    regionClean = false;
+                    break;
+                }
+            }
+            if (!regionClean) continue;
+            const std::string indent = m[1].str();
+            lines[i] = indent + "if (!(" + m[2].str() + ")) {";
+            lines[target] = indent + "}";
+            changed = true;
+            break;
+        }
+        if (changed) continue;
+
         // (3) labels with no remaining references.
         refs = referenceCounts();
         for (size_t i = 0; i < lines.size();) {

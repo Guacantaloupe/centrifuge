@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <tuple>
@@ -2241,6 +2242,11 @@ bool ProgramAnalysis::buildPipeline(const Program& program,
     // pipeline.
     const bool symbolicCfg = std::getenv("CENTRIFUGE_SYMBOLIC_CFG") != nullptr;
     const int cfgPointerSize = program.arch == "x86" ? 4 : 8;
+    // Symbolic return-value summaries merged per callee across every
+    // completed exploration; Phase 7 refines signature return widths from
+    // them (range -> IR feedback).
+    std::map<uint64_t, CallReturnSummary> symbolicReturns;
+    std::mutex symbolicReturnsMutex;
     auto harvestJumpTableHints = [&](const Function* function, uint64_t end) {
         std::vector<JumpTable> tables;
         CfgBuilder probe;
@@ -2277,6 +2283,26 @@ bool ProgramAnalysis::buildPipeline(const Program& program,
             std::fprintf(stderr,
                          "[ws8] cfg hints: fn 0x%llx -> %zu tables\n",
                          (unsigned long long)function->addr, tables.size());
+        // Merge cross-function return summaries (only from a complete
+        // exploration - under budget exhaustion the ranges are mere
+        // under-approximations and must not bound the return type).
+        if (explored.reason.rfind("exploration complete", 0) == 0) {
+            std::lock_guard<std::mutex> lock(symbolicReturnsMutex);
+            for (const CallReturnSummary& s : explored.returnSummaries) {
+                if (!s.target || !s.returns) continue;
+                CallReturnSummary& m = symbolicReturns[s.target];
+                if (!m.returns) {
+                    m = s;
+                    continue;
+                }
+                m.alwaysConst = m.alwaysConst && s.alwaysConst &&
+                                m.constValue == s.constValue;
+                if (!m.alwaysConst) m.constValue = 0;
+                m.lo = std::min(m.lo, s.lo);
+                m.hi = std::max(m.hi, s.hi);
+                m.returns += s.returns;
+            }
+        }
         return tables;
     };
     // Functions whose body ends in an indirect jump (data-slot jump board
@@ -3294,6 +3320,37 @@ bool ProgramAnalysis::buildPipeline(const Program& program,
                         if (psig.returnComponents.size() == 1)
                             psig.returnComponents[0] = psig.returnType;
                         changed = true;
+                    }
+                }
+                // WS8 symbolic range feedback: return-value ranges observed
+                // by symbolic execution bound the callee's return width (e.g.
+                // a function whose returns all fit in 32 bits loses its
+                // default uint64_t), then the outer fixed point re-seeds the
+                // IR.
+                {
+                    const auto sret = symbolicReturns.find(kv.first);
+                    if (sret != symbolicReturns.end() &&
+                        (sig.returnType.kind == TypeKind::UNSIGNED_INT ||
+                         sig.returnType.kind == TypeKind::SIGNED_INT) &&
+                        sig.returnType.bits > 0) {
+                        const CallReturnSummary& summary = sret->second;
+                        const int bits = summary.hi < (1ull << 8)   ? 8
+                                         : summary.hi < (1ull << 16) ? 16
+                                         : summary.hi < (1ull << 32) ? 32
+                                                                     : 64;
+                        if (bits < sig.returnType.bits) {
+                            if (std::getenv("WS8DEBUG"))
+                                std::fprintf(stderr,
+                                    "[ws8] range ret: callee 0x%llx "
+                                    "returns [0x%llx,0x%llx] -> %d bits\n",
+                                    (unsigned long long)kv.first,
+                                    (unsigned long long)summary.lo,
+                                    (unsigned long long)summary.hi, bits);
+                            sig.returnType.bits = bits;
+                            if (sig.returnComponents.size() == 1)
+                                sig.returnComponents[0] = sig.returnType;
+                            changed = true;
+                        }
                     }
                 }
             }

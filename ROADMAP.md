@@ -205,6 +205,15 @@ it to **symbolic values** (expression trees over registers/memory):
   re-derives its results over the enriched CFG (verified on sym_switch:
   `sw` grows from 3 blocks/33 ops/ref-only to 8 blocks/40 ops/mod-ref).
   Off by default: purely additive, the baseline pipeline is unchanged.
+- Symbolic range feedback (WS8): the symbolic harvest also merges the
+  engine's cross-function return summaries (`CallReturnSummary`) per
+  callee - but only from explorations that ran to completion, since under
+  budget exhaustion the ranges are under-approximations.  In the Phase 7
+  fixed point the observed range bounds the callee's return width: a
+  function whose returns all fit in 8/16/32 bits loses its default
+  uint64_t, the signature change feeds the outer IR-feedback rounds, and
+  the IR is re-seeded with the narrower type (verified on chain.exe:
+  `deep` climbs down to `uint8_t` from observed returns in [0,0x29]).
 - Return-through-call recovery (WS8): each call-site argument is traced
   through copy/zext/sext/subpiece chains to a CALL definition
   (`CallSiteArgInfo::fromCallResult`).  In the Phase 7 fixed point, an

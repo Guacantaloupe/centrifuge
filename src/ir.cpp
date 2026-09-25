@@ -18,7 +18,7 @@
 #include "centrifuge/decompile.hpp"
 #include "centrifuge/calling_convention.hpp"
 #include "centrifuge/import_prototype.hpp"
-
+#include "centrifuge/symbolic.hpp"
 namespace centrifuge {
 
 using RegKey = std::pair<uint64_t, int>;
@@ -2230,6 +2230,55 @@ bool ProgramAnalysis::buildPipeline(const Program& program,
             cfgPrefetchFactor = static_cast<size_t>(parsed);
     }
 
+    // WS8 symbolic-assisted CFG: when CENTRIFUGE_SYMBOLIC_CFG is set, every
+    // prefetched CFG is built with jump-table hints harvested from a probe
+    // CFG - static recoverJumpTables merged with multi-target indirect-branch
+    // sites resolved by bounded symbolic exploration - so switch case bodies
+    // become real CFG blocks (successors, liveness, IR operations, call
+    // edges) instead of unreachable dead code after an indirect branch, and
+    // the whole-program analysis re-derives its results over the enriched
+    // CFG.  Purely additive: off by default, no change to the baseline
+    // pipeline.
+    const bool symbolicCfg = std::getenv("CENTRIFUGE_SYMBOLIC_CFG") != nullptr;
+    const int cfgPointerSize = program.arch == "x86" ? 4 : 8;
+    auto harvestJumpTableHints = [&](const Function* function, uint64_t end) {
+        std::vector<JumpTable> tables;
+        CfgBuilder probe;
+        if (!probe.build(engine, read, function->addr, end, executable))
+            return tables;
+        tables = recoverJumpTables(probe, program.memory, cfgPointerSize);
+        ReachOptions options;
+        options.startAddress = function->addr;
+        options.maxStates = 512;
+        options.maxStepsPerState = 20000;
+        const IndirectExploreResult explored =
+            exploreIndirectTargets(engine, program, options);
+        for (const IndirectSite& site : explored.sites) {
+            if (site.isCall || site.targets.empty()) continue;
+            JumpTable* table = nullptr;
+            for (JumpTable& t : tables)
+                if (t.dispatchAddress == site.addr) {
+                    table = &t;
+                    break;
+                }
+            if (!table) {
+                tables.push_back(JumpTable{});
+                table = &tables.back();
+                table->dispatchAddress = site.addr;
+                table->entrySize = cfgPointerSize;
+            }
+            std::set<uint64_t> existing(table->targets.begin(),
+                                        table->targets.end());
+            for (uint64_t target : site.targets)
+                if (existing.insert(target).second)
+                    table->targets.push_back(target);
+        }
+        if (std::getenv("WS8DEBUG") && !tables.empty())
+            std::fprintf(stderr,
+                         "[ws8] cfg hints: fn 0x%llx -> %zu tables\n",
+                         (unsigned long long)function->addr, tables.size());
+        return tables;
+    };
     // Functions whose body ends in an indirect jump (data-slot jump board
     // or vtable tail call).  decompileTyped promotes a void return back to
     // a 64-bit value for these (the dispatch forwards rax), so the Phase 7
@@ -2413,8 +2462,14 @@ bool ProgramAnalysis::buildPipeline(const Program& program,
                     if (index >= jobs.size()) break;
                     CfgJob& job = jobs[index];
                     job.cfg = std::make_unique<CfgBuilder>();
+                    std::vector<JumpTable> hints;
+                    const std::vector<JumpTable>* hintPtr = nullptr;
+                    if (symbolicCfg) {
+                        hints = harvestJumpTableHints(job.function, job.end);
+                        if (!hints.empty()) hintPtr = &hints;
+                    }
                     job.built = job.cfg->build(engine, read,
-                        job.function->addr, job.end, executable);
+                        job.function->addr, job.end, executable, hintPtr);
                 }
             };
             const size_t batchWorkers = std::min(analysisWorkers, jobs.size());

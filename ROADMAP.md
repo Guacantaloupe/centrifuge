@@ -193,6 +193,18 @@ it to **symbolic values** (expression trees over registers/memory):
   traces the convergence under `WS8DEBUG` (verified on chain.exe:
   WinMainCRTStartup's `arg1` climbs from `uint64_t` to `void *` in round
   1 and round 2 reaches the fixed point).
+- Symbolic-assisted CFG (WS8): when `CENTRIFUGE_SYMBOLIC_CFG` is set, every
+  CFG the whole-program analysis builds is seeded with jump-table hints
+  harvested per function: a probe CFG runs `recoverJumpTables` (static
+  pattern recovery) and the result is merged with multi-target BRANCHIND
+  sites resolved by bounded symbolic exploration
+  (`exploreIndirectTargets`), then handed to `CfgBuilder::build` as the
+  jump-table hint list.  Switch case bodies therefore become real CFG
+  blocks - successors, liveness, IR operations, Mod/Ref - instead of
+  unreachable dead code after an indirect branch, and the analysis
+  re-derives its results over the enriched CFG (verified on sym_switch:
+  `sw` grows from 3 blocks/33 ops/ref-only to 8 blocks/40 ops/mod-ref).
+  Off by default: purely additive, the baseline pipeline is unchanged.
 - Return-through-call recovery (WS8): each call-site argument is traced
   through copy/zext/sext/subpiece chains to a CALL definition
   (`CallSiteArgInfo::fromCallResult`).  In the Phase 7 fixed point, an

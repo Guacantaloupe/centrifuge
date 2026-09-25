@@ -243,6 +243,9 @@ void usage(const char* argv0) {
     std::printf("  %s spec <spec.slaspec> <file> reach <addr> [--start a] [--stdin n]"
                 " [--sym-mem a:n] [--max-states n] [--max-steps n] [--trace]\n",
                 argv0);
+    std::printf("  %s spec <spec.slaspec> <file> explore-indirect [--start a]"
+                " [--stdin n] [--sym-mem a:n] [--max-states n] [--max-steps n]\n",
+                argv0);
     std::printf("  %s spec <spec.slaspec> <file> decompile-typed <addr> [abi]\n",
                 argv0);
     std::printf("  %s spec <spec.slaspec> <file> decompile-native <addr> [end] [abi]\n",
@@ -759,6 +762,43 @@ int cmdSpec(int argc, char** argv) {
             std::printf("|\n");
         }
         return res.reached ? 0 : 2;
+    }
+    if (cmd == "explore-indirect") {
+        // Symbolic-assisted decompilation support: explore from the entry
+        // point and report every indirect call/jump instruction whose target
+        // resolved to a concrete address, with the observed target set.
+        ReachOptions o;
+        for (int i = 5; i < argc; ++i) {
+            std::string a = argv[i];
+            auto nextVal = [&]() {
+                return i + 1 < argc ? std::string(argv[++i]) : std::string();
+            };
+            if (a == "--start")
+                o.startAddress = std::stoull(nextVal(), nullptr, 0);
+            else if (a == "--stdin") {
+                o.symbolicStdin = true;
+                o.stdinLength = std::stoull(nextVal(), nullptr, 0);
+            } else if (a == "--sym-mem") {
+                auto s = nextVal();
+                auto c = s.find(':');
+                o.symbolicMemory.push_back(
+                    {std::stoull(s.substr(0, c), nullptr, 0),
+                     std::stoull(s.substr(c + 1), nullptr, 0)});
+            } else if (a == "--max-states")
+                o.maxStates = std::stoull(nextVal(), nullptr, 0);
+            else if (a == "--max-steps")
+                o.maxStepsPerState = std::stoull(nextVal(), nullptr, 0);
+        }
+        auto res = exploreIndirectTargets(*eng, *prog, o);
+        std::printf("%s\n", res.reason.c_str());
+        for (const IndirectSite& site : res.sites) {
+            std::printf("  %s %s", site.isCall ? "call" : "jump",
+                        hexAddr(site.addr).c_str());
+            for (uint64_t t : site.targets)
+                std::printf(" -> %s", hexAddr(t).c_str());
+            std::printf("\n");
+        }
+        return res.sites.empty() ? 2 : 0;
     }
     if (cmd == "decompile-typed") {
         if (argc < 6) { usage(argv[0]); return 1; }

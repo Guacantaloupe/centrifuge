@@ -4831,6 +4831,20 @@ bool SleighEngine::disassemble(
     }
 
     // emit semantics not replaced by the shared x86 flag implementation
+    // Memory operands bound by the pattern carry their address as a CONST
+    // varnode; a memory goto/call destination must load the pointer stored
+    // at that address (indirect), not branch to the address itself.
+    auto stmtIsMemory = [&](const std::string& operand) {
+        for (auto it = magicExports.rbegin(); it != magicExports.rend(); ++it)
+            if (it->first == operand)
+                return it->second.rfind("rmmem", 0) == 0;
+        return false;
+    };
+    auto stmtLoadValue = [&](uint64_t address, int size) {
+        Varnode* t = makeVarnode(out, Varnode::UNIQUE, nextId_++, size);
+        out.ops.push_back(PcodeOp{POp::LOAD, t->id, address, 0, 0});
+        return t->id;
+    };
     if (!x86Handled) for (const auto& st : matched->stmts) {
         switch (st.kind) {
         case SpecCtor::SStmt::ASSIGN: {
@@ -4854,6 +4868,16 @@ bool SleighEngine::disassemble(
             break;
         }
         case SpecCtor::SStmt::GOTO: {
+            // A memory destination (`jmp m64`) is an indirect branch through
+            // the pointer stored at the operand address, not a branch to the
+            // address itself; register destinations use the register value.
+            if (st.rhsE && st.rhsE->kind == SpecCtor::SExpr::VAR &&
+                stmtIsMemory(st.rhsE->var)) {
+                const uint64_t addr = evalExpr(out, *st.rhsE);
+                const uint64_t dest = stmtLoadValue(addr, 8);
+                out.ops.push_back(PcodeOp{POp::BRANCHIND, 0, dest, 0, 0});
+                break;
+            }
             const uint64_t dest = evalExpr(out, *st.rhsE);
             const Varnode* target = out.find(dest);
             out.ops.push_back(PcodeOp{target && target->isConst()
@@ -4868,6 +4892,13 @@ bool SleighEngine::disassemble(
             break;
         }
         case SpecCtor::SStmt::CALL: {
+            if (st.rhsE && st.rhsE->kind == SpecCtor::SExpr::VAR &&
+                stmtIsMemory(st.rhsE->var)) {
+                const uint64_t addr = evalExpr(out, *st.rhsE);
+                const uint64_t dest = stmtLoadValue(addr, 8);
+                out.ops.push_back(PcodeOp{POp::CALLIND, 0, dest, 0, 0});
+                break;
+            }
             const uint64_t dest = evalExpr(out, *st.rhsE);
             const Varnode* target = out.find(dest);
             out.ops.push_back(PcodeOp{target && target->isConst()

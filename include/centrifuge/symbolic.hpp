@@ -15,7 +15,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
 #include "centrifuge/loader.hpp"
 #include "centrifuge/sleigh.hpp"
 
@@ -61,5 +60,33 @@ struct ReachResult {
 // makes execution reach options.targetAddress.
 ReachResult reachTarget(const SleighEngine& engine, const Program& program,
                         const ReachOptions& options);
+
+// One indirect call/jump instruction observed during exploration, together
+// with the concrete targets symbolic execution resolved for it.  A site with
+// several targets is the fingerprint of a switch over a jump table or a
+// vtable dispatch; a single target is usually an import thunk or an
+// indirectly-referenced helper.
+struct IndirectSite {
+    uint64_t addr = 0;              // address of the CALLIND/BRANCHIND insn
+    bool isCall = false;            // true = CALLIND, false = BRANCHIND
+    std::vector<uint64_t> targets;  // concrete targets, sorted ascending
+};
+
+struct IndirectExploreResult {
+    std::vector<IndirectSite> sites;
+    uint64_t statesExplored = 0;
+    uint64_t statesPruned = 0;
+    std::string reason;
+};
+
+// Bounded symbolic exploration from the entry point (or options.startAddress)
+// that runs to completion and records every indirect call/branch instruction
+// whose target resolved to a concrete address on at least one explored path,
+// along with the full set of targets observed per site.  options.targetAddress
+// is ignored; all budgets (maxStates, maxStepsPerState, loopBound,
+// symbolicStdin, symbolicMemory) behave exactly as in reachTarget.
+IndirectExploreResult exploreIndirectTargets(const SleighEngine& engine,
+                                             const Program& program,
+                                             const ReachOptions& options);
 
 } // namespace centrifuge

@@ -1227,6 +1227,7 @@ public:
 
     ReachResult run() {
         ReachResult result;
+        const bool explore = exploreMode_;
         // Symbol seeding ranges.
         std::vector<std::pair<uint64_t, uint64_t>> seedRanges =
             opt_.symbolicMemory;
@@ -1319,7 +1320,7 @@ public:
             if (symTrace)
                 std::fprintf(stderr, "[sym]   -> next=%zu prune=%s\n",
                              outcome.next.size(), outcome.prune.c_str());
-            if (outcome.reached) {
+            if (outcome.reached && !explore) {
                 SymState& winner = outcome.next.front();
                 result.reached = true;
                 result.reason = "found";
@@ -1357,6 +1358,12 @@ public:
             result.statesPruned = pruned;
         }
         if (result.reason.empty()) {
+            if (explore) {
+                std::ostringstream why;
+                why << "exploration complete (" << explored << " states explored, "
+                    << pruned << " pruned)";
+                result.reason = why.str();
+            } else {
             std::ostringstream why;
             why << "target not reached (" << explored << " states explored)";
             if (!pruneReasons.empty()) {
@@ -1365,9 +1372,35 @@ public:
                     why << " " << kv.first << "=" << kv.second;
             }
             result.reason = why.str();
+            }
         }
         result.steps = explored;
         return result;
+    }
+
+    // Exploration mode (exploreIndirectTargets): identical BFS to run(), but
+    // never stops at a single target; instead every concretely-resolved
+    // indirect call/branch site is accumulated in indirectSites_.
+    IndirectExploreResult explore() {
+        exploreMode_ = true;
+        ReachResult r = run();
+        IndirectExploreResult res;
+        res.statesExplored = r.statesExplored;
+        res.statesPruned = r.statesPruned;
+        res.reason = r.reason;
+        for (const auto& kv : indirectSites_) {
+            IndirectSite site;
+            site.addr = kv.first;
+            const auto kind = siteIsCall_.find(kv.first);
+            site.isCall = kind != siteIsCall_.end() && kind->second;
+            site.targets.assign(kv.second.begin(), kv.second.end());
+            res.sites.push_back(std::move(site));
+        }
+        std::sort(res.sites.begin(), res.sites.end(),
+                  [](const IndirectSite& a, const IndirectSite& b) {
+                      return a.addr < b.addr;
+                  });
+        return res;
     }
 
 private:
@@ -1384,6 +1417,7 @@ private:
             out.prune = "undecodable-pc";
             return out;
         }
+        const uint64_t curPc = st.pc;
         const uint32_t visits = ++st.visits[st.pc];
         if (visits > opt_.loopBound) {
             out.prune = "loop-bound";
@@ -1659,6 +1693,8 @@ private:
             case POp::BRANCHIND: {
                 const Sym t = ex.valueOf(op.in0);
                 if (auto v = asConst(t)) {
+                    indirectSites_[curPc].insert(*v);
+                    siteIsCall_.emplace(curPc, false);
                     branchTaken = true;
                     hasBranch = true;
                     branchTarget = *v;
@@ -1694,6 +1730,8 @@ private:
             case POp::CALLIND: {
                 const Sym t = ex.valueOf(op.in0);
                 if (auto v = asConst(t)) {
+                    indirectSites_[curPc].insert(*v);
+                    siteIsCall_.emplace(curPc, true);
                     if (handleLibcCall(*v, st, insn, out)) {
                         st.pc = insn.nextAddr;
                         return finishFork(std::move(out), insn);
@@ -2090,6 +2128,10 @@ private:
     std::function<bool(uint64_t, void*, size_t)> imgRead_;
     InputFactory inputFactory_;
     uint32_t totalInputs_ = 0;
+    // Exploration-mode accumulation: site pc -> concrete targets observed.
+    std::map<uint64_t, std::set<uint64_t>> indirectSites_;
+    std::map<uint64_t, bool> siteIsCall_;  // site pc -> true for CALLIND
+    bool exploreMode_ = false;
 };
 
 } // namespace
@@ -2098,6 +2140,13 @@ ReachResult reachTarget(const SleighEngine& engine, const Program& program,
                         const ReachOptions& options) {
     SymbolicReach runner(engine, program, options);
     return runner.run();
+}
+
+IndirectExploreResult exploreIndirectTargets(const SleighEngine& engine,
+                                             const Program& program,
+                                             const ReachOptions& options) {
+    SymbolicReach runner(engine, program, options);
+    return runner.explore();
 }
 
 } // namespace centrifuge

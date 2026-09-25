@@ -13,6 +13,7 @@
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "centrifuge/ir.hpp"
 #include "centrifuge/sleigh.hpp"
@@ -76,7 +77,8 @@ std::string decompile(
     const std::map<uint64_t, DataType>* callResultTypes = nullptr,
     const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites = nullptr,
     const SymIndirectSites* symIndirectSites = nullptr,
-    const SymBranchCoverage* symCoverage = nullptr);
+    const SymBranchCoverage* symCoverage = nullptr,
+    const std::vector<JumpTable>* jumpTables = nullptr);
 
 // Emits a complete C-like function with the recovered declaration and ABI
 // register aliases.  Direct calls use propagated callee signatures.
@@ -99,6 +101,7 @@ std::string decompileTyped(
     const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites =
         nullptr,
     const SymIndirectSites* symIndirectSites = nullptr,
-    const SymBranchCoverage* symCoverage = nullptr);
+    const SymBranchCoverage* symCoverage = nullptr,
+    const std::vector<JumpTable>* jumpTables = nullptr);
 
 } // namespace centrifuge

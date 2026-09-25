@@ -13,7 +13,8 @@ namespace centrifuge {
 bool CfgBuilder::build(
     const SleighEngine& eng,
     const std::function<bool(uint64_t, void*, size_t)>& read, uint64_t start,
-    uint64_t end, const std::function<bool(uint64_t)>& isExecutable) {
+    uint64_t end, const std::function<bool(uint64_t)>& isExecutable,
+    const std::vector<JumpTable>* jumpTables) {
     blocks_.clear();
     idx_.clear();
     loops_.clear();
@@ -79,6 +80,17 @@ bool CfgBuilder::build(
                 return operation.op == POp::TRAP;
             });
         if (traps) continue;
+        // Jump-table hint: an indirect branch whose dispatch is covered by
+        // a recovered (statically or symbolically) table branches to every
+        // case target.  Enqueue them so the case bodies become regular
+        // CFG blocks; addUnique keeps overlap with known targets cheap.
+        if (jumpTables) {
+            for (const JumpTable& table : *jumpTables) {
+                if (table.dispatchAddress != a) continue;
+                for (uint64_t target : table.targets)
+                    enqueue(a, target, true);
+            }
+        }
         switch (pi.kind) {
         case Insn::RET:
             break;

@@ -50,13 +50,33 @@ struct NaturalLoop {
     std::optional<uint64_t> parentHeader;
 };
 
+// A recovered switch/jump-table dispatch: the indirect branch at
+// `dispatchAddress` selects one of `targets` (table slot i dispatches to
+// targets[i]).  `tableAddress`/`entrySize`/`relative` describe the static
+// table image (tableAddress == 0 for a synthetically-built table, e.g.
+// from symbolic-exploration targets).  Consumed by the decompiler to
+// structure the dispatch into a switch and, via CfgBuilder::build, to add
+// the case bodies as real CFG blocks.
+struct JumpTable {
+    uint64_t dispatchAddress = 0;
+    uint64_t tableAddress = 0;
+    int entrySize = 0;
+    bool relative = false;
+    std::vector<uint64_t> targets;
+};
+
 class CfgBuilder {
 public:
     // Disassembles from `start` until RET / undecodable / `end` (exclusive).
+    // When `jumpTables` is given, the case targets of any table whose
+    // dispatch instruction is discovered are enqueued as branch targets, so
+    // switch bodies become ordinary CFG blocks (successors, loops, liveness)
+    // instead of unreachable dead code after an indirect branch.
     bool build(const SleighEngine& eng,
                const std::function<bool(uint64_t, void*, size_t)>& read,
                uint64_t start, uint64_t end,
-               const std::function<bool(uint64_t)>& isExecutable = {});
+               const std::function<bool(uint64_t)>& isExecutable = {},
+               const std::vector<JumpTable>* jumpTables = nullptr);
 
     const std::vector<CfgBlock>& blocks() const { return blocks_; }
     const CfgBlock* blockAt(uint64_t startAddr) const;

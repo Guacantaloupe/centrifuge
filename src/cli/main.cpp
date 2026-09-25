@@ -958,12 +958,46 @@ int cmdSpec(int argc, char** argv) {
                              symRes.coverage.visitedPcs.size());
             }
         }
+        // WS7 switch recovery: statically recover jump tables from the
+        // image (table contents are readable data) and merge in any
+        // multi-target indirect-branch sites the symbolic exploration
+        // resolved (covers relative/offset tables and computed dispatches
+        // the static scan misses).  The decompiler feeds these to
+        // CfgBuilder so case bodies become real blocks, then emits a C
+        // switch at the dispatch site.
+        std::vector<JumpTable> jumpTables =
+            recoverJumpTables(cfg, prog->memory,
+                              prog->arch == "x86" ? 4 : 8);
+        for (const auto& site : symSites) {
+            if (site.second.isCall || site.second.targets.size() < 2)
+                continue;
+            auto existing = std::find_if(
+                jumpTables.begin(), jumpTables.end(),
+                [&](const JumpTable& t) {
+                    return t.dispatchAddress == site.first;
+                });
+            if (existing == jumpTables.end()) {
+                JumpTable synthetic;
+                synthetic.dispatchAddress = site.first;
+                synthetic.targets = site.second.targets;
+                jumpTables.push_back(std::move(synthetic));
+            } else {
+                for (uint64_t t : site.second.targets)
+                    if (std::find(existing->targets.begin(),
+                                  existing->targets.end(),
+                                  t) == existing->targets.end())
+                        existing->targets.push_back(t);
+                std::sort(existing->targets.begin(),
+                          existing->targets.end());
+            }
+        }
         std::printf("%s", decompile(*eng, reader, addr, end, nameOf,
                                      signatureOf, arch, false, &model,
                                      &globals, nullptr, entryName, nullptr,
                                      nullptr, nullptr, nullptr,
                                      symSites.empty() ? nullptr : &symSites,
-                                     symExplore ? &symCoverage : nullptr)
+                                     symExplore ? &symCoverage : nullptr,
+                                     &jumpTables)
                         .c_str());
         return 0;
     }

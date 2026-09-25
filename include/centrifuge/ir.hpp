@@ -273,14 +273,7 @@ public:
     }
 };
 
-struct JumpTable {
-    uint64_t dispatchAddress = 0;
-    uint64_t tableAddress = 0;
-    int entrySize = 0;
-    bool relative = false;
-    std::vector<uint64_t> targets;
-};
-
+// JumpTable lives in cfg.hpp (CfgBuilder consumes it); pulled in above.
 std::vector<JumpTable> recoverJumpTables(const CfgBuilder& cfg,
                                          const MemoryImage& memory,
                                          int pointerSize = 8,

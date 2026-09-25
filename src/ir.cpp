@@ -1414,6 +1414,287 @@ void FunctionIR::optimize() {
         }
 }
 
+// Cross-instruction chase for table dispatch inside one basic block.
+// Handles the dominant clang/PE relative-table shape split across several
+// machine instructions:
+//     lea     rcx, [rip+table]
+//     movsxd  rax, dword ptr [rcx + rax*4]
+//     add     rax, rcx
+//     jmp     rax
+// where the simple single-instruction chase sees only `jmp rax`.  Builds a
+// position-indexed local value model (constants, LEA addresses, LOADs,
+// ADD/MUL combinations over registers and per-instruction temps), resolves
+// the branch input against the last write before the branch, and extracts
+// (slot base, scale, relative base) for the caller to read entries.
+namespace {
+
+struct JtArg {
+    enum K { NONE, CONST, REG, TEMP } k = NONE;
+    uint64_t v = 0;  // const value / register offset / temp varnode id
+};
+
+struct JtExpr {
+    enum K { UNKNOWN, CONST, LEA, LOAD, ADD, MUL, SEXT, ZEXT, COPY } k =
+        UNKNOWN;
+    JtArg a, b;
+    int loadSize = 0;
+    uint64_t pos = 0;  // linear write position (insn-major, op-minor)
+};
+
+std::optional<JumpTable> chaseBlockDispatch(const CfgBlock& block,
+                                            const PcodeInsn& branchInsn,
+                                            const PcodeOp& branch,
+                                            const MemoryImage& memory,
+                                            size_t maxEntries) {
+    auto dbg = [&](int line) {
+        if (std::getenv("JTDEBUG"))
+            std::fprintf(stderr, "[jt] bail line %d\n", line);
+    };
+    // Index every write in the block with a linear position.
+    std::map<uint64_t, std::vector<std::pair<uint64_t, JtExpr>>> regWrites;
+    std::map<uint64_t, std::map<uint64_t, JtExpr>> tempDefs;  // insn addr -> temp id -> expr
+    auto argOf = [&](const PcodeInsn& pi, uint64_t id) -> JtArg {
+        const Varnode* v = pi.find(id);
+        if (!v) return {};
+        if (v->kind == Varnode::CONST) return {JtArg::CONST, v->offset};
+        if (v->kind == Varnode::REGISTER) return {JtArg::REG, v->offset};
+        // Unique temps and named address expressions (e.g. `[rcx+rax*4]`)
+        // are both block-local values: treat any non-const, non-register
+        // varnode as a temp.
+        return {JtArg::TEMP, v->id};
+    };
+    uint64_t position = 0;
+    for (const PcodeInsn& pi : block.insns) {
+        std::map<uint64_t, JtExpr>& temps = tempDefs[pi.addr];
+        for (const PcodeOp& op : pi.ops) {
+            const uint64_t pos = position++;
+            if (!op.out) continue;
+            const Varnode* out = pi.find(op.out);
+            if (!out) continue;
+            JtExpr e;
+            e.pos = pos;
+            switch (op.op) {
+            case POp::COPY:
+                e.k = JtExpr::COPY; e.a = argOf(pi, op.in0); break;
+            case POp::INT_ADD:
+                e.k = JtExpr::ADD; e.a = argOf(pi, op.in0);
+                e.b = argOf(pi, op.in1); break;
+            case POp::INT_MULT:
+                e.k = JtExpr::MUL; e.a = argOf(pi, op.in0);
+                e.b = argOf(pi, op.in1); break;
+            case POp::INT_SEXT:
+                e.k = JtExpr::SEXT; e.a = argOf(pi, op.in0); break;
+            case POp::INT_ZEXT:
+                e.k = JtExpr::ZEXT; e.a = argOf(pi, op.in0); break;
+            case POp::SUBPIECE:
+                // Truncation of a loaded slot value: pass-through.
+                e.k = JtExpr::COPY; e.a = argOf(pi, op.in0); break;
+            case POp::LOAD:
+                e.k = JtExpr::LOAD; e.a = argOf(pi, op.in0);
+                e.loadSize = out->size; break;
+            default: break;
+            }
+            if (e.k == JtExpr::UNKNOWN) continue;
+            if (out->kind == Varnode::REGISTER)
+                regWrites[out->offset].push_back({pos, std::move(e)});
+            else
+                temps[op.out] = std::move(e);
+        }
+        // LEA lifts to a COPY/INT_ADD of a constant address; record a
+        // CONST value for any register written by an op whose inputs are
+        // both constant (covers COPY const and ADD of rip+disp).
+        // (Handled implicitly: COPY/ADD with CONST arg resolve below.)
+        (void)temps;
+    }
+
+    const uint64_t branchPos = position;  // after all ops in the block
+    std::function<std::optional<JtExpr>(const JtArg&, uint64_t)> resolve =
+        [&](const JtArg& arg, uint64_t beforePos) -> std::optional<JtExpr> {
+        if (arg.k == JtArg::CONST) {
+            JtExpr e; e.k = JtExpr::CONST; e.a = arg; return e;
+        }
+        if (arg.k == JtArg::REG) {
+            const auto it = regWrites.find(arg.v);
+            if (it == regWrites.end()) { dbg(__LINE__); return std::nullopt; }
+            for (auto w = it->second.rbegin(); w != it->second.rend(); ++w)
+                if (w->first < beforePos) return w->second;
+            { dbg(__LINE__); return std::nullopt; }
+        }
+        if (arg.k == JtArg::TEMP) {
+            // Search temps of instructions at positions < beforePos.
+            for (auto ti = tempDefs.rbegin(); ti != tempDefs.rend(); ++ti) {
+                const auto& te = ti->second;
+                const auto it = te.find(arg.v);
+                if (it == te.end()) continue;
+                // Reject if this temp's instruction starts at/after
+                // beforePos: approximate via stored pos inside expr.
+                if (it->second.pos >= beforePos) continue;
+                return it->second;
+            }
+            { dbg(__LINE__); if (std::getenv("JTDEBUG2")) std::fprintf(stderr,
+                "[jt2] temp 0x%llx before %llu not found (blocks=%zu tempsets=%zu)\n",
+                (unsigned long long)arg.v, (unsigned long long)beforePos,
+                block.insns.size(), tempDefs.size());
+              return std::nullopt; }
+        }
+        { dbg(__LINE__); return std::nullopt; }
+    };
+
+    // Address-value resolution: base constant + index*scale (+ index arg).
+    struct AddrVal { uint64_t base = 0; int scale = 0; JtArg index; };
+    std::function<std::optional<AddrVal>(const JtArg&, uint64_t)> evalAddrArg =
+        [&](const JtArg& arg, uint64_t beforePos)
+        -> std::optional<AddrVal> {
+        const auto resolved = resolve(arg, beforePos);
+        if (!resolved) { dbg(__LINE__); return std::nullopt; }
+        const JtExpr& e = *resolved;
+        if (e.k == JtExpr::CONST && e.a.k == JtArg::CONST)
+            return AddrVal{e.a.v, 0, {}};
+        if (e.k == JtExpr::ADD) {
+            // One side constant (base), other the scaled index (or plain).
+            uint64_t base = 0;
+            const JtArg* other = nullptr;
+            if (e.a.k == JtArg::CONST) { base = e.a.v; other = &e.b; }
+            else if (e.b.k == JtArg::CONST) { base = e.b.v; other = &e.a; }
+            if (!other) {
+                // Neither side is a literal constant: one may still be a
+                // register/temp holding a constant (e.g. an LEA result
+                // lifted as `COPY reg, const`).
+                for (const JtArg* side : {&e.a, &e.b}) {
+                    if (side->k == JtArg::CONST) continue;
+                    auto sub = resolve(*side, e.pos);
+                    for (int guard = 0; guard < 8 && sub; ++guard) {
+                        if (sub->k == JtExpr::COPY ||
+                            sub->k == JtExpr::SEXT ||
+                            sub->k == JtExpr::ZEXT) {
+                            const auto next = resolve(sub->a, sub->pos);
+                            if (!next) break;
+                            sub = next;
+                        } else break;
+                    }
+                    if (sub && sub->k == JtExpr::CONST &&
+                        sub->a.k == JtArg::CONST) {
+                        base = sub->a.v;
+                        other = side == &e.a ? &e.b : &e.a;
+                        break;
+                    }
+                }
+                if (!other) { dbg(__LINE__); return std::nullopt; }
+            }
+            if (other->k == JtArg::CONST) { dbg(__LINE__); return std::nullopt; }
+            const auto sub = resolve(*other, e.pos);
+            if (!sub) return AddrVal{base, 1, *other};
+            if (sub->k == JtExpr::MUL) {
+                const JtArg* idx = nullptr;
+                int scale = 0;
+                for (const JtArg* cand : {&sub->a, &sub->b}) {
+                    if (cand->k == JtArg::CONST) scale = (int)cand->v;
+                    else idx = cand;
+                }
+                if (!idx || scale <= 0) { dbg(__LINE__); return std::nullopt; }
+                return AddrVal{base, scale, *idx};
+            }
+            return AddrVal{base, 1, *other};
+        }
+        { dbg(__LINE__); return std::nullopt; }
+    };
+
+    // Resolve the branch input: REGISTER (or temp) at branchPos.
+    const Varnode* bv = branchInsn.find(branch.in0);
+    if (!bv) { dbg(__LINE__); return std::nullopt; }
+    JtArg root;
+    if (bv->kind == Varnode::REGISTER) root = {JtArg::REG, bv->offset};
+    else if (bv->kind == Varnode::UNIQUE) root = {JtArg::TEMP, bv->id};
+    else { dbg(__LINE__); return std::nullopt; }
+    auto target = resolve(root, branchPos);
+    if (!target) { dbg(__LINE__); return std::nullopt; }
+    // Unwrap extensions/copies.
+    for (int guard = 0; guard < 8; ++guard) {
+        if (target->k == JtExpr::SEXT || target->k == JtExpr::ZEXT ||
+            target->k == JtExpr::COPY) {
+            const auto next = resolve(target->a, target->pos);
+            if (!next) break;
+            target = next;
+        } else break;
+    }
+
+    // Shape A (absolute): LOAD from base+index*scale.
+    // Shape B (relative): ADD(LOAD, const base) in either operand order.
+    JtExpr loadHolder;
+    const JtExpr* load = nullptr;
+    uint64_t relativeBase = 0;
+    if (target->k == JtExpr::LOAD) {
+        loadHolder = *target;
+        load = &loadHolder;
+    } else if (target->k == JtExpr::ADD) {
+        bool haveLoad = false;
+        for (const JtArg* side : {&target->a, &target->b}) {
+            if (side->k == JtArg::CONST) { relativeBase = side->v; continue; }
+            auto sub = resolve(*side, target->pos);
+            // Unwrap copies/extensions between the ADD and its operands.
+            for (int guard = 0; guard < 8 && sub; ++guard) {
+                if (sub->k == JtExpr::COPY || sub->k == JtExpr::SEXT ||
+                    sub->k == JtExpr::ZEXT) {
+                    const auto next = resolve(sub->a, sub->pos);
+                    if (!next) break;
+                    sub = next;
+                } else break;
+            }
+            if (!sub) { dbg(__LINE__); return std::nullopt; }
+            if (sub->k == JtExpr::LOAD) {
+                loadHolder = *sub;
+                load = &loadHolder;
+                haveLoad = true;
+            } else if (sub->k == JtExpr::CONST &&
+                       sub->a.k == JtArg::CONST) {
+                relativeBase = sub->a.v;
+            } else {
+                { dbg(__LINE__); return std::nullopt; }
+            }
+        }
+        if (!haveLoad || relativeBase == 0) {
+            dbg(__LINE__);
+            { dbg(__LINE__); return std::nullopt; }
+        }
+    } else {
+        { dbg(__LINE__); return std::nullopt; }
+    }
+
+    const auto addr = evalAddrArg(load->a, load->pos);
+    if (!addr || addr->scale <= 0 || addr->base == 0) { dbg(__LINE__); return std::nullopt; }
+    if (addr->scale != 4 && addr->scale != 8) { dbg(__LINE__); return std::nullopt; }
+    if (!memory.isReadable(addr->base)) { dbg(__LINE__); return std::nullopt; }
+
+    JumpTable table;
+    table.dispatchAddress = branchInsn.addr;
+    table.tableAddress = addr->base;
+    table.entrySize = addr->scale;
+    table.relative = relativeBase != 0;
+    const int entryBytes = addr->scale;
+    for (size_t i = 0; i < maxEntries; ++i) {
+        uint64_t raw = 0;
+        if (!memory.read(addr->base + i * entryBytes, &raw, entryBytes)) break;
+        uint64_t target_addr;
+        if (table.relative) {
+            const int64_t disp =
+                entryBytes == 4 ? static_cast<int32_t>(raw & 0xffffffffULL)
+                                : static_cast<int64_t>(raw);
+            const uint64_t base = relativeBase;
+            target_addr = disp >= 0
+                              ? base + static_cast<uint64_t>(disp)
+                              : base - static_cast<uint64_t>(-disp);
+        } else {
+            target_addr = entryBytes == 4 ? raw & 0xffffffffULL : raw;
+        }
+        if (!memory.isExecutable(target_addr)) break;
+        table.targets.push_back(target_addr);
+    }
+    if (table.targets.size() >= 2) return table;
+    { dbg(__LINE__); return std::nullopt; }
+}
+
+}  // namespace
+
 std::vector<JumpTable> recoverJumpTables(const CfgBuilder& cfg,
                                          const MemoryImage& memory,
                                          int pointerSize, size_t maxEntries) {
@@ -1444,7 +1725,21 @@ std::vector<JumpTable> recoverJumpTables(const CfgBuilder& cfg,
                         if (v && v->isConst()) { base = v->offset; haveBase = true; }
                     }
                 }
-                if (!haveBase || !memory.isReadable(base)) continue;
+                if (!haveBase || !memory.isReadable(base)) {
+                    // Cross-instruction fallback: the dominant clang/PE
+                    // relative-table shape (lea base; movsxd slot; add base;
+                    // jmp reg) spreads the dispatch over several
+                    // instructions, invisible to the single-instruction
+                    // chase above.
+                    if (auto t = chaseBlockDispatch(block, insn, branch,
+                                                    memory, maxEntries))
+                        result.push_back(std::move(*t));
+                    else if (std::getenv("JTDEBUG"))
+                        std::fprintf(stderr,
+                                     "[jt] chase failed dispatch 0x%llx\n",
+                                     (unsigned long long)insn.addr);
+                    continue;
+                }
                 JumpTable table;
                 table.dispatchAddress = insn.addr; table.tableAddress = base;
                 table.entrySize = pointerSize;

@@ -104,10 +104,21 @@ it to **symbolic values** (expression trees over registers/memory):
   state reached are annotated too.  Gated on a complete run (budget
   exhaustion disables elimination, since unobserved then means "unknown",
   not "dead").
+- Switch/jump-table recovery (WS7): `recoverJumpTables` now chases the
+  dispatch across the whole basic block (position-indexed local value
+  model), covering the dominant clang/PE relative-table shape (`lea base;
+  movsxd slot; add base; jmp reg`) that the single-instruction chase could
+  never see; multi-target symbolic BRANCHIND sites merge in as synthetic
+  tables.  CfgBuilder takes the tables as a hint and enqueues every case
+  target, so switch bodies become real CFG blocks (liveness, loops, stack
+  analysis all apply), and the emitter prints a C `switch` at the dispatch
+  - recovered index when derivable (`switch (x) { case 0: ... }`), the
+  resolved target value with absolute-address cases otherwise.  Case
+  bodies keep their labels, so output stays recompilable.
 
-Still open: state merging (item 5), switch structuring from multi-target
-jump sites, CMOV/select concretization in the executor (limits coverage of
-register-indirect dispatches selected by cmov).
+Still open: state merging (item 5), CMOV/select concretization in the
+executor (limits coverage of register-indirect dispatches selected by
+cmov).
 
 ## 🎯 v0.8 — Breadth
 - More formats: Mach-O, raw, archives; more ISAs via specs (ARM, MIPS, ...)

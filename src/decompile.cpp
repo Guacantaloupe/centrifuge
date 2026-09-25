@@ -5960,9 +5960,19 @@ std::string decompile(
     const std::map<uint64_t, DataType>* callResultTypes,
     const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites,
     const SymIndirectSites* symIndirectSites,
-    const SymBranchCoverage* symCoverage) {
+    const SymBranchCoverage* symCoverage,
+    const std::vector<JumpTable>* jumpTables) {
     CfgBuilder cfg;
-    if (!cfg.build(eng, read, start, end)) return "// failed to build CFG\n";
+    if (!cfg.build(eng, read, start, end, {}, jumpTables))
+        return "// failed to build CFG\n";
+
+    // Jump-table lookup for the dispatch site currently being emitted.
+    std::map<uint64_t, const JumpTable*> tablesByDispatch;
+    if (jumpTables)
+        for (const JumpTable& table : *jumpTables)
+            if (table.targets.size() >= 2 &&
+                !tablesByDispatch.count(table.dispatchAddress))
+                tablesByDispatch[table.dispatchAddress] = &table;
 
     std::ostringstream out;
     out << "// decompiled " << hexAddr(start) << "\n";
@@ -6556,6 +6566,361 @@ be.pushSlots = &pushSlots;
                     << (onlyTaken ? "taken" : "fall-through") << " */\n";
                 emitBlock(live, depth);
                 return;
+            }
+        }
+        // WS7 switch recovery: an indirect branch covered by a recovered
+        // jump table (static image scan and/or symbolic-exploration
+        // targets) restructures into a C switch.  The case bodies are
+        // already ordinary CFG blocks (CfgBuilder enqueued the table
+        // targets), so emit switch-of-gotos here and let the trailing
+        // emission print the labeled bodies - semantics-preserving and
+        // recompilable even when the bodies share code or fall through.
+        if ((term->kind == Insn::JMP || term->kind == Insn::OTHER) &&
+            !term->targetKnown) {
+            const auto tbl = tablesByDispatch.find(term->addr);
+            if (std::getenv("SWDEBUG"))
+                std::fprintf(stderr,
+                             "[sw] jmp@0x%llx kind=%d table=%s index... ",
+                             (unsigned long long)term->addr, (int)term->kind,
+                             tbl == tablesByDispatch.end() ? "none"
+                                                           : "found");
+            if (tbl != tablesByDispatch.end()) {
+                // p-code def index across the WHOLE dispatch block: the
+                // slot load/add typically live in earlier instructions of
+                // the same block, and a subregister read (`jmp eax`) has
+                // a different varnode than the full-register write.
+                struct JtRef {
+                    const PcodeOp* op;
+                    const PcodeInsn* pi;
+                    uint64_t pos;
+                };
+                std::map<uint64_t, std::vector<JtRef>> defsById, defsByReg;
+                uint64_t jtPos = 0;
+                for (const PcodeInsn& pi : b->insns)
+                    for (const PcodeOp& op : pi.ops) {
+                        const uint64_t pos = jtPos++;
+                        if (!op.out) continue;
+                        const Varnode* out = pi.find(op.out);
+                        if (!out) continue;
+                        defsById[op.out].push_back({&op, &pi, pos});
+                        if (out->kind == Varnode::REGISTER)
+                            defsByReg[out->offset].push_back({&op, &pi, pos});
+                    }
+                // Varnode ids are reused across instructions, so a bare id
+                // lookup is ambiguous.  Resolution order: (1) a def in the
+                // SAME instruction as the consumer, (2) the last register-
+                // offset write before the consumer (reliable for registers
+                // regardless of id reuse), (3) any earlier same-id def.
+                auto defBefore = [&](uint64_t id, uint64_t beforePos,
+                                     uint64_t regOffset,
+                                     const PcodeInsn* preferPi) -> JtRef {
+                    auto it = defsById.find(id);
+                    if (preferPi && it != defsById.end())
+                        for (auto w = it->second.rbegin();
+                             w != it->second.rend(); ++w)
+                            if (w->pi == preferPi && w->pos < beforePos)
+                                return *w;
+                    if (regOffset != ~0ULL) {
+                        const auto ri = defsByReg.find(regOffset);
+                        if (ri != defsByReg.end())
+                            for (auto w = ri->second.rbegin();
+                                 w != ri->second.rend(); ++w)
+                                if (w->pos < beforePos) return *w;
+                    }
+                    if (it != defsById.end())
+                        for (auto w = it->second.rbegin();
+                             w != it->second.rend(); ++w)
+                            if (w->pos < beforePos) return *w;
+                    return {nullptr, nullptr, 0};
+                };
+                auto regOffsetOf = [&](const PcodeInsn& pi,
+                                       uint64_t id) -> uint64_t {
+                    const Varnode* v = pi.find(id);
+                    return v && v->kind == Varnode::REGISTER ? v->offset
+                                                             : ~0ULL;
+                };
+                // Does this varnode reduce to a constant (through COPY/
+                // extension chains, e.g. an LEA lifted as COPY reg,const)?
+                std::function<std::optional<uint64_t>(uint64_t,
+                                                      const PcodeInsn*,
+                                                      uint64_t, int)>
+                    constThroughDefs =
+                        [&](uint64_t id, const PcodeInsn* pi,
+                            uint64_t beforePos, int guard) -> std::optional<uint64_t> {
+                    if (guard <= 0 || !pi) return std::nullopt;
+                    const Varnode* v = pi->find(id);
+                    if (!v) return std::nullopt;
+                    if (v->kind == Varnode::CONST) return v->offset;
+                    const JtRef d = defBefore(
+                        id, beforePos, regOffsetOf(*pi, id), pi);
+                    if (d.op && (d.op->op == POp::COPY ||
+                                 d.op->op == POp::INT_ZEXT ||
+                                 d.op->op == POp::INT_SEXT ||
+                                 d.op->op == POp::SUBPIECE))
+                        return constThroughDefs(d.op->in0, d.pi, d.pos,
+                                                guard - 1);
+                    return std::nullopt;
+                };
+                // Recover the table index: BRANCHIND input -> COPY/ext
+                // chain -> LOAD (slot) -> address = base + index*scale.
+                // The LOAD may sit inside an ADD that combines the slot
+                // value with the relative table base (`add rax, rcx`), so
+                // chase each side of intervening ADDs too.
+                const PcodeOp* branch = nullptr;
+                for (const auto& op : term->ops)
+                    if (op.op == POp::BRANCHIND) branch = &op;
+                uint64_t root = branch ? branch->in0 : 0;
+                const PcodeOp* load = nullptr;
+                const PcodeInsn* loadPi = nullptr;
+                uint64_t loadAddrId = 0;
+                uint64_t loadPos = 0;
+                std::function<bool(uint64_t, const PcodeInsn*, uint64_t, int)>
+                    chaseToLoad = [&](uint64_t id, const PcodeInsn* pi,
+                                      uint64_t beforePos, int guard) -> bool {
+                    if (guard <= 0) return false;
+                    const JtRef d =
+                        defBefore(id, beforePos, regOffsetOf(*pi, id), pi);
+                    if (!d.op) return false;
+                    if (d.op->op == POp::COPY || d.op->op == POp::INT_ZEXT ||
+                        d.op->op == POp::INT_SEXT ||
+                        d.op->op == POp::SUBPIECE)
+                        return chaseToLoad(d.op->in0, d.pi, d.pos, guard - 1);
+                    if (d.op->op == POp::LOAD) {
+                        load = d.op;
+                        loadPi = d.pi;
+                        loadAddrId = d.op->in0;
+                        loadPos = d.pos;
+                        return true;
+                    }
+                    if (d.op->op == POp::INT_ADD) {
+                        for (uint64_t side : {d.op->in0, d.op->in1})
+                            if (chaseToLoad(side, d.pi, d.pos, guard - 1))
+                                return true;
+                    }
+                    return false;
+                };
+                chaseToLoad(root, term, ~0ULL, 12);
+                if (std::getenv("SWDEBUG"))
+                    std::fprintf(stderr, "[sw] load=%s addrId=%llu ",
+                                 load ? "yes" : "no",
+                                 (unsigned long long)loadAddrId);
+                uint64_t indexId = 0;
+                const PcodeInsn* indexPi = nullptr;
+                uint64_t indexBefore = ~0ULL;
+                if (load) {
+                    // Varnode ids are reused across instructions: bound the
+                    // def search by the LOAD's position.
+                    const JtRef addrDef =
+                        defBefore(loadAddrId, loadPos, ~0ULL, loadPi);
+                    if (std::getenv("SWDEBUG")) {
+                        std::fprintf(stderr, "addrOp=%d ",
+                                     addrDef.op ? (int)addrDef.op->op : -1);
+                        if (addrDef.op && addrDef.op->op == POp::INT_ADD) {
+                            const Varnode* sa = addrDef.pi->find(addrDef.op->in0);
+                            const Varnode* sb = addrDef.pi->find(addrDef.op->in1);
+                            std::fprintf(stderr, "sides=%d/%d ",
+                                         sa ? (int)sa->kind : -1,
+                                         sb ? (int)sb->kind : -1);
+                        }
+                    }
+                    uint64_t scaledId = 0;
+                    const PcodeInsn* scaledPi = nullptr;
+                    if (addrDef.op && addrDef.op->op == POp::INT_ADD) {
+                        const Varnode* a = addrDef.pi->find(addrDef.op->in0);
+                        const Varnode* c = addrDef.pi->find(addrDef.op->in1);
+                        if (a && a->kind == Varnode::CONST &&
+                            c && c->kind != Varnode::CONST) {
+                            scaledId = addrDef.op->in1;
+                            scaledPi = addrDef.pi;
+                        } else if (c && c->kind == Varnode::CONST &&
+                                   a && a->kind != Varnode::CONST) {
+                            scaledId = addrDef.op->in0;
+                            scaledPi = addrDef.pi;
+                        } else {
+                            // Neither side a literal: one may still be a
+                            // register holding the table base (LEA).
+                            for (uint64_t side : {addrDef.op->in0,
+                                                  addrDef.op->in1}) {
+                                const Varnode* sv = addrDef.pi->find(side);
+                                if (!sv || sv->kind == Varnode::CONST)
+                                    continue;
+                                const auto cv = constThroughDefs(
+                                    side, addrDef.pi, addrDef.pos, 8);
+                                if (std::getenv("SWDEBUG"))
+                                    std::fprintf(stderr, "side=%llu cv=%d ",
+                                                 (unsigned long long)side,
+                                                 cv ? 1 : 0);
+                                if (cv) {
+                                    scaledId = side == addrDef.op->in0
+                                                   ? addrDef.op->in1
+                                                   : addrDef.op->in0;
+                                    scaledPi = addrDef.pi;
+                                    break;
+                                }
+                            }
+                        }
+                    } else if (addrDef.op && addrDef.op->op == POp::INT_MULT) {
+                        scaledId = loadAddrId;
+                    }
+                    // Strip the scale: index * entrySize -> index.  Only
+                    // temp-to-temp COPY/extension chains are followed; a
+                    // register write ends the chase at the register read,
+                    // which is the index expression.
+                    uint64_t candidate = scaledId;
+                    const PcodeInsn* candPi = scaledPi;
+                    uint64_t candBefore = addrDef.op ? addrDef.pos : ~0ULL;
+                    std::set<uint64_t> seen;
+                    while (candidate && seen.insert(candidate).second) {
+                        const PcodeInsn* pi =
+                            candPi
+                                ? candPi
+                                : (defsById.count(candidate)
+                                       ? defsById[candidate].back().pi
+                                       : term);
+                        if (!pi) break;
+                        const Varnode* v = pi->find(candidate);
+                        if (!v) break;
+                        if (v->kind == Varnode::CONST) {
+                            candidate = 0;  // index reduced to a constant
+                            break;
+                        }
+                        const JtRef d = defBefore(
+                            candidate, candBefore,
+                            regOffsetOf(*pi, candidate), pi);
+                        if (!d.op) break;  // incoming value: index found
+                        if (d.op->op == POp::INT_MULT) {
+                            const Varnode* a = d.pi->find(d.op->in0);
+                            const Varnode* c = d.pi->find(d.op->in1);
+                            if (a && a->kind == Varnode::CONST)
+                                candidate = d.op->in1;
+                            else if (c && c->kind == Varnode::CONST)
+                                candidate = d.op->in0;
+                            else
+                                break;  // two symbolic factors: give up
+                        } else if (d.op->op == POp::INT_ZEXT ||
+                                   d.op->op == POp::INT_SEXT ||
+                                   d.op->op == POp::COPY) {
+                            const Varnode* outV = d.pi->find(d.op->out);
+                            if (outV && outV->kind == Varnode::REGISTER)
+                                break;  // register write: the register as
+                                        // read here IS the index
+                            candidate = d.op->in0;
+                        } else {
+                            break;
+                        }
+                        candPi = d.pi;
+                        candBefore = d.pos;
+                    }
+                    indexId = candidate;
+                    indexPi = candPi;
+                    indexBefore = candBefore;
+                    if (std::getenv("SWDEBUG"))
+                        std::fprintf(stderr, "indexId=%llu ",
+                                     (unsigned long long)indexId);
+                }
+                // Text of a varnode: registers read as their (ABI-renamed)
+                // names; temps chase COPY/extension chains.  For the index
+                // do NOT consult be.regExpr - by the branch it holds the
+                // loaded target value, not the incoming index.
+                std::function<std::string(uint64_t, const PcodeInsn*,
+                                          uint64_t, int, bool)>
+                    exprOfId = [&](uint64_t id, const PcodeInsn* pi,
+                                   uint64_t beforePos, int guard,
+                                   bool useRegExpr) -> std::string {
+                    if (guard <= 0 || !pi) return "";
+                    const Varnode* v = pi->find(id);
+                    if (!v) return "";
+                    if (v->kind == Varnode::CONST) return hexAddr(v->offset);
+                    if (v->kind == Varnode::REGISTER && !useRegExpr)
+                        return registerName(
+                            architecture,
+                            registerStorageOffset(architecture, v->offset,
+                                                  v->size),
+                            v->size);
+                    const JtRef d = defBefore(
+                        id, beforePos, regOffsetOf(*pi, id), pi);
+                    if (d.op && (d.op->op == POp::COPY ||
+                                 d.op->op == POp::INT_ZEXT ||
+                                 d.op->op == POp::INT_SEXT ||
+                                 d.op->op == POp::SUBPIECE))
+                        return exprOfId(d.op->in0, d.pi, d.pos, guard - 1,
+                                        useRegExpr);
+                    if (v->kind == Varnode::REGISTER) {
+                        const uint64_t storage = registerStorageOffset(
+                            architecture, v->offset, v->size);
+                        if (useRegExpr) {
+                            const auto def = be.regExpr.find(storage);
+                            if (def != be.regExpr.end() &&
+                                inlineableExpression(def->second))
+                                return stripParens(def->second.text);
+                        }
+                        return registerName(architecture, storage, v->size);
+                    }
+                    return "";
+                };
+                std::string indexText;
+                if (indexId) {
+                    const PcodeInsn* pi = indexPi;
+                    if (!pi && defsById.count(indexId))
+                        pi = defsById[indexId].back().pi;
+                    indexText = exprOfId(indexId, pi, indexBefore, 8, false);
+                }
+                // Every target must be a real block for the goto form.
+                bool allBlocks = true;
+                for (uint64_t target : tbl->second->targets)
+                    if (!cfg.blockAt(target)) allBlocks = false;
+                if (allBlocks) {
+                    const JumpTable& table = *tbl->second;
+                    // Without a recovered index, dispatch on the resolved
+                    // target value itself (cases are absolute addresses).
+                    const bool byTarget = indexText.empty();
+                    if (byTarget) {
+                        // Dispatch on the resolved target value itself:
+                        // render the branch input register's recovered
+                        // expression (the loaded slot + base).
+                        const Varnode* rv = term->find(root);
+                        if (rv && rv->kind == Varnode::REGISTER) {
+                            const uint64_t storage = registerStorageOffset(
+                                architecture, rv->offset, rv->size);
+                            const auto def = be.regExpr.find(storage);
+                            indexText =
+                                def != be.regExpr.end() &&
+                                inlineableExpression(def->second)
+                                    ? stripParens(def->second.text)
+                                    : registerName(architecture, storage,
+                                                   rv->size);
+                        }
+                    }
+                    if (std::getenv("SWDEBUG"))
+                        std::fprintf(stderr, "indexText='%s' byTarget=%d\n",
+                                     indexText.c_str(), (int)byTarget);
+                    if (indexText.empty()) { /* fall through to old paths */ }
+                    else {
+                    for (int i = 0; i <= depth; ++i) out << "    ";
+                    if (table.tableAddress)
+                        out << "/* switch via jump table @ "
+                            << hexAddr(table.tableAddress) << " ("
+                            << table.targets.size() << " cases) */\n";
+                    else
+                        out << "/* switch via symbolically-resolved "
+                            << table.targets.size() << " targets */\n";
+                    for (int i = 0; i <= depth; ++i) out << "    ";
+                    out << "switch (" << indexText << ") {\n";
+                    for (size_t i = 0; i < table.targets.size(); ++i) {
+                        for (int j = 0; j <= depth + 1; ++j) out << "    ";
+                        out << "case ";
+                        if (byTarget)
+                            out << hexAddr(table.targets[i]);
+                        else
+                            out << i;
+                        out << ": goto " << labelName(table.targets[i])
+                            << ";\n";
+                    }
+                    for (int i = 0; i <= depth; ++i) out << "    ";
+                    out << "}\n";
+                    return;
+                    }
+                }
             }
         }
         if (term->kind == Insn::JCC && term->targetKnown &&
@@ -7182,14 +7547,15 @@ std::string decompileTyped(
     const std::map<uint64_t, DataType>* callResultTypes,
     const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites,
     const SymIndirectSites* symIndirectSites,
-    const SymBranchCoverage* symCoverage) {
+    const SymBranchCoverage* symCoverage,
+    const std::vector<JumpTable>* jumpTables) {
     std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
                                  architecture, useRecoveredRuntime,
                                  stackModel, globals, guardSlotOf,
                                  /*entryName=*/"", &signature,
                                  fieldAccessors, callResultTypes,
                                  virtualCallSites, symIndirectSites,
-                                 symCoverage);
+                                 symCoverage, jumpTables);
     // A data-slot trampoline (indirect tail call) forwards the callee's
     // return value through rax, so it must never decompile to void: the
     // typed wrapper's void-return rewrite would turn the dispatch into a

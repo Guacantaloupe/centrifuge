@@ -1,4 +1,4 @@
-﻿# Roadmap — Centrifuge (离心机): merging Ghidra + angr in C++17
+# Roadmap — Centrifuge (离心机): merging Ghidra + angr in C++17
 
 One foundation (loaders → spec-driven disassembly → p-code), two analysis
 rotors: static decompilation (Ghidra) and symbolic exploration (angr).
@@ -76,6 +76,28 @@ it to **symbolic values** (expression trees over registers/memory):
 4. `centrifuge explore <file> --from <addr> --to <addr>` — path finding;
    `--trace` for input synthesis (angr's "what input reaches X?" use case)
 5. State merging (equivalence-class dedup), loop bounding, worklist policies
+
+**Delivered (WS6)**: the rotor is real and now *feeds the decompiler*.
+- `reach <addr>` derives a verified concrete input that reaches a target
+  (stdin/argv/strcmp models, interval solver + concrete replay proof).
+- `explore-indirect` runs bounded BFS exploration to completion and records
+  every indirect call/jump site whose target concretized, with the full
+  observed target set per site.
+- `decompile-native --sym-explore` pipes those sites into the decompiler:
+  single-target indirect calls/tail-jumps devirtualize into direct named
+  calls (e.g. a function pointer loaded from a global becomes
+  `return add(arg0, arg1, ...)`); multi-target sites stay generic
+  dispatchers (switch-shaped evidence, not yet structured).
+- Enablers: `jmp/call r/m64` pcode is a real LOAD+BRANCHIND/CALLIND (was a
+  bogus direct branch to the operand address); PE IAT slots are bound to
+  synthetic `ret` stubs so import crossings resolve to named targets.
+- Windows kernel/driver recovery: PE subsystem/characteristics extracted,
+  native-subsystem entry named `DriverEntry`, ~50 ntoskrnl/hal import
+  prototypes (IoCreateDevice, ExAllocatePool2, Rtl*, Ke*, Mm*, HAL port I/O).
+
+Still open: state merging (item 5), switch structuring from multi-target
+jump sites, CMOV/select concretization in the executor (limits coverage of
+register-indirect dispatches selected by cmov).
 
 ## 🎯 v0.8 — Breadth
 - More formats: Mach-O, raw, archives; more ISAs via specs (ARM, MIPS, ...)

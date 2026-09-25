@@ -314,6 +314,16 @@ ProgramKnowledgeGraph buildProgramKnowledgeGraph(
             graph.addEdge(functionNode->second, globalNode(address),
                           KnowledgeEdgeKind::WRITES, 0.85,
                           "whole-program Mod/Ref (interprocedural)");
+        // MAY-attribution through pointer parameters: lower confidence,
+        // distinct reason, so provable and possible accesses never mix.
+        for (uint64_t address : entry.second.effects.mayReferencedGlobals)
+            graph.addEdge(functionNode->second, globalNode(address),
+                          KnowledgeEdgeKind::READS, 0.5,
+                          "may-read via pointer parameter (points-to)");
+        for (uint64_t address : entry.second.effects.mayModifiedGlobals)
+            graph.addEdge(functionNode->second, globalNode(address),
+                          KnowledgeEdgeKind::WRITES, 0.5,
+                          "may-write via pointer parameter (points-to)");
         // Object/alias evidence: a constant address passed as this argument
         // at any call site is a global the parameter provably may alias.
         const std::string functionKey =

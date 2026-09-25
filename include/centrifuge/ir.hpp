@@ -297,6 +297,13 @@ struct FunctionEffects {
     // callees touch, transitively, across recursion.
     std::set<uint64_t> referencedGlobals;
     std::set<uint64_t> modifiedGlobals;
+    // MAY-attribution through pointer parameters (WS8): globals this
+    // function may read/write because a pointer parameter it dereferences
+    // may alias them (see AnalyzedFunction::paramPointsTo).  Kept separate
+    // from the provable sets above: these edges carry lower confidence in
+    // the knowledge graph.
+    std::set<uint64_t> mayReferencedGlobals;
+    std::set<uint64_t> mayModifiedGlobals;
     ModRefInfo modRef() const {
         if (unknownCall) return ModRefInfo::UNKNOWN;
         if (readsMemory && writesMemory) return ModRefInfo::MOD_REF;
@@ -358,6 +365,13 @@ struct AnalyzedFunction {
     // so a set entry names a provable global object the parameter may
     // alias - the seed of the object/alias analysis.
     std::map<uint64_t, std::set<uint64_t>> paramPointsTo;
+    // Register offsets of pointer parameters this function's body
+    // dereferences: paramReadParams for LOADs, paramWrittenParams for
+    // STOREs.  Combined with paramPointsTo this attributes
+    // may-reads/may-writes to the pointed-to globals (WS8 fixed-point
+    // feedback).
+    std::set<uint64_t> paramReadParams;
+    std::set<uint64_t> paramWrittenParams;
     bool complete = false;
     bool complexityLimited = false;
     std::string incompleteReason;

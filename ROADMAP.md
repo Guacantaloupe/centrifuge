@@ -170,6 +170,17 @@ it to **symbolic values** (expression trees over registers/memory):
   ALIASES edges PARAMETER -> GLOBAL with reason "call-site
   constant-argument points-to" (verified: `rd(&g_x)` produces
   `arg3 -> g_data_140005000`, `rd2(&g_x, &g_y)` both parameters).
+- Fixed-point feedback (WS8): the alias evidence now feeds back into
+  Mod/Ref.  Each function records which pointer parameters its body
+  dereferences (paramReadParams / paramWrittenParams, traced from the
+  LOAD/STORE address back through copy/zext/sext chains to the entry
+  register).  After Phase 7, a dedicated fixed point attributes
+  may-reads/may-writes to the parameter's points-to globals and
+  propagates the attribution through the direct call graph - so
+  `bump(&g_count)`'s `(*p) += 1` surfaces as a may-WRITE edge on bump,
+  main, and the whole CRTStartup chain.  Knowledge graph emits these at
+  confidence 0.5 with reason "may-access via pointer parameter", never
+  mixed with the provable 0.85 Mod/Ref edges.
 
 Still open: state merging (item 5), CMOV/select concretization in the
 executor (limits coverage of register-indirect dispatches selected by

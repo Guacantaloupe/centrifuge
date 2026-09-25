@@ -1428,6 +1428,36 @@ void FunctionIR::optimize() {
 // (slot base, scale, relative base) for the caller to read entries.
 namespace {
 
+// Trace an SSA value back through copy/zext/sext chains to the entry
+// (version 0) register value it derives from; returns that register's
+// storage offset.  Used by WS8 to recognize pointer-parameter accesses:
+// a LOAD/STORE whose address chains back to an entry value is a
+// dereference of that parameter.
+std::optional<uint64_t> traceToEntryRegister(
+    const MidIR& ir, const std::map<SsaId, const SsaOp*>& definitions,
+    SsaId start) {
+    std::set<SsaId> seen;
+    SsaId current = start;
+    while (current && seen.insert(current).second) {
+        const MidValue* value = ir.value(current);
+        if (!value) return std::nullopt;
+        if (value->version == 0 && value->storage == MidValue::REGISTER)
+            return value->offset;
+        const auto definition = definitions.find(current);
+        if (definition == definitions.end()) return std::nullopt;
+        const SsaOp& op = *definition->second;
+        if (!op.phi && !op.removed &&
+            (op.op == POp::COPY || op.op == POp::INT_ZEXT ||
+             op.op == POp::INT_SEXT) &&
+            !op.inputs.empty()) {
+            current = op.inputs[0];
+            continue;
+        }
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
 struct JtArg {
     enum K { NONE, CONST, REG, TEMP } k = NONE;
     uint64_t v = 0;  // const value / register offset / temp varnode id
@@ -1796,6 +1826,10 @@ bool FunctionEffects::mergeFrom(const FunctionEffects& other) {
                              other.referencedGlobals.end());
     modifiedGlobals.insert(other.modifiedGlobals.begin(),
                            other.modifiedGlobals.end());
+    mayReferencedGlobals.insert(other.mayReferencedGlobals.begin(),
+                                other.mayReferencedGlobals.end());
+    mayModifiedGlobals.insert(other.mayModifiedGlobals.begin(),
+                              other.mayModifiedGlobals.end());
     return readsMemory != before.readsMemory ||
            writesMemory != before.writesMemory ||
            allocates != before.allocates || frees != before.frees ||
@@ -1803,7 +1837,9 @@ bool FunctionEffects::mergeFrom(const FunctionEffects& other) {
            referencedObjects != before.referencedObjects ||
            modifiedObjects != before.modifiedObjects ||
            referencedGlobals != before.referencedGlobals ||
-           modifiedGlobals != before.modifiedGlobals;
+           modifiedGlobals != before.modifiedGlobals ||
+           mayReferencedGlobals != before.mayReferencedGlobals ||
+           mayModifiedGlobals != before.mayModifiedGlobals;
 }
 
 const AnalyzedFunction* ProgramAnalysis::functionAt(uint64_t address) const {
@@ -2589,6 +2625,16 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
         analyzed.complete = true;
         size_t indirectCalls = 0;
         bool hasSystemCall = false;
+        // WS8: value->def map for the pointer-parameter trace (the callSite
+        // pass builds its own; this loop is a separate phase).
+        std::map<SsaId, const SsaOp*> memoryDefinitions;
+        for (const MidBlock& block : ir.blocks()) {
+            for (const SsaOp& phi : block.phis)
+                if (phi.output) memoryDefinitions[phi.output] = &phi;
+            for (const SsaOp& operation : block.ops)
+                if (operation.output)
+                    memoryDefinitions[operation.output] = &operation;
+        }
         for (const MidBlock& block : ir.blocks())
             for (const MidInstruction& operation : block.ops) {
                 if (operation.removed) continue;
@@ -2624,11 +2670,19 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                     analyzed.effects.referencedObjects.insert(objectKind);
                     if (globalAddress)
                         analyzed.effects.referencedGlobals.insert(globalAddress);
+                    if (!operation.inputs.empty())
+                        if (const auto entry = traceToEntryRegister(
+                                ir, memoryDefinitions, operation.inputs[0]))
+                            analyzed.paramReadParams.insert(*entry);
                 } else if (operation.op == POp::STORE) {
                     analyzed.effects.writesMemory = true;
                     analyzed.effects.modifiedObjects.insert(objectKind);
                     if (globalAddress)
                         analyzed.effects.modifiedGlobals.insert(globalAddress);
+                    if (!operation.inputs.empty())
+                        if (const auto entry = traceToEntryRegister(
+                                ir, memoryDefinitions, operation.inputs[0]))
+                            analyzed.paramWrittenParams.insert(*entry);
                 } else if (operation.op == POp::CALLIND) {
                     ++indirectCalls;
                 } else if (operation.op == POp::BRANCHIND) {
@@ -3073,6 +3127,42 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
             }
             if (!changed) break;
         }
+    }
+    // WS8 fixed-point feedback: attribute may-reads/may-writes through
+    // pointer parameters to the parameter's points-to globals, then
+    // propagate the attribution through the direct call graph (a caller
+    // may touch everything its callees may touch) until no set grows.
+    // Runs after Phase 7 because it consumes the final paramPointsTo.
+    for (size_t pass = 0; pass < functions_.size() + 1; ++pass) {
+        bool changed = false;
+        for (auto& entry : functions_) {
+            AnalyzedFunction& function = entry.second;
+            if (!function.complete) continue;
+            for (uint64_t offset : function.paramReadParams) {
+                const auto targets = function.paramPointsTo.find(offset);
+                if (targets == function.paramPointsTo.end()) continue;
+                for (uint64_t address : targets->second)
+                    changed |=
+                        function.effects.mayReferencedGlobals.insert(address)
+                            .second;
+            }
+            for (uint64_t offset : function.paramWrittenParams) {
+                const auto targets = function.paramPointsTo.find(offset);
+                if (targets == function.paramPointsTo.end()) continue;
+                for (uint64_t address : targets->second)
+                    changed |=
+                        function.effects.mayModifiedGlobals.insert(address)
+                            .second;
+            }
+        }
+        for (auto& caller : functions_)
+            for (uint64_t calleeAddress : caller.second.callees) {
+                const auto callee = functions_.find(calleeAddress);
+                if (callee != functions_.end())
+                    changed |= caller.second.effects.mergeFrom(
+                        callee->second.effects);
+            }
+        if (!changed) break;
     }
     const auto refinementFinished = std::chrono::steady_clock::now();
     if (std::getenv("CENTRIFUGE_ANALYSIS_PROFILE")) {

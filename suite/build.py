@@ -73,7 +73,8 @@ def tool_env(bin_dir: str):
     return env
 
 
-def compile_one(src: Path, cfg_name: str, cfg: dict, exe: Path):
+def compile_one(src: Path, cfg_name: str, cfg: dict, exe: Path,
+                suite_names=None):
     kind = cfg["kind"]
     opt = cfg["opt"]
     is_cpp = src.suffix == ".cpp"
@@ -83,9 +84,19 @@ def compile_one(src: Path, cfg_name: str, cfg: dict, exe: Path):
         map_file = exe.with_suffix(".map")
         obj_dir = OUT / "obj" / exe.stem
         obj_dir.mkdir(parents=True, exist_ok=True)
+        # MSVC links strip the COFF symbol table, which both hides names
+        # and (worse) leaves frameless switch-only functions undiscoverable
+        # by the prologue scanner.  Exporting every suite function puts it
+        # in the PE export directory: real names + guaranteed discovery.
+        def_file = exe.with_suffix(".def")
+        if suite_names:
+            def_file.write_text(
+                "LIBRARY {}\nEXPORTS\n{}\n".format(
+                    exe.stem, "\n".join(sorted(suite_names))))
         bat = ROOT / "msvc_build.bat"
         res = run(["cmd", "/c", str(bat), opt, stdflag, str(exe),
-                   str(obj_dir) + "\\", str(src), str(map_file)])
+                   str(obj_dir) + "\\", str(src), str(map_file),
+                   str(def_file)])
         addr2name = parse_map(map_file)
     elif kind == "clang":
         compiler = CLANGXX if is_cpp else CLANG
@@ -232,7 +243,8 @@ def main():
         exe = OUT / f"{fam}--{cfg_name}.exe"
         if exe.exists():
             exe.unlink()
-        err, addr2name = compile_one(src, cfg_name, cfg, exe)
+        err, addr2name = compile_one(src, cfg_name, cfg, exe,
+                                     defined_names(src))
         if err == "skip":
             return fam, cfg_name, {"status": "pending"}
         if err:

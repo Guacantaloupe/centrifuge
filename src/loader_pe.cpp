@@ -759,6 +759,55 @@ std::optional<Program> loadPeImpl(const std::vector<uint8_t>& d,
         }
     }
 
+    // ---- COFF symbol table ----
+    // Link-generated executables carry their local symbols here - including
+    // the Itanium C++ ABI metadata names (_ZTV*/_ZTI*/_ZTS*) that drive
+    // class, vtable, and RTTI recovery.  Export parsing above only sees DLL
+    // exports, so vtables in a plain executable were invisible before.
+    if (coff.pointerToSymbolTable && coff.numberOfSymbols) {
+        const uint64_t symBase = coff.pointerToSymbolTable;
+        const uint64_t strBase = symBase + 18ULL * coff.numberOfSymbols;
+        for (uint32_t i = 0; i < coff.numberOfSymbols; ++i) {
+            const uint64_t at = symBase + 18ULL * i;
+            if (!rangeInFile(at, 18, d.size())) break;
+            const int16_t secNum = static_cast<int16_t>(rd16(d, at + 12));
+            const uint8_t storage = d[at + 16];
+            const uint8_t aux = d[at + 17];
+            std::string name;
+            if (rd32(d, at) == 0) {
+                const uint64_t strOff = strBase + rd32(d, at + 4);
+                if (rangeInFile(strOff, 1, d.size()))
+                    name = cstrAt(d, static_cast<size_t>(strOff), 4096);
+            } else {
+                name.assign(reinterpret_cast<const char*>(d.data() + at), 8);
+                const size_t nul = name.find('\0');
+                if (nul != std::string::npos) name.resize(nul);
+            }
+            i += aux;  // aux records carry no name of their own
+            if (name.empty()) continue;
+            // EXTERNAL and STATIC cover code and data objects; skip section
+            // records, labels, and debug class entries.
+            if (storage != 2 && storage != 3) continue;
+            const uint32_t value = rd32(d, at + 8);
+            uint64_t addr = 0;
+            if (secNum > 0) {
+                if (static_cast<uint32_t>(secNum) > ps.secs.size()) continue;
+                if (!addOk(p.imageBase, ps.secs[secNum - 1].virtualAddress,
+                           addr) ||
+                    !addOk(addr, value, addr))
+                    continue;
+            } else if (secNum == -1) {
+                addr = value;  // absolute symbol
+            } else {
+                continue;
+            }
+            Symbol sym;
+            sym.name = std::move(name);
+            sym.addr = addr;
+            p.symbols.push_back(std::move(sym));
+        }
+    }
+
     // entry point as a pseudo-symbol
     if (p.entryPoint != 0) {
         Symbol e;

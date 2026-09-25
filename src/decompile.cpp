@@ -2313,6 +2313,11 @@ public:
     // pending write flushes (erase-then-record in the flush loop would
     // otherwise drop it immediately).
     std::map<uint64_t, DataType> pendingCallStructs;
+    // WS4: C++ virtual call sites recovered by the object graph (call
+    // instruction address -> site).  A site with a resolved vtable target
+    // devirtualizes the indirect call to a direct named call.
+    const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites =
+        nullptr;
     // WS3: when a LOAD/STORE address is an untouched incoming-parameter
     // register plus a constant displacement, and the recovered parameter
     // type carries a member at that offset whose width matches the
@@ -2497,10 +2502,13 @@ public:
     }
 
     // emit "a0 = fname(args);" for a resolved call; returns true if emitted
-    bool emitCall(const PcodeInsn& pi, uint64_t targetId) {
+    bool emitCall(const PcodeInsn& pi, uint64_t targetId,
+                  uint64_t forcedTarget = 0) {
         if (!nameOf) return false;
         int64_t target = 0;
-        if (!resolveTarget(pi, targetId, target)) return false;
+        if (forcedTarget)
+            target = static_cast<int64_t>(forcedTarget);
+        else if (!resolveTarget(pi, targetId, target)) return false;
         std::string fname = nameOf(static_cast<uint64_t>(target));
         if (fname.empty()) return false;
         std::string args;
@@ -3044,6 +3052,24 @@ public:
                     continue;
                 }
                 if (op.op == POp::CALL || op.op == POp::CALLIND) {
+                    // WS4: a recovered C++ virtual call site with a resolved
+                    // vtable slot devirtualizes to a direct named call.  The
+                    // object graph already attributed this instruction
+                    // address to (class, vptr offset, slot) and resolved the
+                    // slot's target, so the indirect target expression only
+                    // obscures the call.
+                    if (op.op == POp::CALLIND && virtualCallSites) {
+                        const auto vc = virtualCallSites->find(pi.addr);
+                        if (vc != virtualCallSites->end() &&
+                            vc->second.resolvedTarget &&
+                            emitCall(pi, op.in0, vc->second.resolvedTarget)) {
+                            regExpr.clear();
+                            paramCopies.clear();
+                            callResultStructs.clear();
+                            regConst.clear();
+                            continue;
+                        }
+                    }
                     if (!emitCall(pi, op.in0)) {
                         const Varnode* targetNode = pi.find(op.in0);
                         std::string target = exprOfV(targetNode).text;
@@ -5531,7 +5557,8 @@ std::string decompile(
     const std::function<bool(uint64_t)>& guardSlotOf,
     const std::string& entryName, const FunctionSignature* callerSignature,
     const FieldAccessorMap* fieldAccessors,
-    const std::map<uint64_t, DataType>* callResultTypes) {
+    const std::map<uint64_t, DataType>* callResultTypes,
+    const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites) {
     CfgBuilder cfg;
     if (!cfg.build(eng, read, start, end)) return "// failed to build CFG\n";
 
@@ -5866,6 +5893,7 @@ std::string decompile(
                     body.callerSignature = callerSignature;
                     body.fieldAccessors = fieldAccessors;
                     body.callResultTypes = callResultTypes;
+                    body.virtualCallSites = virtualCallSites;
                     body.architecture = architecture;
                     body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -5910,6 +5938,7 @@ body.pushSlots = &pushSlots;
                 body.callerSignature = callerSignature;
                 body.fieldAccessors = fieldAccessors;
                 body.callResultTypes = callResultTypes;
+                body.virtualCallSites = virtualCallSites;
                 body.architecture = architecture;
                 body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -6002,6 +6031,7 @@ body.pushSlots = &pushSlots;
                         header.callerSignature = callerSignature;
                         header.fieldAccessors = fieldAccessors;
                         header.callResultTypes = callResultTypes;
+                        header.virtualCallSites = virtualCallSites;
                         header.architecture = architecture;
                         header.useRecoveredRuntime = useRecoveredRuntime;
                         header.stackModel = stackModel;
@@ -6061,6 +6091,7 @@ header.pushSlots = &pushSlots;
         be.callerSignature = callerSignature;
         be.fieldAccessors = fieldAccessors;
         be.callResultTypes = callResultTypes;
+        be.virtualCallSites = virtualCallSites;
         be.architecture = architecture;
         be.useRecoveredRuntime = useRecoveredRuntime;
                     be.stackModel = stackModel;
@@ -6111,6 +6142,7 @@ be.pushSlots = &pushSlots;
                 thenBody.callerSignature = callerSignature;
                 thenBody.fieldAccessors = fieldAccessors;
                 thenBody.callResultTypes = callResultTypes;
+                thenBody.virtualCallSites = virtualCallSites;
                 thenBody.architecture = architecture;
                 thenBody.useRecoveredRuntime = useRecoveredRuntime;
                     thenBody.stackModel = stackModel;
@@ -6139,6 +6171,7 @@ thenBody.pushSlots = &pushSlots;
                 elseBody.callerSignature = callerSignature;
                 elseBody.fieldAccessors = fieldAccessors;
                 elseBody.callResultTypes = callResultTypes;
+                elseBody.virtualCallSites = virtualCallSites;
                 elseBody.architecture = architecture;
                 elseBody.useRecoveredRuntime = useRecoveredRuntime;
                     elseBody.stackModel = stackModel;
@@ -6183,6 +6216,7 @@ elseBody.pushSlots = &pushSlots;
                 te.callerSignature = callerSignature;
                 te.fieldAccessors = fieldAccessors;
                 te.callResultTypes = callResultTypes;
+                te.virtualCallSites = virtualCallSites;
                 te.architecture = architecture;
                 te.useRecoveredRuntime = useRecoveredRuntime;
                     te.stackModel = stackModel;
@@ -6346,6 +6380,39 @@ te.pushSlots = &pushSlots;
             for (int i = 0; i <= depth; ++i) out << "    ";
             out << "goto " << labelName(be.resolvedTarget) << ";\n";
             return;
+        }
+        // WS4: a recovered C++ virtual tail dispatch (`jmp [vptr+K]`) whose
+        // slot resolved to a concrete target devirtualizes to a direct tail
+        // call, same as the CALLIND case.  The object graph attributed this
+        // instruction address to a resolved vtable slot.
+        if ((term->kind == Insn::JMP || term->kind == Insn::OTHER) &&
+            !term->targetKnown && !be.resolvedKnown && virtualCallSites &&
+            !useRecoveredRuntime) {
+            const auto vc = virtualCallSites->find(term->addr);
+            if (vc != virtualCallSites->end() &&
+                vc->second.resolvedTarget &&
+                nameOf) {
+                const std::string fname =
+                    nameOf(vc->second.resolvedTarget);
+                if (!fname.empty()) {
+                    std::string args;
+                    const std::vector<uint64_t> abi =
+                        defaultArgumentRegisters(architecture);
+                    for (size_t i = 0; i < abi.size(); ++i) {
+                        std::string text = registerName(architecture, abi[i]);
+                        const uint64_t argStorage = registerStorageOffset(
+                            architecture, abi[i], 8);
+                        const auto definition = be.regExpr.find(argStorage);
+                        if (definition != be.regExpr.end() &&
+                            inlineableExpression(definition->second))
+                            text = stripParens(definition->second.text);
+                        args += (i ? ", " : "") + text;
+                    }
+                    for (int i = 0; i <= depth; ++i) out << "    ";
+                    out << "return " << fname << "(" << args << ");\n";
+                    return;
+                }
+            }
         }
         // Indirect-jump trampoline: `mov reg, [rip+slot]; jmp *reg` (a
         // data-slot jump board, common in recovered CRT/allocator thunks).
@@ -6554,12 +6621,14 @@ std::string decompileTyped(
     const GlobalObjectRecovery* globals,
     const std::function<bool(uint64_t)>& guardSlotOf,
     const FieldAccessorMap* fieldAccessors,
-    const std::map<uint64_t, DataType>* callResultTypes) {
+    const std::map<uint64_t, DataType>* callResultTypes,
+    const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites) {
     std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
                                  architecture, useRecoveredRuntime,
                                  stackModel, globals, guardSlotOf,
                                  /*entryName=*/"", &signature,
-                                 fieldAccessors, callResultTypes);
+                                 fieldAccessors, callResultTypes,
+                                 virtualCallSites);
     // A data-slot trampoline (indirect tail call) forwards the callee's
     // return value through rax, so it must never decompile to void: the
     // typed wrapper's void-return rewrite would turn the dispatch into a

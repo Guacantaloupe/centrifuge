@@ -433,6 +433,10 @@ struct SymbolicObjectAddress {
     unsigned dereferenceDepth = 0;
     int64_t firstDereferenceOffset = 0;
     int64_t lastDereferenceOffset = 0;
+    // The chain began at a register seeded as the object pointer (`this` or
+    // the first parameter).  Distinguishes vptr-shaped chains from indirect
+    // calls through unrelated data pointers.
+    bool fromThis = false;
 };
 
 } // namespace
@@ -598,8 +602,21 @@ void refineCppObjectGraph(const Program& program, const SleighEngine& engine,
                           CppRecoveryResult& recovery) {
     const int pointerSize = program.format == "ELF32" || program.format == "PE32"
                                 ? 4 : 8;
-    const uint64_t abiThisRegister =
-        program.format.rfind("PE", 0) == 0 ? 8 : 56;
+    // Both x86-64 C++ ABIs appear in the wild: MSVC PE images pass `this`
+    // in rcx, Itanium ELF and mingw PE images in rdi.  rdx is seeded as
+    // well so a compiler shuffle of the object pointer into the second
+    // argument register before the first dereference still tracks (the
+    // synthetic recovery fixtures model `this` at offset 8).  Seeding is
+    // only a heuristic root: detection further requires a vptr-shaped
+    // dereference chain and resolution is gated by class/slot evidence.
+    std::vector<uint64_t> abiThisRegisters = {0, 8, 56};
+    if (program.arch != "x86-64") {
+        abiThisRegisters = {program.format.rfind("PE", 0) == 0 ? uint64_t(0) : uint64_t(56)};
+    }
+    auto isThisRegister = [&](uint64_t offset) {
+        return std::find(abiThisRegisters.begin(), abiThisRegisters.end(),
+                         offset) != abiThisRegisters.end();
+    };
     std::map<std::string, size_t> classIndex;
     for (size_t index = 0; index < recovery.classes.size(); ++index)
         classIndex.emplace(recovery.classes[index].name, index);
@@ -639,7 +656,7 @@ void refineCppObjectGraph(const Program& program, const SleighEngine& engine,
         method.name = function.function.name;
         method.role = symbolMethodRole(function.function.name,
                                        member.first, member.second);
-        method.thisRegister = abiThisRegister;
+        method.thisRegister = abiThisRegisters.front();
         method.thisAdjustment = itaniumThisAdjustment(function.function.name);
         method.hasThis = !member.first.empty();
         method.confidence = method.hasThis ? 0.92 : 0.25;
@@ -733,7 +750,9 @@ void refineCppObjectGraph(const Program& program, const SleighEngine& engine,
             std::map<uint64_t, SymbolicObjectAddress> registers;
             SymbolicObjectAddress thisValue;
             thisValue.valid = true;
-            registers[abiThisRegister] = thisValue;
+            thisValue.fromThis = true;
+            for (const uint64_t tr : abiThisRegisters)
+                registers[tr] = thisValue;
             for (const PcodeInsn& instruction : block.insns) {
                 std::map<uint64_t, SymbolicObjectAddress> values;
                 for (const auto& varnodePair : instruction.varnodes) {
@@ -746,7 +765,7 @@ void refineCppObjectGraph(const Program& program, const SleighEngine& engine,
                     } else if (varnode.kind == Varnode::REGISTER) {
                         const auto known = registers.find(varnode.offset);
                         if (known != registers.end()) values[varnode.id] = known->second;
-                        else if (varnode.offset == abiThisRegister) values[varnode.id] = thisValue;
+                        else if (isThisRegister(varnode.offset)) values[varnode.id] = thisValue;
                     }
                 }
                 auto symbolic = [&](uint64_t id) {
@@ -783,6 +802,7 @@ void refineCppObjectGraph(const Program& program, const SleighEngine& engine,
                             static_cast<uint64_t>(output ? output->size : pointerSize),
                             false, instruction.addr});
                         result.valid = true;
+                        result.fromThis = left.fromThis;
                         result.dereferenceDepth = left.dereferenceDepth + 1;
                         result.firstDereferenceOffset = left.dereferenceDepth
                             ? left.firstDereferenceOffset : left.offset;
@@ -808,14 +828,34 @@ void refineCppObjectGraph(const Program& program, const SleighEngine& engine,
                                 refinement.constructorEvidence = true;
                             }
                         }
-                    } else if (operation.op == POp::CALLIND && left.valid &&
-                               left.dereferenceDepth >= 2) {
+                    } else if ((operation.op == POp::CALLIND ||
+                                operation.op == POp::BRANCHIND) &&
+                               left.valid &&
+                               // Double-load shape (`fn = load(vptr); call fn`)
+                               // unambiguously names a slot.  The direct
+                               // memory shape (`call [vptr+K]`, and the
+                               // tail-dispatch `jmp [vptr+K]`) performs only
+                               // one load before the transfer, so it must
+                               // additionally root at the tracked object
+                               // pointer and index a plausible vtable slot.
+                               (left.dereferenceDepth >= 2 ||
+                                (left.dereferenceDepth >= 1 && left.fromThis &&
+                                 left.offset >= 0 && left.offset < 4096 &&
+                                 left.offset % pointerSize == 0))) {
                         CppVirtualCallSite call;
                         call.functionAddress = start;
                         call.instructionAddress = instruction.addr;
                         call.vptrOffset = left.firstDereferenceOffset;
+                        // The slot index is the displacement of the final
+                        // address expression.  After a LOAD the tracked
+                        // offset resets, so for the double-load shape the
+                        // displacement recorded at the last load names the
+                        // slot; for the direct memory shape the transfer's
+                        // own input (vptr + K) carries it.
+                        const int64_t slotOffset = left.dereferenceDepth >= 2
+                            ? left.lastDereferenceOffset : left.offset;
                         call.slot = static_cast<size_t>(std::max<int64_t>(
-                            0, left.lastDereferenceOffset) / pointerSize);
+                            0, slotOffset) / pointerSize);
                         call.className = refinement.className;
                         call.confidence = call.className.empty() ? 0.65 : 0.86;
                         refinement.virtualCalls.push_back(std::move(call));
@@ -893,7 +933,7 @@ void refineCppObjectGraph(const Program& program, const SleighEngine& engine,
             recovery.objectGraph.functionClasses[function] = common;
             CppMethodInfo& method = recovery.objectGraph.methods[graphMethod[function]];
             method.hasThis = true;
-            method.thisRegister = abiThisRegister;
+            method.thisRegister = abiThisRegisters.front();
             method.confidence = std::max(method.confidence, 0.68);
             method.evidence.push_back({CppEvidenceKind::THIS_FORWARD,
                 function, function, 0.68,
@@ -1073,8 +1113,33 @@ void refineCppObjectGraph(const Program& program, const SleighEngine& engine,
     // the target method.  Multiple candidates are retained by the public IR
     // even though a class-specific site normally resolves to one slot.
     for (CppVirtualCallSite& call : recovery.objectGraph.virtualCalls) {
-        const auto classAt = classIndex.find(call.className);
-        if (classAt == classIndex.end()) continue;
+        auto classAt = classIndex.find(call.className);
+        if (classAt == classIndex.end()) {
+            // The calling function owns no vptr store (e.g. a free function
+            // taking a base pointer), so no class identity was attributed.
+            // Fall back to the vtable slot evidence itself: when exactly one
+            // recovered class has a function pointer at this slot, that
+            // target is the only possible dispatch.  Ambiguous or empty
+            // candidate sets keep the call indirect - devirtualizing a
+            // genuinely polymorphic site would be wrong.
+            std::set<uint64_t> candidates;
+            for (const CppClassInfo& info : recovery.classes) {
+                for (const CppVtableGroup& group : info.vtableGroups) {
+                    if (call.slot >= group.virtualFunctions.size()) continue;
+                    const uint64_t address =
+                        group.virtualFunctions[call.slot].address;
+                    if (address) candidates.insert(address);
+                }
+            }
+            if (candidates.size() != 1) continue;
+            call.resolvedTarget = *candidates.begin();
+            call.resolvedTargets.push_back(call.resolvedTarget);
+            call.confidence = std::max(call.confidence, 0.78);
+            recovery.objectGraph.evidence.push_back({CppEvidenceKind::VIRTUAL_CALL,
+                call.instructionAddress, call.functionAddress, call.confidence,
+                "unique vtable slot candidate resolves the indirect call"});
+            continue;
+        }
         CppClassInfo& info = recovery.classes[classAt->second];
         const CppVtableGroup* selected = nullptr;
         for (const CppVtableGroup& group : info.vtableGroups)

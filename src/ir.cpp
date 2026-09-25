@@ -2707,6 +2707,13 @@ std::string ProgramAnalysis::decompileFunction(const Program& program,
                 name, field.type.bits};
         }
     }
+    // WS4: virtual call sites recovered for this function, keyed by call
+    // instruction address.  Lets the emitter devirtualize an indirect call
+    // when the object graph resolved the vtable slot to a concrete target.
+    std::map<uint64_t, CppVirtualCallSite> virtualCallSites;
+    for (const CppVirtualCallSite& site : cppTypes_.objectGraph.virtualCalls)
+        if (site.functionAddress == address && site.resolvedTarget)
+            virtualCallSites[site.instructionAddress] = site;
     output << decompileTyped(engine, read, address, end, architecture_,
                              analyzed->function.name, analyzed->signature,
                              nameOf, signatureOf, false, nullptr, nullptr,
@@ -2715,7 +2722,10 @@ std::string ProgramAnalysis::decompileFunction(const Program& program,
                                                     : &fieldAccessors,
                              analyzed->callResultTypes.empty()
                                  ? nullptr
-                                 : &analyzed->callResultTypes);
+                                 : &analyzed->callResultTypes,
+                             virtualCallSites.empty()
+                                 ? nullptr
+                                 : &virtualCallSites);
     return output.str();
 }
 

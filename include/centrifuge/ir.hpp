@@ -314,6 +314,12 @@ struct CallSiteArgInfo {
     bool addressUsed = false; // value feeds a LOAD/STORE address
     bool constant = false;
     uint64_t constantValue = 0;
+    // Interprocedural reverse evidence (WS8): index into the caller's own
+    // ABI parameters when this argument value is the parameter forwarded
+    // through a copy/zext/sext chain (-1 = not parameter-derived).  Lets a
+    // pointer type recovered at the callee propagate back into the
+    // caller's signature during the Phase 7 fixed point.
+    int forwardedParam = -1;
 };
 
 struct AnalyzedCallSite {

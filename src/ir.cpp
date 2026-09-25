@@ -2490,6 +2490,49 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                                     !useOp->inputs.empty() &&
                                     useOp->inputs[0] == argumentId)
                                     info.addressUsed = true;
+                        // Trace the argument back through copy/zext/sext
+                        // chains to an entry value: when it is one of this
+                        // function's own ABI parameters, record which one
+                        // is forwarded, so a pointer recovered at the
+                        // callee can propagate back to this signature.
+                        {
+                            std::set<SsaId> seen;
+                            SsaId current = argumentId;
+                            while (current && seen.insert(current).second) {
+                                const SsaValue* v = ir.value(current);
+                                if (!v) break;
+                                if (v->version == 0 &&
+                                    v->storage == MidValue::REGISTER) {
+                                    for (const FunctionParameter& p :
+                                         analyzed.signature.parameters)
+                                        if (!p.onStack &&
+                                            p.registerOffset == v->offset) {
+                                            for (size_t ai = 0;
+                                                 ai < abi.size(); ++ai)
+                                                if (abi[ai].first ==
+                                                    v->offset) {
+                                                    info.forwardedParam =
+                                                        static_cast<int>(ai);
+                                                    break;
+                                                }
+                                            break;
+                                        }
+                                    break;
+                                }
+                                const auto def = definitions.find(current);
+                                if (def == definitions.end()) break;
+                                const SsaOp& op = *def->second;
+                                if (!op.phi && !op.removed &&
+                                    (op.op == POp::COPY ||
+                                     op.op == POp::INT_ZEXT ||
+                                     op.op == POp::INT_SEXT) &&
+                                    !op.inputs.empty()) {
+                                    current = op.inputs[0];
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
                     }
                     callSite.arguments.clear();
                     // Keep the original constant-value resolution (recursive
@@ -2799,6 +2842,8 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                         merged.widthBytes =
                             std::max(merged.widthBytes, info.widthBytes);
                         merged.addressUsed |= info.addressUsed;
+                        if (merged.forwardedParam < 0)
+                            merged.forwardedParam = info.forwardedParam;
                         if (!info.observed ||
                             info.type.kind == TypeKind::UNKNOWN)
                             continue;
@@ -2915,6 +2960,89 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                     if (sig.returnComponents.size() == 1)
                         sig.returnComponents[0] = sig.returnType;
                     changed = true;
+                }
+            }
+            // WS8 reverse direction: a callee parameter typed POINTER (by
+            // its body, by forward call-site evidence, or by an earlier
+            // reverse pass) marks the caller's forwarded parameter POINTER
+            // too - pointer types climb from deep callees up to the entry
+            // points across the whole call graph inside this fixed point.
+            {
+                auto paramAtAbi = [&abi](FunctionSignature& signature,
+                                         size_t abiIndex) -> FunctionParameter* {
+                    for (FunctionParameter& p : signature.parameters)
+                        if (!p.onStack &&
+                            p.registerOffset == abi[abiIndex].first)
+                            return &p;
+                    return nullptr;
+                };
+                for (auto& callerEntry : functions_) {
+                    if (!callerEntry.second.complete) continue;
+                    for (const AnalyzedCallSite& site :
+                         callerEntry.second.callSites) {
+                        if (!site.target || site.indirect) continue;
+                        const auto callee = functions_.find(*site.target);
+                        if (callee == functions_.end() ||
+                            !callee->second.complete)
+                            continue;
+                        for (size_t i = 0;
+                             i < site.argInfo.size() && i < abi.size(); ++i) {
+                            const int from = site.argInfo[i].forwardedParam;
+                            if (from < 0 ||
+                                static_cast<size_t>(from) >= abi.size())
+                                continue;
+                            const FunctionParameter* into =
+                                paramAtAbi(callee->second.signature, i);
+                            if (!into ||
+                                into->type.kind != TypeKind::POINTER)
+                                continue;
+                            FunctionSignature& callerSig =
+                                callerEntry.second.signature;
+                            FunctionParameter* source =
+                                paramAtAbi(callerSig,
+                                           static_cast<size_t>(from));
+                            if (source) {
+                                if (source->type.kind != TypeKind::POINTER &&
+                                    (source->type.kind ==
+                                         TypeKind::UNSIGNED_INT ||
+                                     source->type.kind ==
+                                         TypeKind::SIGNED_INT ||
+                                     source->type.kind == TypeKind::UNKNOWN)) {
+                                    source->type =
+                                        DataType{TypeKind::POINTER, 64, 1};
+                                    changed = true;
+                                }
+                            } else {
+                                // The caller never itself reads the
+                                // parameter, but a callee it forwards the
+                                // value to dereferences it: declare the
+                                // pointer parameter for the prototype.
+                                FunctionParameter added;
+                                added.name = "arg" + std::to_string(from);
+                                added.registerOffset = abi[from].first;
+                                added.type = DataType{TypeKind::POINTER, 64, 1};
+                                callerSig.parameters.push_back(added);
+                                changed = true;
+                            }
+                        }
+                        // Newly added parameters append at the end; restore
+                        // ABI declaration order for positional call
+                        // emission (same comparator as the forward pass).
+                        std::stable_sort(
+                            callerEntry.second.signature.parameters.begin(),
+                            callerEntry.second.signature.parameters.end(),
+                            [&](const FunctionParameter& a,
+                                const FunctionParameter& b) {
+                                auto abiIndex = [&](const FunctionParameter& p) {
+                                    if (p.onStack) return abi.size() + 1;
+                                    for (size_t k = 0; k < abi.size(); ++k)
+                                        if (abi[k].first == p.registerOffset)
+                                            return k;
+                                    return abi.size();
+                                };
+                                return abiIndex(a) < abiIndex(b);
+                            });
+                    }
                 }
             }
             if (!changed) break;

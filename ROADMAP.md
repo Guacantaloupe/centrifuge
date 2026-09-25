@@ -150,6 +150,18 @@ it to **symbolic values** (expression trees over registers/memory):
   edges from every FUNCTION node to the GLOBAL nodes it provably touches
   (anonymous accessed globals get a node too), turning the graph into a
   queryable whole-program Mod/Ref oracle.
+- Interprocedural type recovery, reverse direction (WS8): Phase 7's
+  call-site fixed point previously only climbed caller -> callee
+  (address-used evidence installs/upgrades pointer parameters).  Each
+  call-site argument now also records when it is one of the caller's own
+  ABI parameters forwarded through a copy/zext/sext chain
+  (`CallSiteArgInfo::forwardedParam`), and the same fixed point runs the
+  inverse rule: a callee parameter typed POINTER marks the caller's
+  forwarded parameter POINTER too.  Pointer types therefore climb from
+  deep callees up to entry points across the whole call graph (verified
+  on a noinline chain: deep's `int*` reaches mid and top, which baseline
+  left `uint64_t`), and the recovered signatures feed back into
+  decompileFunction output and the knowledge graph's HAS_TYPE edges.
 
 Still open: state merging (item 5), CMOV/select concretization in the
 executor (limits coverage of register-indirect dispatches selected by

@@ -5643,15 +5643,23 @@ std::string collapseDegenerateBranches(const std::string& text) {
         }
 
         // (4) guarded region: `if (c) goto Lx;` whose label is the single-
-        // reference join immediately after a label-free, break-free region
-        // becomes `if (!(c)) { <region> }`.  Jumping out of the new braces
-        // stays legal (all locals are trivial), and no label inside means no
-        // jump can land inside the wrapped region.
+        // reference join immediately after the region becomes
+        // `if (!(c)) { <region> }`.  Labels may appear inside the region
+        // when every reference to them also lives inside it (internal jumps
+        // stay internal after wrapping); break/continue are safe because
+        // plain if-braces do not capture them.  Jumping out of the new
+        // braces stays legal (all locals are trivial).
         refs = referenceCounts();
         static const std::regex ifGotoLineRe(
             R"(^(\s*)if \((.+)\) goto L(0x[0-9a-fA-F]+);\s*$)");
-        static const std::regex innerLabelRe(R"(^\s*L0x[0-9a-fA-F]+:)");
+        static const std::regex innerLabelRe(R"(^\s*L(0x[0-9a-fA-F]+):)");
         static const std::regex breakRe(R"(\b(break|continue);)");
+        std::map<std::string, std::vector<size_t>> refPositions;
+        for (size_t li = 0; li < lines.size(); ++li)
+            for (auto it = std::sregex_iterator(lines[li].begin(),
+                                                lines[li].end(), gotoRefRe);
+                 it != std::sregex_iterator(); ++it)
+                refPositions[(*it)[1].str()].push_back(li);
         for (size_t i = 0; i < lines.size(); ++i) {
             std::smatch m;
             if (!std::regex_match(lines[i], m, ifGotoLineRe)) continue;
@@ -5668,10 +5676,17 @@ std::string collapseDegenerateBranches(const std::string& text) {
             if (target == i + 1) continue; // rule (1) shape
             bool regionClean = true;
             for (size_t j = i + 1; j < target; ++j) {
-                if (std::regex_search(lines[j], innerLabelRe) ||
-                    std::regex_search(lines[j], breakRe)) {
-                    regionClean = false;
-                    break;
+                std::smatch lm;
+                if (std::regex_search(lines[j], lm, innerLabelRe)) {
+                    // Inner labels are allowed only when every goto
+                    // referencing them is also inside the region.
+                    const auto& rp = refPositions[lm[1].str()];
+                    for (size_t pos : rp)
+                        if (pos <= i || pos >= target) {
+                            regionClean = false;
+                            break;
+                        }
+                    if (!regionClean) break;
                 }
             }
             if (!regionClean) continue;

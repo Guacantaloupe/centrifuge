@@ -2620,7 +2620,51 @@ std::string ProgramAnalysis::decompileFunction(const Program& program,
     auto read = [&](uint64_t source, void* output, size_t size) {
         return program.memory.read(source, output, size);
     };
-    auto nameOf = [&](uint64_t target) {
+    // WS4: recovered C++ member functions whose symbol is mangled or
+    // synthetic get a readable ClassName_method identifier, used both for
+    // the function definition and for every call site so the two can never
+    // disagree.  Overloads sharing a flattened name are disambiguated with
+    // the address suffix.
+    std::map<uint64_t, std::string> recoveredNames;
+    {
+        std::map<std::string, std::vector<uint64_t>> byFlat;
+        for (const CppMethodInfo& method : cppTypes_.objectGraph.methods) {
+            if (method.ownerClass.empty() || method.memberName.empty())
+                continue;
+            const AnalyzedFunction* function = functionAt(method.address);
+            if (!function) continue;
+            const std::string& current = function->function.name;
+            const bool mangled = current.rfind("_Z", 0) == 0 ||
+                                 current.rfind("??", 0) == 0;
+            const bool generated = current.rfind("FUN_", 0) == 0;
+            if (!mangled && !generated) continue;
+            std::string member = method.memberName;
+            if (!member.empty() && member.front() == '~')
+                member = "dtor_" + member.substr(1);
+            std::string flat = method.ownerClass + "_" + member;
+            for (char& ch : flat)
+                if (!std::isalnum(static_cast<unsigned char>(ch)) &&
+                    ch != '_')
+                    ch = '_';
+            byFlat[flat].push_back(method.address);
+        }
+        for (auto& pair : byFlat) {
+            const bool overloaded = pair.second.size() > 1;
+            for (const uint64_t target : pair.second) {
+                std::string name = pair.first;
+                if (overloaded) {
+                    char suffix[24];
+                    std::snprintf(suffix, sizeof(suffix), "_%llX",
+                                  static_cast<unsigned long long>(target));
+                    name += suffix;
+                }
+                recoveredNames[target] = name;
+            }
+        }
+    }
+    auto displayNameOf = [&](uint64_t target) -> std::string {
+        const auto recovered = recoveredNames.find(target);
+        if (recovered != recoveredNames.end()) return recovered->second;
         const AnalyzedFunction* function = functionAt(target);
         if (function) return function->function.name;
         // Match the analysis naming convention (analysis.cpp funName) so
@@ -2635,6 +2679,7 @@ std::string ProgramAnalysis::decompileFunction(const Program& program,
                       static_cast<unsigned long long>(target));
         return std::string(buffer);
     };
+    auto nameOf = [&](uint64_t target) { return displayNameOf(target); };
     auto signatureOf = [&](uint64_t target) { return signatureAt(target); };
     uint64_t end = 0;
     if (analyzed->function.size && address <=
@@ -2715,7 +2760,7 @@ std::string ProgramAnalysis::decompileFunction(const Program& program,
         if (site.functionAddress == address && site.resolvedTarget)
             virtualCallSites[site.instructionAddress] = site;
     output << decompileTyped(engine, read, address, end, architecture_,
-                             analyzed->function.name, analyzed->signature,
+                             displayNameOf(address), analyzed->signature,
                              nameOf, signatureOf, false, nullptr, nullptr,
                              nullptr,
                              fieldAccessors.empty() ? nullptr

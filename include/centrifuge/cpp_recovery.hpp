@@ -62,6 +62,11 @@ struct CppMethodInfo {
     bool isVirtual = false;
     size_t virtualSlot = 0;
     double confidence = 0;
+    // Visible member identity recovered from the symbol: owning class and
+    // bare member name ("Square", "area" / "~Square").  Drives readable
+    // ClassName_method renaming in decompiled output.
+    std::string ownerClass;
+    std::string memberName;
     std::vector<CppEvidence> evidence;
 };
 

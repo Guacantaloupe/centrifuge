@@ -5378,7 +5378,7 @@ std::string recoverCallResultMembers(std::string text,
         R"(\*\s*(\()?\((u?int[0-9]+_t|void|char|float|double) \*\)\s*\(\s*([A-Za-z_]\w*)\s*(?:\+\s*(0[xX][0-9a-fA-F]+|[0-9]+))?\s*\))");
     static const std::regex assignRe(R"(^\s*([A-Za-z_]\w*) = ([A-Za-z_]\w*);\s*$)");
     static const std::regex callRe(
-        R"(^\s*ret_val = (?:\([^()]*\)\s*)?FUN_[0-9a-fA-F]+\()");
+        R"(^\s*ret_val = (?:\([^()]*\)\s*)?(?!recovered_)[A-Za-z_]\w*\()");
 
     struct Site {
         // offset -> C type of the access; std::map keeps offsets ordered and

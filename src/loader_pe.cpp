@@ -771,6 +771,7 @@ std::optional<Program> loadPeImpl(const std::vector<uint8_t>& d,
             const uint64_t at = symBase + 18ULL * i;
             if (!rangeInFile(at, 18, d.size())) break;
             const int16_t secNum = static_cast<int16_t>(rd16(d, at + 12));
+            const uint16_t typeField = rd16(d, at + 14);
             const uint8_t storage = d[at + 16];
             const uint8_t aux = d[at + 17];
             std::string name;
@@ -804,6 +805,9 @@ std::optional<Program> loadPeImpl(const std::vector<uint8_t>& d,
             Symbol sym;
             sym.name = std::move(name);
             sym.addr = addr;
+            // COFF derived-type 0x20 (IMAGE_SYM_DTYPE_FUNCTION) marks a
+            // function; everything else is data (vtables, RTTI, strings).
+            sym.isFunction = (typeField & 0x30) == 0x20;
             p.symbols.push_back(std::move(sym));
         }
     }

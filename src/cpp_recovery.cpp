@@ -230,6 +230,13 @@ std::pair<std::string, std::string> visibleMemberName(
         size_t at = 3;
         std::vector<std::string> components;
         while (at < symbol.size() && symbol[at] != 'E') {
+            // Skip Itanium cv-qualifiers and ref-qualifiers so const member
+            // functions (_ZNK6Square4areaEv) still yield their owner.
+            if (symbol[at] == 'K' || symbol[at] == 'V' ||
+                symbol[at] == 'r') {
+                ++at;
+                continue;
+            }
             if (symbol.compare(at, 2, "C1") == 0 ||
                 symbol.compare(at, 2, "C2") == 0 ||
                 symbol.compare(at, 2, "C3") == 0) {
@@ -654,6 +661,8 @@ void refineCppObjectGraph(const Program& program, const SleighEngine& engine,
         CppMethodInfo method;
         method.address = function.function.addr;
         method.name = function.function.name;
+        method.ownerClass = member.first;
+        method.memberName = member.second;
         method.role = symbolMethodRole(function.function.name,
                                        member.first, member.second);
         method.thisRegister = abiThisRegisters.front();
@@ -674,6 +683,40 @@ void refineCppObjectGraph(const Program& program, const SleighEngine& engine,
             method.role == CppMethodRole::COVARIANT_RETURN_THUNK)
             method.evidence.push_back({CppEvidenceKind::THUNK, method.address,
                 method.address, 0.95, "ABI thunk mangling"});
+        graphMethod[method.address] = recovery.objectGraph.methods.size();
+        recovery.objectGraph.methods.push_back(std::move(method));
+    }
+    // Member-function symbols at addresses the function discovery did not
+    // reach (leaf virtual methods reached only through vtables, thunks)
+    // still carry class ownership: record them so the object graph and the
+    // decompiler's readable renaming see every method.
+    for (const Symbol& symbol : program.symbols) {
+        if (!symbol.isFunction || graphMethod.count(symbol.addr)) continue;
+        const auto member = visibleMemberName(symbol.name);
+        if (member.first.empty()) continue;
+        CppMethodInfo method;
+        method.address = symbol.addr;
+        method.name = symbol.name;
+        method.ownerClass = member.first;
+        method.memberName = member.second;
+        method.role = symbolMethodRole(symbol.name, member.first,
+                                       member.second);
+        method.thisRegister = abiThisRegisters.front();
+        method.thisAdjustment = itaniumThisAdjustment(symbol.name);
+        method.hasThis = true;
+        method.confidence = 0.85;
+        const CppAbi abi = program.format.rfind("PE", 0) == 0
+                               ? CppAbi::MSVC : CppAbi::ITANIUM;
+        const size_t owner = ensureClass(member.first, abi);
+        recovery.objectGraph.functionClasses[method.address] = member.first;
+        method.evidence.push_back({CppEvidenceKind::SYMBOL, method.address,
+            method.address, 0.85, "member-function symbol establishes class ownership"});
+        recovery.classes[owner].confidence =
+            std::max(recovery.classes[owner].confidence, 0.7);
+        if (method.role == CppMethodRole::ADJUSTOR_THUNK ||
+            method.role == CppMethodRole::COVARIANT_RETURN_THUNK)
+            method.evidence.push_back({CppEvidenceKind::THUNK, method.address,
+                method.address, 0.9, "ABI thunk mangling"});
         graphMethod[method.address] = recovery.objectGraph.methods.size();
         recovery.objectGraph.methods.push_back(std::move(method));
     }

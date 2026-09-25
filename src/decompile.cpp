@@ -5683,6 +5683,68 @@ std::string collapseDegenerateBranches(const std::string& text) {
         }
         if (changed) continue;
 
+        // (5) shared return tail: a goto (conditional or not) whose target
+        // is a short straight-line tail ending in return is replaced by a
+        // copy of the tail, so `if (c) goto Lret;` reads as an early
+        // return.  The jump is immediate, so variable values at the goto
+        // equal the values the tail would observe; the tail itself stays
+        // for the remaining (fallthrough) references.
+        refs = referenceCounts();
+        static const std::regex bareGotoLineRe2(
+            R"(^(\s*)goto L(0x[0-9a-fA-F]+);\s*$)");
+        static const std::regex returnLineRe(R"(^\s*return\b)");
+        for (size_t i = 0; i < lines.size(); ++i) {
+            std::smatch m;
+            const bool isIf = std::regex_match(lines[i], m, ifGotoLineRe);
+            std::smatch bm;
+            const bool isBare =
+                !isIf && std::regex_match(lines[i], bm, bareGotoLineRe2);
+            if (!isIf && !isBare) continue;
+            const std::string label =
+                isIf ? m[3].str() : bm[2].str();
+            const std::string indent = isIf ? m[1].str() : bm[1].str();
+            // Locate the label and its tail slice.
+            size_t t = 0;
+            for (size_t j = 0; j < lines.size(); ++j) {
+                if (lines[j] == "L" + label + ":") {
+                    t = j;
+                    break;
+                }
+            }
+            if (!t) continue;
+            std::vector<std::string> tail;
+            bool tailOk = true;
+            for (size_t j = t + 1; j < lines.size() && tail.size() < 8;
+                 ++j) {
+                const std::string& ln = lines[j];
+                if (std::regex_match(ln, labelRe) || ln == "}" ||
+                    ln.find('{') != std::string::npos ||
+                    ln.find('}') != std::string::npos ||
+                    ln.find("goto") != std::string::npos ||
+                    std::regex_search(ln, breakRe))
+                    break;
+                tail.push_back(ln);
+            }
+            if (tail.empty() ||
+                !std::regex_search(tail.back(), returnLineRe))
+                tailOk = false;
+            if (!tailOk) continue;
+            std::vector<std::string> replacement;
+            if (isIf)
+                replacement.push_back(indent + "if (" + m[2].str() +
+                                      ") {");
+            for (const std::string& tl : tail)
+                replacement.push_back(indent + "    " +
+                                      tl.substr(tl.find_first_not_of(" \t")));
+            if (isIf) replacement.push_back(indent + "}");
+            lines.erase(lines.begin() + static_cast<long>(i));
+            lines.insert(lines.begin() + static_cast<long>(i),
+                         replacement.begin(), replacement.end());
+            changed = true;
+            break;
+        }
+        if (changed) continue;
+
         // (3) labels with no remaining references.
         refs = referenceCounts();
         for (size_t i = 0; i < lines.size();) {

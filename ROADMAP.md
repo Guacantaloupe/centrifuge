@@ -115,10 +115,21 @@ it to **symbolic values** (expression trees over registers/memory):
   - recovered index when derivable (`switch (x) { case 0: ... }`), the
   resolved target value with absolute-address cases otherwise.  Case
   bodies keep their labels, so output stays recompilable.
+- Cross-function summaries (WS7): exploration now tracks a pending-call
+  stack, and every RETURN merges the architectural return register into a
+  per-call-site summary (merged across all explored paths: occurrence
+  count, always-constant value, unsigned range).  On a complete run
+  `decompile-native --sym-explore` annotates each recovered call site with
+  what the callee actually returned, e.g.
+  `/* symbolic: demo always returns 0x2 (1 explored return) */` or
+  `/* symbolic: probe returns in [0x0, 0x1] (2 explored returns) */`.
+  The call statement itself is preserved (summaries cover returns, not
+  side effects).  `SYMSUM_DUMP=1` prints the harvested table.
 
 Still open: state merging (item 5), CMOV/select concretization in the
 executor (limits coverage of register-indirect dispatches selected by
-cmov).
+cmov); global-write sets per callee (extend the summary beyond return
+values); mid-function starts for callee-focused summaries.
 
 ## 🎯 v0.8 — Breadth
 - More formats: Mach-O, raw, archives; more ISAs via specs (ARM, MIPS, ...)

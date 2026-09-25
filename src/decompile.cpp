@@ -2324,6 +2324,7 @@ public:
     // WS6: branch-direction coverage from symbolic exploration; a branch
     // observed in only one direction has its dead arm eliminated.
     const SymBranchCoverage* symCoverage = nullptr;
+    const std::vector<SymCallSummaryInfo>* symCallSummaries = nullptr;
     // WS3: when a LOAD/STORE address is an untouched incoming-parameter
     // register plus a constant displacement, and the recovered parameter
     // type carries a member at that offset whose width matches the
@@ -2643,6 +2644,35 @@ public:
             args += (i ? ", " : "") + argument;
         }
         const std::string call = fname + "(" + args + ")";
+        // WS6 cross-function summary: when the symbolic exploration that
+        // produced this call's summary ran to completion, annotate what the
+        // callee's return register actually held across the explored
+        // returns (constant, or an unsigned range).  The call itself stays:
+        // the callee may have side effects the summary does not cover.
+        if (symCallSummaries && symCoverage && symCoverage->complete) {
+            for (const auto& s : *symCallSummaries) {
+                if (s.callAddr != pi.addr || s.returns == 0) continue;
+                char buf[160];
+                if (s.alwaysConst)
+                    std::snprintf(buf, sizeof buf,
+                                  "/* symbolic: %s always returns 0x%llx "
+                                  "(%llu explored return%s) */",
+                                  fname.c_str(),
+                                  (unsigned long long)s.constValue,
+                                  (unsigned long long)s.returns,
+                                  s.returns == 1 ? "" : "s");
+                else
+                    std::snprintf(buf, sizeof buf,
+                                  "/* symbolic: %s returns in [0x%llx, "
+                                  "0x%llx] (%llu explored return%s) */",
+                                  fname.c_str(), (unsigned long long)s.lo,
+                                  (unsigned long long)s.hi,
+                                  (unsigned long long)s.returns,
+                                  s.returns == 1 ? "" : "s");
+                line(buf);
+                break;
+            }
+        }
         // Calls can clobber registers and memory. Argument text has already
         // been captured; no pre-call definition is valid for later inlining.
         regExpr.clear();
@@ -5961,7 +5991,8 @@ std::string decompile(
     const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites,
     const SymIndirectSites* symIndirectSites,
     const SymBranchCoverage* symCoverage,
-    const std::vector<JumpTable>* jumpTables) {
+    const std::vector<JumpTable>* jumpTables,
+    const std::vector<SymCallSummaryInfo>* symCallSummaries) {
     CfgBuilder cfg;
     if (!cfg.build(eng, read, start, end, {}, jumpTables))
         return "// failed to build CFG\n";
@@ -6315,6 +6346,7 @@ std::string decompile(
                     body.virtualCallSites = virtualCallSites;
                     body.symIndirectSites = symIndirectSites;
                     body.symCoverage = symCoverage;
+                    body.symCallSummaries = symCallSummaries;
                     body.architecture = architecture;
                     body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -6362,6 +6394,7 @@ body.pushSlots = &pushSlots;
                 body.virtualCallSites = virtualCallSites;
                 body.symIndirectSites = symIndirectSites;
                 body.symCoverage = symCoverage;
+                body.symCallSummaries = symCallSummaries;
                 body.architecture = architecture;
                 body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -6457,6 +6490,7 @@ body.pushSlots = &pushSlots;
                         header.virtualCallSites = virtualCallSites;
                         header.symIndirectSites = symIndirectSites;
                         header.symCoverage = symCoverage;
+                        header.symCallSummaries = symCallSummaries;
                         header.architecture = architecture;
                         header.useRecoveredRuntime = useRecoveredRuntime;
                         header.stackModel = stackModel;
@@ -6519,6 +6553,7 @@ header.pushSlots = &pushSlots;
         be.virtualCallSites = virtualCallSites;
         be.symIndirectSites = symIndirectSites;
         be.symCoverage = symCoverage;
+        be.symCallSummaries = symCallSummaries;
         be.architecture = architecture;
         be.useRecoveredRuntime = useRecoveredRuntime;
                     be.stackModel = stackModel;
@@ -6946,6 +6981,7 @@ be.pushSlots = &pushSlots;
                 thenBody.virtualCallSites = virtualCallSites;
                 thenBody.symIndirectSites = symIndirectSites;
                 thenBody.symCoverage = symCoverage;
+                thenBody.symCallSummaries = symCallSummaries;
                 thenBody.architecture = architecture;
                 thenBody.useRecoveredRuntime = useRecoveredRuntime;
                     thenBody.stackModel = stackModel;
@@ -6977,6 +7013,7 @@ thenBody.pushSlots = &pushSlots;
                 elseBody.virtualCallSites = virtualCallSites;
                 elseBody.symIndirectSites = symIndirectSites;
                 elseBody.symCoverage = symCoverage;
+                elseBody.symCallSummaries = symCallSummaries;
                 elseBody.architecture = architecture;
                 elseBody.useRecoveredRuntime = useRecoveredRuntime;
                     elseBody.stackModel = stackModel;
@@ -7024,6 +7061,7 @@ elseBody.pushSlots = &pushSlots;
                 te.virtualCallSites = virtualCallSites;
                 te.symIndirectSites = symIndirectSites;
                 te.symCoverage = symCoverage;
+                te.symCallSummaries = symCallSummaries;
                 te.architecture = architecture;
                 te.useRecoveredRuntime = useRecoveredRuntime;
                     te.stackModel = stackModel;
@@ -7090,6 +7128,7 @@ te.pushSlots = &pushSlots;
                     armBody.virtualCallSites = virtualCallSites;
                     armBody.symIndirectSites = symIndirectSites;
                     armBody.symCoverage = symCoverage;
+                    armBody.symCallSummaries = symCallSummaries;
                     armBody.architecture = architecture;
                     armBody.useRecoveredRuntime = useRecoveredRuntime;
                     armBody.stackModel = stackModel;
@@ -7548,14 +7587,15 @@ std::string decompileTyped(
     const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites,
     const SymIndirectSites* symIndirectSites,
     const SymBranchCoverage* symCoverage,
-    const std::vector<JumpTable>* jumpTables) {
+    const std::vector<JumpTable>* jumpTables,
+    const std::vector<SymCallSummaryInfo>* symCallSummaries) {
     std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
                                  architecture, useRecoveredRuntime,
                                  stackModel, globals, guardSlotOf,
                                  /*entryName=*/"", &signature,
                                  fieldAccessors, callResultTypes,
                                  virtualCallSites, symIndirectSites,
-                                 symCoverage, jumpTables);
+                                 symCoverage, jumpTables, symCallSummaries);
     // A data-slot trampoline (indirect tail call) forwards the callee's
     // return value through rax, so it must never decompile to void: the
     // typed wrapper's void-return rewrite would turn the dispatch into a

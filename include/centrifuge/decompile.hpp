@@ -54,6 +54,21 @@ struct SymBranchCoverage {
     bool complete = false;
 };
 
+// Cross-function return-value summaries (see symbolic.hpp
+// CallReturnSummary): one entry per explored call site, recording what the
+// callee's return register actually held across every explored return.
+// The emitter annotates the call site with the observed constant or range.
+// Under-approximation like the coverage above, so it is only passed on a
+// complete exploration run.
+struct SymCallSummaryInfo {
+    uint64_t callAddr = 0;
+    uint64_t target = 0;
+    uint64_t returns = 0;
+    bool alwaysConst = false;
+    uint64_t constValue = 0;
+    uint64_t lo = 0, hi = 0;
+};
+
 // Decompile the function starting at `start` (until RET/undecodable/`end`).
 // `nameOf` resolves call-target addresses to function names ("" = indirect).
 // `stackModel` (optional) enables the Native Source Recovery Backend:
@@ -78,7 +93,8 @@ std::string decompile(
     const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites = nullptr,
     const SymIndirectSites* symIndirectSites = nullptr,
     const SymBranchCoverage* symCoverage = nullptr,
-    const std::vector<JumpTable>* jumpTables = nullptr);
+    const std::vector<JumpTable>* jumpTables = nullptr,
+    const std::vector<SymCallSummaryInfo>* symCallSummaries = nullptr);
 
 // Emits a complete C-like function with the recovered declaration and ABI
 // register aliases.  Direct calls use propagated callee signatures.
@@ -102,6 +118,7 @@ std::string decompileTyped(
         nullptr,
     const SymIndirectSites* symIndirectSites = nullptr,
     const SymBranchCoverage* symCoverage = nullptr,
-    const std::vector<JumpTable>* jumpTables = nullptr);
+    const std::vector<JumpTable>* jumpTables = nullptr,
+    const std::vector<SymCallSummaryInfo>* symCallSummaries = nullptr);
 
 } // namespace centrifuge

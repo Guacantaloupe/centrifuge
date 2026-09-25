@@ -88,8 +88,27 @@ struct BranchCoverage {
     std::set<uint64_t> visitedPcs;
 };
 
+// Cross-function return-value summary for one call site, harvested while
+// exploring.  Every time a state returns from the callee reached by the
+// call instruction at `callAddr`, the architectural return register (rax /
+// x0) is observed and merged into the summary.  `alwaysConst` means every
+// observed return carried the same concrete value, in which case
+// `constValue` is it; `lo`/`hi` bound the observed values unsigned.
+// Summaries are an under-approximation: they describe the explored paths
+// only and are only trustworthy when the run completed without budget
+// exhaustion.
+struct CallReturnSummary {
+    uint64_t callAddr = 0;    // address of the CALL/CALLIND instruction
+    uint64_t target = 0;      // concrete callee observed at this site
+    uint64_t returns = 0;     // number of returns merged into the summary
+    bool alwaysConst = false;
+    uint64_t constValue = 0;
+    uint64_t lo = 0, hi = 0;  // unsigned range over observed returns
+};
+
 struct IndirectExploreResult {
     std::vector<IndirectSite> sites;
+    std::vector<CallReturnSummary> returnSummaries;
     uint64_t statesExplored = 0;
     uint64_t statesPruned = 0;
     std::string reason;

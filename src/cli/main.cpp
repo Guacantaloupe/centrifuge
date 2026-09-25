@@ -926,6 +926,7 @@ int cmdSpec(int argc, char** argv) {
         // and blocks no state reached are annotated.
         SymIndirectSites symSites;
         SymBranchCoverage symCoverage;
+        std::vector<SymCallSummaryInfo> symCallSummaries;
         // Must outlive the decompile call below: the coverage struct hands
         // out pointers into the explore result's maps.
         IndirectExploreResult symRes;
@@ -948,6 +949,38 @@ int cmdSpec(int argc, char** argv) {
             // early exits make unobserved directions merely "unknown").
             symCoverage.complete =
                 symRes.reason.rfind("exploration complete", 0) == 0;
+            // Cross-function summaries: one entry per explored call site,
+            // consumed by the emitter as call-site annotations.
+            for (const auto& s : symRes.returnSummaries) {
+                SymCallSummaryInfo info;
+                info.callAddr = s.callAddr;
+                info.target = s.target;
+                info.returns = s.returns;
+                info.alwaysConst = s.alwaysConst;
+                info.constValue = s.constValue;
+                info.lo = s.lo;
+                info.hi = s.hi;
+                symCallSummaries.push_back(std::move(info));
+            }
+            if (std::getenv("SYMSUM_DUMP")) {
+                std::fprintf(stderr, "// sym-call-summaries: %zu site(s)\n",
+                             symCallSummaries.size());
+                for (const auto& s : symCallSummaries)
+                    std::fprintf(stderr,
+                                 "//   call 0x%llx -> 0x%llx: %llu return%s, "
+                                 "%s\n",
+                                 (unsigned long long)s.callAddr,
+                                 (unsigned long long)s.target,
+                                 (unsigned long long)s.returns,
+                                 s.returns == 1 ? "" : "s",
+                                 s.alwaysConst
+                                     ? ("always const " +
+                                        std::to_string(s.constValue))
+                                           .c_str()
+                                     : ("range [" + std::to_string(s.lo) +
+                                        ", " + std::to_string(s.hi) + "]")
+                                           .c_str());
+            }
             if (std::getenv("SYMCOV_DUMP")) {
                 std::fprintf(stderr, "// sym-coverage: complete=%d\n",
                              (int)symCoverage.complete);
@@ -997,7 +1030,10 @@ int cmdSpec(int argc, char** argv) {
                                      nullptr, nullptr, nullptr,
                                      symSites.empty() ? nullptr : &symSites,
                                      symExplore ? &symCoverage : nullptr,
-                                     &jumpTables)
+                                     &jumpTables,
+                                     symExplore && !symCallSummaries.empty()
+                                         ? &symCallSummaries
+                                         : nullptr)
                         .c_str());
         return 0;
     }

@@ -1033,6 +1033,11 @@ struct SymState {
     // popped for execution, so only directions that genuinely ran count.
     uint64_t branchFrom = 0;
     int branchDir = -1;
+    // Pending call sites (machine address of the CALL/CALLIND instruction,
+    // plus the concrete callee it entered) so RETURN can attribute the
+    // observed return value to the call instruction for cross-function
+    // summaries.  Parallel to the emulated stack's return addresses.
+    std::vector<std::pair<uint64_t, uint64_t>> callStack;
 
     Sym getReg(uint64_t offset) const {
         const auto it = regs.find(offset);
@@ -1414,6 +1419,17 @@ public:
                   });
         res.coverage.outcomes = branchOutcomes_;
         res.coverage.visitedPcs = visitedPcs_;
+        for (const auto& kv : retObs_) {
+            CallReturnSummary s;
+            s.callAddr = kv.first;
+            s.target = kv.second.target;
+            s.returns = kv.second.count;
+            s.alwaysConst = kv.second.alwaysConst;
+            s.constValue = kv.second.constValue;
+            s.lo = kv.second.lo;
+            s.hi = kv.second.hi;
+            res.returnSummaries.push_back(std::move(s));
+        }
         return res;
     }
 
@@ -1742,6 +1758,7 @@ private:
                     if (std::getenv("SYMTRACE"))
                         std::fprintf(stderr, "[sym]   CALL -> %llx\n",
                                      (unsigned long long)tv->offset);
+                    st.callStack.emplace_back(curPc, tv->offset);
                     branchTaken = true;
                     hasBranch = true;
                     branchTarget = tv->offset;
@@ -1764,6 +1781,7 @@ private:
                         out.prune = "symbolic-stack";
                         return out;
                     }
+                    st.callStack.emplace_back(curPc, *v);
                     branchTaken = true;
                     hasBranch = true;
                     branchTarget = *v;
@@ -1774,6 +1792,30 @@ private:
                 break;
             }
             case POp::RETURN: {
+                // Cross-function summary: the callee is about to hand its
+                // return value (architectural return register, offset 0:
+                // rax on x86, x0 on AArch64) back to the call site on top
+                // of the pending-call stack.  Merge the observation before
+                // any of the prune paths below - a pruned state still made
+                // a genuine return.
+                if (!st.callStack.empty()) {
+                    const uint64_t callPc = st.callStack.back().first;
+                    const uint64_t callee = st.callStack.back().second;
+                    st.callStack.pop_back();
+                    RetObs& o = retObs_[callPc];
+                    if (o.count == 0) o.target = callee;
+                    ++o.count;
+                    if (const auto rv = asConst(st.getReg(0))) {
+                        if (o.count == 1) o.constValue = *rv;
+                        else if (o.constValue != *rv) o.alwaysConst = false;
+                        o.lo = std::min(o.lo, *rv);
+                        o.hi = std::max(o.hi, *rv);
+                    } else {
+                        o.alwaysConst = false;
+                        o.lo = 0;
+                        o.hi = ~0ULL;
+                    }
+                }
                 // The simplified slaspec lowers `ret` to a bare `return`
                 // (no pop), so model the architectural pop here to match
                 // the push we emulate on CALL.
@@ -2159,6 +2201,16 @@ private:
     // Exploration-mode accumulation: site pc -> concrete targets observed.
     std::map<uint64_t, std::set<uint64_t>> indirectSites_;
     std::map<uint64_t, bool> siteIsCall_;  // site pc -> true for CALLIND
+    // Cross-function return-value observations: call-site pc -> merged
+    // observation over every explored return from the callee it called.
+    struct RetObs {
+        uint64_t target = 0;        // concrete callee observed at this site
+        uint64_t count = 0;         // returns merged
+        bool alwaysConst = true;    // every observed return was the same constant
+        uint64_t constValue = 0;
+        uint64_t lo = ~0ULL, hi = 0;  // unsigned range over observed returns
+    };
+    std::map<uint64_t, RetObs> retObs_;
     // Branch-direction / pc coverage recorded while exploring: branch pc ->
     // bitmask of executed directions (bit0 fall-through, bit1 target), and
     // every pc any state executed.

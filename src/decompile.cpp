@@ -5814,6 +5814,78 @@ std::string collapseDegenerateBranches(const std::string& text) {
             if (changed) continue;
         }
 
+        // (7) if/else: `if (c) goto Lx; <R1> goto Ly; Lx: <R2> Ly:` with
+        // single-reference Lx/Ly is the compiled if/else shape - R1 is the
+        // else arm and R2 the then arm.  Both regions must be label-free
+        // and brace-balanced; break/continue stay excluded so loop exit
+        // bindings cannot change.
+        refs = referenceCounts();
+        auto balancedClean = [&](size_t from, size_t to) {
+            int balance = 0;
+            for (size_t j = from; j < to; ++j) {
+                const std::string& ln = lines[j];
+                if (std::regex_search(ln, innerLabelRe) ||
+                    std::regex_search(ln, breakRe))
+                    return false;
+                for (char ch : ln) {
+                    if (ch == '{') ++balance;
+                    if (ch == '}') --balance;
+                    if (balance < 0) return false;
+                }
+            }
+            return balance == 0;
+        };
+        for (size_t i = 0; i + 3 < lines.size(); ++i) {
+            std::smatch m;
+            if (!std::regex_match(lines[i], m, ifGotoLineRe)) continue;
+            const std::string lx = m[3].str();
+            if (refs[lx] != 1) continue;
+            // Locate Lx: the first label after the if line.  The line right
+            // before it must be the bare goto terminating R1.
+            size_t p = 0;
+            for (size_t j = i + 1; j < lines.size(); ++j) {
+                if (std::regex_search(lines[j], innerLabelRe)) {
+                    if (lines[j] == "L" + lx + ":") p = j;
+                    break;
+                }
+            }
+            if (!p) continue;
+            std::smatch gm;
+            if (!std::regex_match(lines[p - 1], gm, bareGotoLineRe2))
+                continue;
+            const std::string ly = gm[2].str();
+            if (refs[ly] != 1) continue;
+            // R2 runs from after Lx to Ly:.
+            size_t t = 0;
+            for (size_t j = p + 1; j < lines.size(); ++j) {
+                if (std::regex_search(lines[j], innerLabelRe)) {
+                    if (lines[j] == "L" + ly + ":") t = j;
+                    break;
+                }
+            }
+            if (!t) continue;
+            if (!balancedClean(i + 1, p - 1)) continue;
+            if (!balancedClean(p + 1, t)) continue;
+            const std::string indent = m[1].str();
+            std::vector<std::string> replacement;
+            replacement.push_back(indent + "if (!(" + m[2].str() + ")) {");
+            for (size_t j = i + 1; j < p - 1; ++j)
+                replacement.push_back(lines[j]);
+            if (t > p + 1) {
+                replacement.push_back(indent + "} else {");
+                for (size_t j = p + 1; j < t; ++j)
+                    replacement.push_back(lines[j]);
+            }
+            replacement.push_back(indent + "}");
+            lines.erase(lines.begin() + static_cast<long>(i),
+                        lines.begin() + static_cast<long>(t) + 1);
+            lines.insert(lines.begin() + static_cast<long>(i),
+                         replacement.begin(), replacement.end());
+            changed = true;
+            break;
+        }
+        if (changed) continue;
+
         // (3) labels with no remaining references.
         refs = referenceCounts();
         for (size_t i = 0; i < lines.size();) {

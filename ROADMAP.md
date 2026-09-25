@@ -181,6 +181,26 @@ it to **symbolic values** (expression trees over registers/memory):
   main, and the whole CRTStartup chain.  Knowledge graph emits these at
   confidence 0.5 with reason "may-access via pointer parameter", never
   mixed with the provable 0.85 Mod/Ref edges.
+- Analysis-IR closed loop (WS8): `ProgramAnalysis::build` is now an outer
+  fixed-point driver.  It runs the whole pipeline, harvests every complete
+  function's refined signature as a seed, clears the analysis, and
+  re-analyzes - `FunctionIR::seedSignatureTypes` plants the previous
+  round's parameter types into the rebuilt SSA IR and propagates direct
+  call outputs as their callee's refined return type, so whole-program
+  results change the IR itself.  Rounds repeat until the signature set
+  stops changing or `CENTRIFUGE_IR_FEEDBACK_ROUNDS` rounds (default 4)
+  are exhausted; `[ws8] feedback round N begin` / `round N: ... changed`
+  traces the convergence under `WS8DEBUG` (verified on chain.exe:
+  WinMainCRTStartup's `arg1` climbs from `uint64_t` to `void *` in round
+  1 and round 2 reaches the fixed point).
+- Return-through-call recovery (WS8): each call-site argument is traced
+  through copy/zext/sext/subpiece chains to a CALL definition
+  (`CallSiteArgInfo::fromCallResult`).  In the Phase 7 fixed point, an
+  argument that is the result of a call to P, received by a callee
+  parameter typed POINTER, proves P returns a pointer - so
+  `q = make(); use(q)` with `use(int*)` recovers `void * make(...)`
+  from pure interprocedural evidence even when the producer's body is
+  type-opaque (verified: `void * make(uint32_t)` on demo_rtc).
 
 Still open: state merging (item 5), CMOV/select concretization in the
 executor (limits coverage of register-indirect dispatches selected by

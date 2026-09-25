@@ -235,6 +235,15 @@ public:
     bool build(const CfgBuilder& cfg, const std::string& architecture,
                const std::string& callingConvention = {});
     void inferTypes();
+    // WS8 IR feedback: seed value types from refined whole-program
+    // signatures before inferTypes, so interprocedural results change the
+    // IR itself - own parameter entry values take the refined parameter
+    // types, and call-result values take the refined callee return types.
+    // mergeType keeps every seed an upgrade; inferTypes then propagates
+    // the seeds through the whole function.
+    void seedSignatureTypes(
+        const FunctionSignature* ownSignature,
+        const std::map<uint64_t, FunctionSignature>& calleeSignatures);
     FunctionSignature inferSignature() const;
     void optimize();
     // WS3: struct/union layouts recovered for call-result SSA values, keyed
@@ -327,6 +336,11 @@ struct CallSiteArgInfo {
     // pointer type recovered at the callee propagate back into the
     // caller's signature during the Phase 7 fixed point.
     int forwardedParam = -1;
+    // Interprocedural return evidence (WS8): when this argument value is
+    // the result of another call (through copy chains), the producer
+    // callee's address - a POINTER parameter receiving the value proves
+    // the producer returns a pointer.
+    uint64_t fromCallResult = 0;
 };
 
 struct AnalyzedCallSite {
@@ -384,6 +398,12 @@ public:
     bool build(const Program& program, const SleighEngine& engine,
                const std::string& callingConvention = {},
                size_t maximumFunctions = 0);
+    // One analysis round (WS8): function discovery, CFG/SSA construction,
+    // signature recovery and every whole-program fixed point.  Invoked by
+    // build() until the signature set reaches a fixed point.
+    bool buildPipeline(const Program& program, const SleighEngine& engine,
+                       const std::string& callingConvention,
+                       size_t maximumFunctions);
     const std::map<uint64_t, AnalyzedFunction>& functions() const {
         return functions_;
     }
@@ -402,6 +422,10 @@ private:
     std::string callingConvention_;
     std::map<uint64_t, AnalyzedFunction> functions_;
     std::unique_ptr<ImportPrototypeRecovery> importPrototypes_;
+    // WS8 IR feedback: refined signatures from the previous analysis round,
+    // seeded into each rebuilt FunctionIR (see seedSignatureTypes).  Empty
+    // on the first round.
+    std::map<uint64_t, FunctionSignature> seedSignatures_;
 
 public:
     ~ProgramAnalysis();

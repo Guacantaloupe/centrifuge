@@ -717,6 +717,47 @@ bool FunctionIR::build(const CfgBuilder& cfg, const std::string& architecture,
     return verification.valid();
 }
 
+void FunctionIR::seedSignatureTypes(
+    const FunctionSignature* ownSignature,
+    const std::map<uint64_t, FunctionSignature>& calleeSignatures) {
+    // Seed 1: this function's own refined parameter types land on the
+    // entry (version 0) register values, so inferTypes propagates them
+    // through every use - including the arguments this function forwards
+    // to its callees.
+    if (ownSignature)
+        for (const FunctionParameter& param : ownSignature->parameters) {
+            if (param.onStack || param.type.bits == 0) continue;
+            for (auto& entry : values_)
+                if (entry.second.version == 0 &&
+                    entry.second.storage == MidValue::REGISTER &&
+                    entry.second.offset == param.registerOffset) {
+                    entry.second.type =
+                        mergeType(entry.second.type, param.type);
+                    break;
+                }
+        }
+    // Seed 2: a direct call's result value takes the refined callee
+    // return type (pointer returns stop being opaque integers in the
+    // caller's IR).
+    for (MidBlock& block : blocks_)
+        for (SsaOp& op : block.ops) {
+            if ((op.op != POp::CALL && op.op != POp::CALLIND) ||
+                !op.output || op.inputs.empty())
+                continue;
+            const MidValue* targetValue = value(op.inputs[0]);
+            if (!targetValue || !targetValue->constant) continue;
+            const auto sig = calleeSignatures.find(*targetValue->constant);
+            if (sig == calleeSignatures.end() ||
+                sig->second.returnType.kind == TypeKind::VOID_TYPE ||
+                sig->second.returnType.bits == 0)
+                continue;
+            const auto output = values_.find(op.output);
+            if (output != values_.end())
+                output->second.type =
+                    mergeType(output->second.type, sig->second.returnType);
+        }
+}
+
 void FunctionIR::inferTypes() {
     auto constrain = [&](SsaId id, DataType wanted) {
         auto it = values_.find(id);
@@ -1879,6 +1920,60 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
     if (!importPrototypes_) importPrototypes_ = std::make_unique<ImportPrototypeRecovery>();
     cppTypes_ = recoverCppTypes(program);
 
+    // WS8 outer fixed point (IR feedback): run the whole analysis
+    // pipeline, harvest the refined signatures as seeds for the next
+    // round, and re-analyze until the signature set stops changing (or
+    // the round cap).  Seeds are planted into each rebuilt FunctionIR by
+    // seedSignatureTypes, so whole-program results change the IR itself
+    // and the re-analysis can derive facts that were invisible before.
+    const char* roundsEnv = std::getenv("CENTRIFUGE_IR_FEEDBACK_ROUNDS");
+    size_t maxRounds = 4;
+    if (roundsEnv)
+        maxRounds = std::max<size_t>(1, std::atoi(roundsEnv));
+    std::map<uint64_t, std::string> previousSignatures;
+    for (size_t round = 0; round < maxRounds; ++round) {
+        if (std::getenv("WS8DEBUG"))
+            std::fprintf(stderr, "[ws8] feedback round %zu begin\n", round);
+        if (!buildPipeline(program, engine, callingConvention,
+                           maximumFunctions))
+            return false;
+        std::map<uint64_t, std::string> current;
+        for (const auto& entry : functions_)
+            if (entry.second.complete)
+                current[entry.first] = entry.second.signature.declaration(
+                    entry.second.function.name);
+        if (current == previousSignatures)
+            break;  // fixed point: no new information produced
+        if (std::getenv("WS8DEBUG")) {
+            std::fprintf(stderr, "[ws8] round %zu: %zu signatures, %zu changed/new\n",
+                         round, current.size(),
+                         current.size() - previousSignatures.size());
+            for (const auto& entry : current) {
+                const auto prev = previousSignatures.find(entry.first);
+                if (prev == previousSignatures.end() || prev->second != entry.second)
+                    std::fprintf(stderr, "[ws8]   sig 0x%llx: %s -> %s\n",
+                                 (unsigned long long)entry.first,
+                                 prev == previousSignatures.end() ? "<new>" : prev->second.c_str(),
+                                 entry.second.c_str());
+            }
+        }
+        previousSignatures = std::move(current);
+        if (round + 1 >= maxRounds)
+            break;
+        seedSignatures_.clear();
+        for (const auto& entry : functions_)
+            if (entry.second.complete)
+                seedSignatures_[entry.first] = entry.second.signature;
+        functions_.clear();  // re-analyze, this time with seeds
+    }
+    return true;
+}
+
+bool ProgramAnalysis::buildPipeline(const Program& program,
+                                    const SleighEngine& engine,
+                                    const std::string& callingConvention,
+                                    size_t maximumFunctions) {
+    functions_.clear();
     const std::shared_ptr<const SleighEngine> engineReference(
         &engine, [](const SleighEngine*) {});
     SpecDisassembler disassembler(engineReference);
@@ -2364,6 +2459,17 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
             queueOrdinaryWhenIdle(selectedIndex);
             continue;
         }
+        // WS8 IR feedback: seed refined whole-program signatures into this
+        // function's IR and re-run type inference, so interprocedural
+        // results (pointer parameters, pointer returns) change the IR
+        // itself, not just the whole-program summary.
+        if (!seedSignatures_.empty()) {
+            const FunctionSignature* ownSeed = nullptr;
+            const auto own = seedSignatures_.find(function.addr);
+            if (own != seedSignatures_.end()) ownSeed = &own->second;
+            ir.seedSignatureTypes(ownSeed, seedSignatures_);
+            ir.inferTypes();
+        }
         profiledIrSeconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - irStarted).count();
         const auto postStarted = std::chrono::steady_clock::now();
@@ -2561,7 +2667,48 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                                 if (!op.phi && !op.removed &&
                                     (op.op == POp::COPY ||
                                      op.op == POp::INT_ZEXT ||
-                                     op.op == POp::INT_SEXT) &&
+                                     op.op == POp::INT_SEXT ||
+                                     op.op == POp::SUBPIECE) &&
+                                    !op.inputs.empty()) {
+                                    current = op.inputs[0];
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        // Return-through-call evidence: trace the argument
+                        // through copy chains to a CALL whose result is the
+                        // value - the producer may be proven to return a
+                        // pointer by the callee's parameter type.
+                        {
+                            std::set<SsaId> seen;
+                            SsaId current = argumentId;
+                            while (current && seen.insert(current).second) {
+                                const auto def = definitions.find(current);
+                                if (def == definitions.end()) break;
+                                const SsaOp& op = *def->second;
+                                if (!op.phi && !op.removed &&
+                                    (op.op == POp::CALL ||
+                                     op.op == POp::CALLIND) &&
+                                    op.output == current &&
+                                    !op.inputs.empty()) {
+                                    const MidValue* t =
+                                        ir.value(op.inputs[0]);
+                                    if (std::getenv("WS8DEBUG"))
+                                        std::fprintf(stderr,
+                                            "[ws8] trace: CALL def found, "
+                                            "target const=%d\n",
+                                            (int)(t && t->constant &&
+                                                  t->constant.has_value()));
+                                    if (t && t->constant)
+                                        info.fromCallResult = *t->constant;
+                                    break;
+                                }
+                                if (!op.phi && !op.removed &&
+                                    (op.op == POp::COPY ||
+                                     op.op == POp::INT_ZEXT ||
+                                     op.op == POp::INT_SEXT ||
+                                     op.op == POp::SUBPIECE) &&
                                     !op.inputs.empty()) {
                                     current = op.inputs[0];
                                     continue;
@@ -2909,6 +3056,8 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                         merged.addressUsed |= info.addressUsed;
                         if (merged.forwardedParam < 0)
                             merged.forwardedParam = info.forwardedParam;
+                        if (!merged.fromCallResult)
+                            merged.fromCallResult = info.fromCallResult;
                         if (!info.observed ||
                             info.type.kind == TypeKind::UNKNOWN)
                             continue;
@@ -3040,6 +3189,57 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                     const size_t before = targets.size();
                     targets.insert(pt.second.begin(), pt.second.end());
                     if (targets.size() != before) changed = true;
+                }
+                // WS8 return-through-call: an argument that is itself the
+                // result of a call to P, received by a POINTER parameter,
+                // proves P returns a pointer.
+                for (size_t i = 0;
+                     i < kv.second.args.size() && i < abi.size(); ++i) {
+                    const uint64_t producer = kv.second.args[i].fromCallResult;
+                    if (!producer) continue;
+                    if (std::getenv("WS8DEBUG"))
+                        std::fprintf(stderr,
+                                     "[ws8] rtc: callee 0x%llx arg %zu "
+                                     "producer 0x%llx\n",
+                                     (unsigned long long)kv.first, i,
+                                     (unsigned long long)producer);
+                    const FunctionParameter* into = nullptr;
+                    for (const FunctionParameter& p : sig.parameters)
+                        if (!p.onStack && p.registerOffset == abi[i].first) {
+                            into = &p;
+                            break;
+                        }
+                    if (!into || into->type.kind != TypeKind::POINTER) {
+                        if (std::getenv("WS8DEBUG"))
+                            std::fprintf(stderr,
+                                         "[ws8] rtc skip: callee 0x%llx arg "
+                                         "%zu into=%s type=%d\n",
+                                         (unsigned long long)kv.first, i,
+                                         into ? "found" : "null",
+                                         into ? (int)into->type.kind : -1);
+                        continue;
+                    }
+                    const auto producerIt = functions_.find(producer);
+                    if (producerIt == functions_.end() ||
+                        !producerIt->second.complete ||
+                        tailDispatchers.count(producer))
+                        continue;
+                    FunctionSignature& psig =
+                        producerIt->second.signature;
+                    if (std::getenv("WS8DEBUG"))
+                        std::fprintf(stderr,
+                            "[ws8] rtc apply: producer 0x%llx ret kind=%d\n",
+                            (unsigned long long)producer,
+                            (int)psig.returnType.kind);
+                    if (psig.returnType.kind != TypeKind::POINTER &&
+                        (psig.returnType.kind == TypeKind::UNSIGNED_INT ||
+                         psig.returnType.kind == TypeKind::SIGNED_INT ||
+                         psig.returnType.kind == TypeKind::UNKNOWN)) {
+                        psig.returnType = DataType{TypeKind::POINTER, 64, 1};
+                        if (psig.returnComponents.size() == 1)
+                            psig.returnComponents[0] = psig.returnType;
+                        changed = true;
+                    }
                 }
             }
             // WS8 reverse direction: a callee parameter typed POINTER (by

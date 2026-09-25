@@ -54,12 +54,16 @@ CONTROL = {"if", "for", "while", "switch", "return", "sizeof"}
 
 def defined_names(src: Path):
     names = set()
+    classes = set()
     for line in src.read_text(encoding="utf-8").splitlines():
         m = DEF_RE.match(line)
         if m and m.group(1) not in CONTROL:
             names.add(m.group(1))
+        cm = re.match(r"^\s*(?:class|struct)\s+(\w+)", line)
+        if cm:
+            classes.add(cm.group(1))
     names.discard("main")
-    return names
+    return names, classes
 
 
 def run(cmd, cwd=None, shell=False, timeout=600, env=None):
@@ -74,7 +78,7 @@ def tool_env(bin_dir: str):
 
 
 def compile_one(src: Path, cfg_name: str, cfg: dict, exe: Path,
-                suite_names=None):
+                suite_names=None, suite_classes=None):
     kind = cfg["kind"]
     opt = cfg["opt"]
     is_cpp = src.suffix == ".cpp"
@@ -89,7 +93,13 @@ def compile_one(src: Path, cfg_name: str, cfg: dict, exe: Path,
         # by the prologue scanner.  Exporting every suite function puts it
         # in the PE export directory: real names + guaranteed discovery.
         def_file = exe.with_suffix(".def")
-        if suite_names:
+        if is_cpp:
+            # C++ symbols are decorated (?fn@Class@@...), so a bare-name
+            # def matches nothing.  Pass 1 links with an empty export set
+            # purely to get a .map, then we collect every decorated symbol
+            # and re-link the kept objects with a decorated-name def.
+            def_file.write_text("LIBRARY {}\nEXPORTS\n".format(exe.stem))
+        elif suite_names:
             def_file.write_text(
                 "LIBRARY {}\nEXPORTS\n{}\n".format(
                     exe.stem, "\n".join(sorted(suite_names))))
@@ -98,6 +108,43 @@ def compile_one(src: Path, cfg_name: str, cfg: dict, exe: Path,
                    str(obj_dir) + "\\", str(src), str(map_file),
                    str(def_file)])
         addr2name = parse_map(map_file)
+        if (is_cpp and suite_names and res.returncode == 0
+                and exe.exists()):
+            # Only symbols defined by THIS translation unit's obj — the map
+            # also lists CRT internals whose decorated names would fail the
+            # re-link (LNK2001).
+            own_obj = (src.stem + ".obj").lower()
+
+            def want(sym):
+                if sym.startswith("$"):  # $unwind$/$pdata$ pseudo-symbols
+                    return False
+                if "tag_" in sym or "g_variants" in sym:
+                    return False
+                # free function ?name@@ / member ?name@Class@@
+                if any("@" + n + "@@" in sym for n in suite_names):
+                    return True
+                if any(sym.startswith("?" + n + "@@") for n in suite_names):
+                    return True
+                # ctors/dtors/deleting-dtors of family classes
+                return any(("??0" + c + "@@") in sym or ("??1" + c + "@@") in sym
+                           or ("??_G" + c + "@@") in sym or ("??_E" + c + "@@") in sym
+                           for c in (suite_classes or ()))
+
+            deco = []
+            seen = set()
+            for line in map_file.read_text(errors="replace").splitlines():
+                om = MAP_OBJ_RE.match(line)
+                if (om and om.group(3).lower() == own_obj
+                        and "?" in om.group(1) and om.group(1) not in seen
+                        and want(om.group(1))):
+                    seen.add(om.group(1))
+                    deco.append(om.group(1))
+            def_file.write_text("LIBRARY {}\nEXPORTS\n{}\n".format(
+                exe.stem, "\n".join(sorted(deco))))
+            relink = ROOT / "msvc_relink.bat"
+            res = run(["cmd", "/c", str(relink), str(exe),
+                       str(obj_dir) + "\\", str(map_file), str(def_file)])
+            addr2name = parse_map(map_file)
     elif kind == "clang":
         compiler = CLANGXX if is_cpp else CLANG
         stdflag = "-std=c++17" if is_cpp else "-std=c11"
@@ -116,6 +163,8 @@ def compile_one(src: Path, cfg_name: str, cfg: dict, exe: Path,
 
 
 MAP_RE = re.compile(r"^\s*\d+:[0-9a-fA-F]+\s+(\S+)\s+([0-9a-fA-F]{8,16})\s")
+MAP_OBJ_RE = re.compile(
+    r"^\s*\d+:[0-9a-fA-F]+\s+(\S+)\s+([0-9a-fA-F]{8,16})\s+(\S+\.obj)")
 
 
 def parse_map(map_file: Path):
@@ -134,7 +183,8 @@ def parse_map(map_file: Path):
     return addr2name
 
 
-def analyze(exe: Path, spec: Path, suite_names=None, addr2name=None) -> dict:
+def analyze(exe: Path, spec: Path, suite_names=None, addr2name=None,
+            suite_classes=None) -> dict:
     res = run([str(CENTRIFUGE), "spec", str(spec), str(exe), "analyze-all"],
               timeout=900)
     text = res.stdout
@@ -153,7 +203,12 @@ def analyze(exe: Path, spec: Path, suite_names=None, addr2name=None) -> dict:
                 sym = addr2name.get(addr, "")
                 if any(n in sym for n in suite_names):
                     name = sym
-            if name not in suite_names:
+            keep = name in suite_names
+            if not keep and suite_classes:
+                # MSVC/Itanium C++ symbols are decorated: keep anything
+                # mentioning one of the family's classes (?m@Class@@...).
+                keep = any(c in decl for c in suite_classes)
+            if not keep:
                 # MSVC C symbols carry a leading underscore
                 if not any(name in s or s in name
                            for s in suite_names if len(s) > 4):
@@ -243,14 +298,16 @@ def main():
         exe = OUT / f"{fam}--{cfg_name}.exe"
         if exe.exists():
             exe.unlink()
+        suite_names, suite_classes = defined_names(src)
         err, addr2name = compile_one(src, cfg_name, cfg, exe,
-                                     defined_names(src))
+                                     suite_names, suite_classes)
         if err == "skip":
             return fam, cfg_name, {"status": "pending"}
         if err:
             return fam, cfg_name, {"status": "compile-error", "error": err}
         try:
-            info = analyze(exe, SPEC_X64, defined_names(src), addr2name)
+            info = analyze(exe, SPEC_X64, suite_names, addr2name,
+                           suite_classes)
             info["status"] = "ok"
         except subprocess.TimeoutExpired:
             info = {"status": "analyze-timeout"}

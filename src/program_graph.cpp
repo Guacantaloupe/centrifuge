@@ -314,6 +314,29 @@ ProgramKnowledgeGraph buildProgramKnowledgeGraph(
             graph.addEdge(functionNode->second, globalNode(address),
                           KnowledgeEdgeKind::WRITES, 0.85,
                           "whole-program Mod/Ref (interprocedural)");
+        // Object/alias evidence: a constant address passed as this argument
+        // at any call site is a global the parameter provably may alias.
+        const std::string functionKey =
+            "function:" + addressKey(entry.first);
+        for (const auto& pt : entry.second.paramPointsTo) {
+            for (size_t index = 0;
+                 index < entry.second.signature.parameters.size(); ++index) {
+                const FunctionParameter& parameter =
+                    entry.second.signature.parameters[index];
+                if (parameter.onStack ||
+                    parameter.registerOffset != pt.first)
+                    continue;
+                const auto parameterNode =
+                    graph.find(functionKey + ":parameter:" +
+                               std::to_string(index));
+                if (!parameterNode) break;
+                for (uint64_t address : pt.second)
+                    graph.addEdge(*parameterNode, globalNode(address),
+                                  KnowledgeEdgeKind::ALIASES, 0.7,
+                                  "call-site constant-argument points-to");
+                break;
+            }
+        }
     }
     for (const auto& entry : analysis.functions()) {
         for (uint64_t callee : entry.second.callees) {

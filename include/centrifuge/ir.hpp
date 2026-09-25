@@ -352,6 +352,12 @@ struct AnalyzedFunction {
     // WS3: struct/union layouts recovered for call results (call address ->
     // aggregate type), used for member-access naming on locals.
     std::map<uint64_t, DataType> callResultTypes;
+    // WS8 Memory/Object analysis: points-to evidence per parameter
+    // (register offset -> concrete global addresses callers pass as that
+    // argument).  Only constants inside the program's data regions qualify,
+    // so a set entry names a provable global object the parameter may
+    // alias - the seed of the object/alias analysis.
+    std::map<uint64_t, std::set<uint64_t>> paramPointsTo;
     bool complete = false;
     bool complexityLimited = false;
     std::string incompleteReason;

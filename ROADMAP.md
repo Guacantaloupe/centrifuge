@@ -162,6 +162,14 @@ it to **symbolic values** (expression trees over registers/memory):
   on a noinline chain: deep's `int*` reaches mid and top, which baseline
   left `uint64_t`), and the recovered signatures feed back into
   decompileFunction output and the knowledge graph's HAS_TYPE edges.
+- Object/alias analysis (WS8): a constant argument inside a program data
+  region is points-to evidence - the callee parameter provably may alias
+  that global object.  Every direct call site contributes its constant
+  arguments (register-offset keyed), the Phase 7 fixed point merges them
+  into `AnalyzedFunction::paramPointsTo`, and `knowledge-graph` emits
+  ALIASES edges PARAMETER -> GLOBAL with reason "call-site
+  constant-argument points-to" (verified: `rd(&g_x)` produces
+  `arg3 -> g_data_140005000`, `rd2(&g_x, &g_y)` both parameters).
 
 Still open: state merging (item 5), CMOV/select concretization in the
 executor (limits coverage of register-indirect dispatches selected by

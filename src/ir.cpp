@@ -2815,6 +2815,15 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
     // merges into the callee signature until no signature changes anymore.
     {
         const auto abi = abiArguments(architecture_, callingConvention_);
+        // A constant argument inside a program data region is points-to
+        // evidence: the callee's parameter may alias that global object.
+        auto isDataAddress = [&program](uint64_t address) {
+            for (const DataRegion& region : program.dataRegions)
+                if (address >= region.address &&
+                    address < region.address + region.size)
+                    return true;
+            return false;
+        };
         struct CalleeEvidence {
             size_t sites = 0;
             std::vector<CallSiteArgInfo> args;
@@ -2822,6 +2831,8 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
             bool returnDereferenced = false;
             bool returnBoolean = false;
             bool returnArithmetic = false;
+            // WS8: register offset -> global addresses passed as constants.
+            std::map<uint64_t, std::set<uint64_t>> pointsTo;
         };
         for (size_t pass = 0; pass < functions_.size() + 1; ++pass) {
             bool changed = false;
@@ -2857,6 +2868,11 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                     ev.returnDereferenced |= site.returnDereferenced;
                     ev.returnBoolean |= site.returnBoolean;
                     ev.returnArithmetic |= site.returnArithmetic;
+                    for (size_t i = 0;
+                         i < site.arguments.size() && i < abi.size(); ++i)
+                        if (const auto constant = site.arguments[i])
+                            if (isDataAddress(*constant))
+                                ev.pointsTo[abi[i].first].insert(*constant);
                 }
             }
             for (const auto& kv : evidence) {
@@ -2960,6 +2976,16 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                     if (sig.returnComponents.size() == 1)
                         sig.returnComponents[0] = sig.returnType;
                     changed = true;
+                }
+                // WS8: install the constant-argument points-to evidence on
+                // the callee - each set entry names a global object the
+                // parameter provably may alias.
+                for (const auto& pt : kv.second.pointsTo) {
+                    std::set<uint64_t>& targets =
+                        fit->second.paramPointsTo[pt.first];
+                    const size_t before = targets.size();
+                    targets.insert(pt.second.begin(), pt.second.end());
+                    if (targets.size() != before) changed = true;
                 }
             }
             // WS8 reverse direction: a callee parameter typed POINTER (by

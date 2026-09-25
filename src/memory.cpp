@@ -60,4 +60,16 @@ bool MemoryImage::readString(uint64_t addr, std::string& out, size_t maxLen) con
     return true;
 }
 
+bool MemoryImage::write(uint64_t addr, const void* src, size_t n) {
+    if (n == 0) return true;
+    for (auto& b : blocks_) {
+        if (!b.contains(addr)) continue;
+        const size_t off = static_cast<size_t>(addr - b.base);
+        if (n > b.data.size() - off) return false;
+        std::memcpy(b.data.data() + off, src, n);
+        return true;
+    }
+    return false;
+}
+
 } // namespace centrifuge

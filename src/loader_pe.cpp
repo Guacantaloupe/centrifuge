@@ -814,6 +814,55 @@ std::optional<Program> loadPeImpl(const std::vector<uint8_t>& d,
         }
     }
 
+    // ---- IAT binding: give every import a synthetic stub target ----
+    // Unbound IAT slots hold lookup-table RVAs (pointers to
+    // IMAGE_IMPORT_BY_NAME records), so an indirect call through the slot
+    // resolves to data, not code.  Bind each slot to a synthetic `ret` stub
+    // past the end of the image; symbolic exploration and the decompiler
+    // then see a stable, named call target (library!name) per import.
+    if (!p.imports.empty()) {
+        const uint64_t stubAlign = 0x1000;
+        const uint64_t stubSize = 16;
+        uint64_t stubBase = 0;
+        if (!addOk(p.imageBase,
+                   (static_cast<uint64_t>(sizeOfImage) + stubAlign - 1) &
+                       ~(stubAlign - 1),
+                   stubBase)) {
+            err = "IAT stub region address overflow";
+            return std::nullopt;
+        }
+        std::vector<uint8_t> stubBytes(p.imports.size() * stubSize, 0xCC);
+        for (size_t i = 0; i < p.imports.size(); ++i)
+            stubBytes[i * stubSize] = 0xC3;  // ret
+        if (stubBytes.size() > maxMappedBytes ||
+            !p.memory.addBlock("iat_stubs", stubBase, std::move(stubBytes),
+                               static_cast<int>(Perm::R) |
+                                   static_cast<int>(Perm::X))) {
+            err = "cannot map IAT stub region";
+            return std::nullopt;
+        }
+        for (size_t i = 0; i < p.imports.size(); ++i) {
+            const uint64_t stubAddr = stubBase + i * stubSize;
+            uint8_t encoded[8] = {0};
+            for (int b = 0; b < 8; ++b)
+                encoded[b] = static_cast<uint8_t>(stubAddr >> (8 * b));
+            if (!p.memory.write(p.imports[i].iatAddress, encoded,
+                                is64 ? 8 : 4)) {
+                err = "cannot bind IAT slot";
+                return std::nullopt;
+            }
+            p.imports[i].boundAddress = stubAddr;
+            Symbol stubSym;
+            stubSym.name = p.imports[i].library + "!" +
+                           (p.imports[i].byOrdinal
+                                ? ("#" + std::to_string(p.imports[i].ordinal))
+                                : p.imports[i].name);
+            stubSym.addr = stubAddr;
+            stubSym.isFunction = true;
+            p.symbols.push_back(std::move(stubSym));
+        }
+    }
+
     // entry point as a pseudo-symbol
     if (p.entryPoint != 0) {
         Symbol e;

@@ -39,6 +39,10 @@ public:
     bool isExecutable(uint64_t addr) const;
     bool isReadable(uint64_t addr) const;
 
+    // Write n bytes at addr into the containing block (in-place loader
+    // fixups such as PE IAT binding). False if unmapped or out of bounds.
+    bool write(uint64_t addr, const void* src, size_t n);
+
     // Read exactly n bytes at addr. False if out of bounds.
     bool read(uint64_t addr, void* dst, size_t n) const;
 

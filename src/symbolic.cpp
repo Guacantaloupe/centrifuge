@@ -1960,7 +1960,11 @@ private:
         for (const Symbol& s : prog_.symbols)
             if (s.isFunction && s.addr == target) { sym = &s; break; }
         if (!sym) return false;
-        const std::string& name = sym->name;
+        // Bound PE imports are named "library!func"; hooks match the bare
+        // function name.
+        std::string name = sym->name;
+        const size_t bang = name.find('!');
+        if (bang != std::string::npos) name = name.substr(bang + 1);
         const uint64_t spOff = spOffsetFor(prog_.arch);
         auto rspc = asConst(st.getReg(spOff));
         if (!rspc) return false;

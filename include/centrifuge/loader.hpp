@@ -38,6 +38,11 @@ struct ImportSymbol {
     uint16_t ordinal = 0;
     uint64_t lookupAddress = 0;
     uint64_t iatAddress = 0;
+    // Synthetic stub address this import is bound to in the memory image
+    // (0 when unbound).  The stub is a single `ret` in the mapped
+    // "iat_stubs" block so indirect calls through the slot resolve to a
+    // stable, named target for symbolic exploration and decompilation.
+    uint64_t boundAddress = 0;
     bool byOrdinal = false;
     bool delayed = false;
 };

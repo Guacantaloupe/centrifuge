@@ -136,6 +136,21 @@ it to **symbolic values** (expression trees over registers/memory):
   explored evaluation(s) */` - real range evidence for the recovered
   comparison (bitwise-and with 1 really is [0,1]), not a semantic change.
 
+## 🎯 v0.9 — Whole-program analysis (WS8)
+
+- Memory/Object analysis with concrete global Mod/Ref: FunctionEffects now
+  records the resolved global address of every LOAD/STORE in a GLOBAL memory
+  partition (AliasAnalysis resolves constant pointers to object+offset when
+  a global MemoryObject is registered, and to the absolute address
+  otherwise).  The existing interprocedural Mod/Ref fixed point propagates
+  these sets through the direct call graph - callers inherit every global
+  their callees touch, transitively across recursion - so
+  `WinMainCRTStartup` is attributed the union of the CRT's writes.
+- Knowledge-graph feedback: `knowledge-graph` now emits READS / WRITES
+  edges from every FUNCTION node to the GLOBAL nodes it provably touches
+  (anonymous accessed globals get a node too), turning the graph into a
+  queryable whole-program Mod/Ref oracle.
+
 Still open: state merging (item 5), CMOV/select concretization in the
 executor (limits coverage of register-indirect dispatches selected by
 cmov); global-write sets per callee (extend the summary beyond return

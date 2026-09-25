@@ -289,6 +289,32 @@ ProgramKnowledgeGraph buildProgramKnowledgeGraph(
                           "data-flow type solver");
         }
     }
+    // WS8 Memory/Object analysis: attach the whole-program Mod/Ref fixed
+    // point's concrete global evidence to the graph.  Every function reads
+    // (READS edge) or writes (WRITES edge) the recovered GLOBAL nodes it
+    // provably touches - including globals reached only transitively through
+    // callees, since the fixed point merged callee effects into each caller.
+    // Globals without a loader symbol still get a node (anonymous object).
+    for (const auto& entry : analysis.functions()) {
+        const auto functionNode = functions.find(entry.first);
+        if (functionNode == functions.end()) continue;
+        auto globalNode = [&](uint64_t address) {
+            const std::string key = "global:" + addressKey(address);
+            const auto existing = graph.find(key);
+            if (existing) return *existing;
+            return graph.addNode(KnowledgeNodeKind::GLOBAL, key,
+                                 "g_data_" + addressKey(address), address, 0,
+                                 0.6);
+        };
+        for (uint64_t address : entry.second.effects.referencedGlobals)
+            graph.addEdge(functionNode->second, globalNode(address),
+                          KnowledgeEdgeKind::READS, 0.8,
+                          "whole-program Mod/Ref (interprocedural)");
+        for (uint64_t address : entry.second.effects.modifiedGlobals)
+            graph.addEdge(functionNode->second, globalNode(address),
+                          KnowledgeEdgeKind::WRITES, 0.85,
+                          "whole-program Mod/Ref (interprocedural)");
+    }
     for (const auto& entry : analysis.functions()) {
         for (uint64_t callee : entry.second.callees) {
             const auto callerNode = functions.find(entry.first);

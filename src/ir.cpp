@@ -1792,12 +1792,18 @@ bool FunctionEffects::mergeFrom(const FunctionEffects& other) {
                              other.referencedObjects.end());
     modifiedObjects.insert(other.modifiedObjects.begin(),
                            other.modifiedObjects.end());
+    referencedGlobals.insert(other.referencedGlobals.begin(),
+                             other.referencedGlobals.end());
+    modifiedGlobals.insert(other.modifiedGlobals.begin(),
+                           other.modifiedGlobals.end());
     return readsMemory != before.readsMemory ||
            writesMemory != before.writesMemory ||
            allocates != before.allocates || frees != before.frees ||
            unknownCall != before.unknownCall ||
            referencedObjects != before.referencedObjects ||
-           modifiedObjects != before.modifiedObjects;
+           modifiedObjects != before.modifiedObjects ||
+           referencedGlobals != before.referencedGlobals ||
+           modifiedGlobals != before.modifiedGlobals;
 }
 
 const AnalyzedFunction* ProgramAnalysis::functionAt(uint64_t address) const {
@@ -2548,12 +2554,38 @@ bool ProgramAnalysis::build(const Program& program, const SleighEngine& engine,
                     ir.memoryPartitions().find(operation.memoryPartition);
                 if (partition != ir.memoryPartitions().end())
                     objectKind = partition->second.kind;
+                // WS8: recover the concrete global address behind a GLOBAL
+                // partition so whole-program Mod/Ref can name the object
+                // (and the knowledge graph can attach reads/writes edges).
+                // AliasAnalysis resolves a constant pointer to
+                // object-id + relative offset when a GLOBAL MemoryObject is
+                // registered, and to object 0 + the absolute address
+                // otherwise (function-level IR registers no global objects).
+                uint64_t globalAddress = 0;
+                if (objectKind == MemoryObjectKind::GLOBAL &&
+                    partition != ir.memoryPartitions().end()) {
+                    if (partition->second.object != 0) {
+                        const auto object =
+                            ir.memoryObjects().find(partition->second.object);
+                        if (object != ir.memoryObjects().end() &&
+                            object->second.address != 0)
+                            globalAddress = object->second.address +
+                                partition->second.byteOffset;
+                    } else if (partition->second.byteOffset > 0) {
+                        globalAddress =
+                            static_cast<uint64_t>(partition->second.byteOffset);
+                    }
+                }
                 if (operation.op == POp::LOAD) {
                     analyzed.effects.readsMemory = true;
                     analyzed.effects.referencedObjects.insert(objectKind);
+                    if (globalAddress)
+                        analyzed.effects.referencedGlobals.insert(globalAddress);
                 } else if (operation.op == POp::STORE) {
                     analyzed.effects.writesMemory = true;
                     analyzed.effects.modifiedObjects.insert(objectKind);
+                    if (globalAddress)
+                        analyzed.effects.modifiedGlobals.insert(globalAddress);
                 } else if (operation.op == POp::CALLIND) {
                     ++indirectCalls;
                 } else if (operation.op == POp::BRANCHIND) {

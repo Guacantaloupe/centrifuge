@@ -289,6 +289,14 @@ struct FunctionEffects {
     bool unknownCall = false;
     std::set<MemoryObjectKind> referencedObjects;
     std::set<MemoryObjectKind> modifiedObjects;
+    // Whole-program Memory/Object analysis (WS8): concrete global-object
+    // addresses this function provably reads or writes, resolved from the
+    // memory partitions of its LOAD/STORE operations.  Propagated
+    // interprocedurally by the Mod/Ref fixed point in ProgramAnalysis::build
+    // (mergeFrom unions the sets), so a caller inherits every global its
+    // callees touch, transitively, across recursion.
+    std::set<uint64_t> referencedGlobals;
+    std::set<uint64_t> modifiedGlobals;
     ModRefInfo modRef() const {
         if (unknownCall) return ModRefInfo::UNKNOWN;
         if (readsMemory && writesMemory) return ModRefInfo::MOD_REF;

@@ -2318,6 +2318,9 @@ public:
     // devirtualizes the indirect call to a direct named call.
     const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites =
         nullptr;
+    // WS6: indirect call/jump sites resolved by symbolic exploration
+    // (instruction address -> observed concrete targets).
+    const SymIndirectSites* symIndirectSites = nullptr;
     // WS3: when a LOAD/STORE address is an untouched incoming-parameter
     // register plus a constant displacement, and the recovered parameter
     // type carries a member at that offset whose width matches the
@@ -3063,6 +3066,23 @@ public:
                         if (vc != virtualCallSites->end() &&
                             vc->second.resolvedTarget &&
                             emitCall(pi, op.in0, vc->second.resolvedTarget)) {
+                            regExpr.clear();
+                            paramCopies.clear();
+                            callResultStructs.clear();
+                            regConst.clear();
+                            continue;
+                        }
+                    }
+                    // WS6: a symbolic-exploration site with exactly one
+                    // resolved target devirtualizes the same way - the
+                    // observed target (typically a bound import stub) gives
+                    // a named direct call instead of an opaque indirect one.
+                    if (op.op == POp::CALLIND && symIndirectSites) {
+                        const auto si = symIndirectSites->find(pi.addr);
+                        if (si != symIndirectSites->end() &&
+                            si->second.isCall &&
+                            si->second.targets.size() == 1 &&
+                            emitCall(pi, op.in0, si->second.targets.front())) {
                             regExpr.clear();
                             paramCopies.clear();
                             callResultStructs.clear();
@@ -5935,7 +5955,8 @@ std::string decompile(
     const std::string& entryName, const FunctionSignature* callerSignature,
     const FieldAccessorMap* fieldAccessors,
     const std::map<uint64_t, DataType>* callResultTypes,
-    const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites) {
+    const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites,
+    const SymIndirectSites* symIndirectSites) {
     CfgBuilder cfg;
     if (!cfg.build(eng, read, start, end)) return "// failed to build CFG\n";
 
@@ -6271,6 +6292,7 @@ std::string decompile(
                     body.fieldAccessors = fieldAccessors;
                     body.callResultTypes = callResultTypes;
                     body.virtualCallSites = virtualCallSites;
+                    body.symIndirectSites = symIndirectSites;
                     body.architecture = architecture;
                     body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -6316,6 +6338,7 @@ body.pushSlots = &pushSlots;
                 body.fieldAccessors = fieldAccessors;
                 body.callResultTypes = callResultTypes;
                 body.virtualCallSites = virtualCallSites;
+                body.symIndirectSites = symIndirectSites;
                 body.architecture = architecture;
                 body.useRecoveredRuntime = useRecoveredRuntime;
                     body.stackModel = stackModel;
@@ -6409,6 +6432,7 @@ body.pushSlots = &pushSlots;
                         header.fieldAccessors = fieldAccessors;
                         header.callResultTypes = callResultTypes;
                         header.virtualCallSites = virtualCallSites;
+                        header.symIndirectSites = symIndirectSites;
                         header.architecture = architecture;
                         header.useRecoveredRuntime = useRecoveredRuntime;
                         header.stackModel = stackModel;
@@ -6469,6 +6493,7 @@ header.pushSlots = &pushSlots;
         be.fieldAccessors = fieldAccessors;
         be.callResultTypes = callResultTypes;
         be.virtualCallSites = virtualCallSites;
+        be.symIndirectSites = symIndirectSites;
         be.architecture = architecture;
         be.useRecoveredRuntime = useRecoveredRuntime;
                     be.stackModel = stackModel;
@@ -6520,6 +6545,7 @@ be.pushSlots = &pushSlots;
                 thenBody.fieldAccessors = fieldAccessors;
                 thenBody.callResultTypes = callResultTypes;
                 thenBody.virtualCallSites = virtualCallSites;
+                thenBody.symIndirectSites = symIndirectSites;
                 thenBody.architecture = architecture;
                 thenBody.useRecoveredRuntime = useRecoveredRuntime;
                     thenBody.stackModel = stackModel;
@@ -6549,6 +6575,7 @@ thenBody.pushSlots = &pushSlots;
                 elseBody.fieldAccessors = fieldAccessors;
                 elseBody.callResultTypes = callResultTypes;
                 elseBody.virtualCallSites = virtualCallSites;
+                elseBody.symIndirectSites = symIndirectSites;
                 elseBody.architecture = architecture;
                 elseBody.useRecoveredRuntime = useRecoveredRuntime;
                     elseBody.stackModel = stackModel;
@@ -6594,6 +6621,7 @@ elseBody.pushSlots = &pushSlots;
                 te.fieldAccessors = fieldAccessors;
                 te.callResultTypes = callResultTypes;
                 te.virtualCallSites = virtualCallSites;
+                te.symIndirectSites = symIndirectSites;
                 te.architecture = architecture;
                 te.useRecoveredRuntime = useRecoveredRuntime;
                     te.stackModel = stackModel;
@@ -6658,6 +6686,7 @@ te.pushSlots = &pushSlots;
                     armBody.fieldAccessors = fieldAccessors;
                     armBody.callResultTypes = callResultTypes;
                     armBody.virtualCallSites = virtualCallSites;
+                    armBody.symIndirectSites = symIndirectSites;
                     armBody.architecture = architecture;
                     armBody.useRecoveredRuntime = useRecoveredRuntime;
                     armBody.stackModel = stackModel;
@@ -6855,6 +6884,36 @@ te.pushSlots = &pushSlots;
                 nameOf) {
                 const std::string fname =
                     nameOf(vc->second.resolvedTarget);
+                if (!fname.empty()) {
+                    std::string args;
+                    const std::vector<uint64_t> abi =
+                        defaultArgumentRegisters(architecture);
+                    for (size_t i = 0; i < abi.size(); ++i) {
+                        std::string text = registerName(architecture, abi[i]);
+                        const uint64_t argStorage = registerStorageOffset(
+                            architecture, abi[i], 8);
+                        const auto definition = be.regExpr.find(argStorage);
+                        if (definition != be.regExpr.end() &&
+                            inlineableExpression(definition->second))
+                            text = stripParens(definition->second.text);
+                        args += (i ? ", " : "") + text;
+                    }
+                    for (int i = 0; i <= depth; ++i) out << "    ";
+                    out << "return " << fname << "(" << args << ");\n";
+                    return;
+                }
+            }
+        }
+        // WS6: a symbolic-exploration tail jump with exactly one observed
+        // target devirtualizes the same way (e.g. a resolved jmp [iat]
+        // import thunk becomes a direct tail call).
+        if ((term->kind == Insn::JMP || term->kind == Insn::OTHER) &&
+            !term->targetKnown && !be.resolvedKnown && symIndirectSites &&
+            !useRecoveredRuntime && nameOf) {
+            const auto si = symIndirectSites->find(term->addr);
+            if (si != symIndirectSites->end() && !si->second.isCall &&
+                si->second.targets.size() == 1) {
+                const std::string fname = nameOf(si->second.targets.front());
                 if (!fname.empty()) {
                     std::string args;
                     const std::vector<uint64_t> abi =
@@ -7083,13 +7142,14 @@ std::string decompileTyped(
     const std::function<bool(uint64_t)>& guardSlotOf,
     const FieldAccessorMap* fieldAccessors,
     const std::map<uint64_t, DataType>* callResultTypes,
-    const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites) {
+    const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites,
+    const SymIndirectSites* symIndirectSites) {
     std::string body = decompile(eng, read, start, end, nameOf, signatureOf,
                                  architecture, useRecoveredRuntime,
                                  stackModel, globals, guardSlotOf,
                                  /*entryName=*/"", &signature,
                                  fieldAccessors, callResultTypes,
-                                 virtualCallSites);
+                                 virtualCallSites, symIndirectSites);
     // A data-slot trampoline (indirect tail call) forwards the callee's
     // return value through rax, so it must never decompile to void: the
     // typed wrapper's void-return rewrite would turn the dispatch into a

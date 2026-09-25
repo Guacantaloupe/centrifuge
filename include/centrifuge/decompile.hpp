@@ -28,6 +28,16 @@ namespace centrifuge {
 using FieldAccessorMap =
     std::map<std::pair<uint64_t, int64_t>, std::pair<std::string, int>>;
 
+// WS6 symbolic-assisted decompilation: indirect call/jump sites whose
+// targets the symbolic exploration engine resolved, keyed by instruction
+// address.  A single-target call site devirtualizes to a direct named
+// call; a multi-target jump site is switch-shaped evidence.
+struct SymIndirectSiteInfo {
+    bool isCall = false;            // true = CALLIND, false = BRANCHIND
+    std::vector<uint64_t> targets;  // concrete targets observed, sorted
+};
+using SymIndirectSites = std::map<uint64_t, SymIndirectSiteInfo>;
+
 // Decompile the function starting at `start` (until RET/undecodable/`end`).
 // `nameOf` resolves call-target addresses to function names ("" = indirect).
 // `stackModel` (optional) enables the Native Source Recovery Backend:
@@ -49,8 +59,8 @@ std::string decompile(
     const FunctionSignature* callerSignature = nullptr,
     const FieldAccessorMap* fieldAccessors = nullptr,
     const std::map<uint64_t, DataType>* callResultTypes = nullptr,
-    const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites =
-        nullptr);
+    const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites = nullptr,
+    const SymIndirectSites* symIndirectSites = nullptr);
 
 // Emits a complete C-like function with the recovered declaration and ABI
 // register aliases.  Direct calls use propagated callee signatures.
@@ -71,6 +81,7 @@ std::string decompileTyped(
     const FieldAccessorMap* fieldAccessors = nullptr,
     const std::map<uint64_t, DataType>* callResultTypes = nullptr,
     const std::map<uint64_t, CppVirtualCallSite>* virtualCallSites =
-        nullptr);
+        nullptr,
+    const SymIndirectSites* symIndirectSites = nullptr);
 
 } // namespace centrifuge

@@ -248,7 +248,9 @@ void usage(const char* argv0) {
                 argv0);
     std::printf("  %s spec <spec.slaspec> <file> decompile-typed <addr> [abi]\n",
                 argv0);
-    std::printf("  %s spec <spec.slaspec> <file> decompile-native <addr> [end] [abi]\n",
+    std::printf("  %s spec <spec.slaspec> <file> decompile-native <addr> [end] [abi]"
+                " [--sym-explore [--sym-start a] [--stdin n] [--max-states n]"
+                " [--max-steps n]]\n",
                 argv0);
     std::printf("  %s spec <spec.slaspec> <file> decompile <addr> [end]\n",
                 argv0);
@@ -831,18 +833,41 @@ int cmdSpec(int argc, char** argv) {
             std::fprintf(stderr, "centrifuge: bad address '%s'\n", argv[5]);
             return 1;
         }
+        // Flags may follow or replace the optional positional end/abi
+        // arguments, so scan everything after <addr> and collect bare
+        // tokens positionally.
         uint64_t end = 0;
-        if (argc >= 7) end = std::strtoull(argv[6], nullptr, 0);
+        std::string abi;
+        std::vector<std::string> positional;
+        bool symExplore = false;
+        ReachOptions symOpt;
+        for (int i = 6; i < argc; ++i) {
+            const std::string a = argv[i];
+            if (a == "--sym-explore") symExplore = true;
+            else if (a == "--sym-start" && i + 1 < argc)
+                symOpt.startAddress = std::stoull(argv[++i], nullptr, 0);
+            else if (a == "--stdin" && i + 1 < argc) {
+                symOpt.symbolicStdin = true;
+                symOpt.stdinLength = std::stoull(argv[++i], nullptr, 0);
+            } else if (a == "--max-states" && i + 1 < argc)
+                symOpt.maxStates = std::stoull(argv[++i], nullptr, 0);
+            else if (a == "--max-steps" && i + 1 < argc)
+                symOpt.maxStepsPerState = std::stoull(argv[++i], nullptr, 0);
+            else if (a.rfind("--", 0) != 0)
+                positional.push_back(a);
+        }
+        if (!positional.empty())
+            end = std::strtoull(positional[0].c_str(), nullptr, 0);
         if (end == 0) end = addr + 0x1000;
+        if (positional.size() > 1) abi = positional[1];
+        if (abi.empty() && prog->arch.rfind("x86", 0) == 0 &&
+            prog->arch != "x86")
+            abi = "win64";
         CfgBuilder cfg;
         if (!cfg.build(*eng, reader, addr, end)) {
             std::fprintf(stderr, "centrifuge: failed to build CFG\n");
             return 1;
         }
-        const std::string abi = argc >= 8
-            ? argv[7]
-            : (prog->arch.rfind("x86", 0) == 0 && prog->arch != "x86"
-                   ? "win64" : std::string());
         const std::string arch = prog->arch + abi;
         StackFrameAnalysis stackAnalysis;
         stackAnalysis.analyze(cfg, arch);
@@ -890,9 +915,25 @@ int cmdSpec(int argc, char** argv) {
         std::string entryName;
         for (const auto& s : prog->symbols)
             if (s.isFunction && s.addr == addr) { entryName = s.name; break; }
+        // WS6 symbolic-assisted decompilation: bounded symbolic exploration
+        // resolves indirect call sites; single-target sites devirtualize
+        // into direct named calls in the output below.
+        SymIndirectSites symSites;
+        if (symExplore) {
+            if (!symOpt.startAddress) symOpt.startAddress = addr;
+            const auto res = exploreIndirectTargets(*eng, *prog, symOpt);
+            std::fprintf(stderr, "// sym-explore: %s; %zu site(s)\n",
+                         res.reason.c_str(), res.sites.size());
+            for (const auto& site : res.sites)
+                symSites[site.addr] =
+                    SymIndirectSiteInfo{site.isCall, site.targets};
+        }
         std::printf("%s", decompile(*eng, reader, addr, end, nameOf,
                                      signatureOf, arch, false, &model,
-                                     &globals, nullptr, entryName).c_str());
+                                     &globals, nullptr, entryName, nullptr,
+                                     nullptr, nullptr, nullptr,
+                                     symSites.empty() ? nullptr : &symSites)
+                        .c_str());
         return 0;
     }
     if (cmd == "decompile") {

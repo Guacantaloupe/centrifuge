@@ -5745,6 +5745,75 @@ std::string collapseDegenerateBranches(const std::string& text) {
         }
         if (changed) continue;
 
+        // (6) loop exits: a goto (conditional or not) whose target label is
+        // the first line after the innermost enclosing structured loop's
+        // closing brace is exactly break.  break binds to the innermost
+        // loop regardless of intervening if-braces, so any nesting depth is
+        // sound as long as the target is that loop's own exit label.
+        {
+            static const std::regex loopOpenRe(
+                R"(^\s*(?:while \(.+\)|for \(.+\)) \{\s*$|^\s*do \{\s*$)");
+            struct ClosedLoop {
+                int bodyDepth = 0;
+                size_t closeLine = 0;
+            };
+            // Pass A: locate every structured loop's closing line.
+            std::vector<ClosedLoop> closed;
+            std::vector<int> lineDepth(lines.size(), 0);
+            {
+                struct OpenLoop {
+                    int bodyDepth = 0;
+                };
+                std::vector<OpenLoop> open;
+                int depth = 0;
+                for (size_t li = 0; li < lines.size(); ++li) {
+                    lineDepth[li] = depth;
+                    const std::string& ln = lines[li];
+                    int opens = 0, closes = 0;
+                    for (char ch : ln) {
+                        if (ch == '{') ++opens;
+                        if (ch == '}') ++closes;
+                    }
+                    if (std::regex_match(ln, loopOpenRe) && opens > 0)
+                        open.push_back({depth + 1});
+                    depth += opens - closes;
+                    while (!open.empty() &&
+                           depth < open.back().bodyDepth) {
+                        closed.push_back({open.back().bodyDepth, li});
+                        open.pop_back();
+                    }
+                }
+            }
+            // Pass B: rewrite gotos whose target sits right after their
+            // innermost enclosing loop's closing brace.
+            for (size_t li = 0; li < lines.size(); ++li) {
+                const std::string& ln = lines[li];
+                std::smatch m;
+                const bool isIf = std::regex_match(ln, m, ifGotoLineRe);
+                std::smatch bm;
+                const bool isBare =
+                    !isIf && std::regex_match(ln, bm, bareGotoLineRe2);
+                if (!isIf && !isBare) continue;
+                const std::string label = isIf ? m[3].str() : bm[2].str();
+                const std::string indent = isIf ? m[1].str() : bm[1].str();
+                const ClosedLoop* inner = nullptr;
+                for (const ClosedLoop& cl : closed)
+                    if (cl.bodyDepth <= lineDepth[li] &&
+                        cl.closeLine >= li &&
+                        (!inner || cl.bodyDepth > inner->bodyDepth))
+                        inner = &cl;
+                if (!inner) continue;
+                const size_t after = inner->closeLine + 1;
+                if (after >= lines.size()) continue;
+                if (lines[after] != "L" + label + ":") continue;
+                lines[li] = isIf ? indent + "if (" + m[2].str() +
+                                       ") break;"
+                                 : indent + "break;";
+                changed = true;
+            }
+            if (changed) continue;
+        }
+
         // (3) labels with no remaining references.
         refs = referenceCounts();
         for (size_t i = 0; i < lines.size();) {

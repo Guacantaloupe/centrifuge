@@ -5543,6 +5543,124 @@ std::string recoverCallResultMembers(std::string text,
     return out.str();
 }
 
+// Structured-control-flow cleanup (WS5), purely local rewrites on the
+// emitted text:
+//   1. a branch (conditional or not) whose target label is the immediately
+//      following line never skips anything - drop both lines;
+//   2. an empty label immediately followed by another label forwards all
+//      of its references and disappears;
+//   3. a label nobody jumps to disappears.
+// Irreducible control flow never matches these shapes, so its gotos are
+// preserved; multi-entry labels keep their references.
+std::string collapseDegenerateBranches(const std::string& text) {
+    std::vector<std::string> lines;
+    {
+        std::istringstream in(text);
+        std::string ln;
+        while (std::getline(in, ln)) lines.push_back(ln);
+    }
+    static const std::regex gotoRefRe(R"(goto L(0x[0-9a-fA-F]+);)");
+    static const std::regex labelRe(R"(^L(0x[0-9a-fA-F]+):$)");
+    static const std::regex gotoLineRe(
+        R"(^\s*(?:if \(.+\) )?goto L(0x[0-9a-fA-F]+);\s*$)");
+
+    auto referenceCounts = [&]() {
+        std::map<std::string, int> refs;
+        for (const std::string& ln : lines)
+            for (auto it = std::sregex_iterator(ln.begin(), ln.end(),
+                                                gotoRefRe);
+                 it != std::sregex_iterator(); ++it)
+                ++refs[(*it)[1].str()];
+        return refs;
+    };
+
+    bool changed = true;
+    int guard = 0;
+    while (changed && guard++ < 256) {
+        changed = false;
+
+        // (1) branch to the immediately following label.
+        std::map<std::string, int> refs = referenceCounts();
+        for (size_t i = 0; i + 1 < lines.size(); ++i) {
+            std::smatch m;
+            if (!std::regex_match(lines[i], m, gotoLineRe)) continue;
+            std::smatch lm;
+            if (!std::regex_match(lines[i + 1], lm, labelRe)) continue;
+            if (m[1].str() != lm[1].str()) continue;
+            if (refs[m[1].str()] != 1) continue;
+            lines.erase(lines.begin() + static_cast<long>(i),
+                        lines.begin() + static_cast<long>(i) + 2);
+            changed = true;
+            break;
+        }
+        if (changed) continue;
+
+        // (2) chained empty labels: Lx: immediately followed by Ly:.
+        std::map<std::string, std::string> forward;
+        for (size_t i = 0; i + 1 < lines.size(); ++i) {
+            std::smatch mx, my;
+            if (std::regex_match(lines[i], mx, labelRe) &&
+                std::regex_match(lines[i + 1], my, labelRe))
+                forward.emplace(mx[1].str(), my[1].str());
+        }
+        if (!forward.empty()) {
+            // Resolve chains cycle-safely so Lx->Ly, Ly->Lz becomes Lx->Lz.
+            for (auto& kv : forward) {
+                std::set<std::string> seen{kv.first};
+                std::string cur = kv.second;
+                while (forward.count(cur) && !seen.count(cur)) {
+                    seen.insert(cur);
+                    cur = forward[cur];
+                }
+                kv.second = cur;
+            }
+            for (std::string& ln : lines) {
+                for (const auto& kv : forward) {
+                    const std::string needle =
+                        "goto L" + kv.first + ";";
+                    const std::string replacement =
+                        "goto L" + kv.second + ";";
+                    size_t at = 0;
+                    while ((at = ln.find(needle, at)) !=
+                           std::string::npos) {
+                        ln.replace(at, needle.size(), replacement);
+                        at += replacement.size();
+                        changed = true;
+                    }
+                }
+            }
+            for (size_t i = 0; i < lines.size();) {
+                std::smatch m;
+                if (std::regex_match(lines[i], m, labelRe) &&
+                    forward.count(m[1].str())) {
+                    lines.erase(lines.begin() + static_cast<long>(i));
+                    changed = true;
+                } else {
+                    ++i;
+                }
+            }
+            if (changed) continue;
+        }
+
+        // (3) labels with no remaining references.
+        refs = referenceCounts();
+        for (size_t i = 0; i < lines.size();) {
+            std::smatch m;
+            if (std::regex_match(lines[i], m, labelRe) &&
+                refs[m[1].str()] == 0) {
+                lines.erase(lines.begin() + static_cast<long>(i));
+                changed = true;
+            } else {
+                ++i;
+            }
+        }
+    }
+
+    std::ostringstream out;
+    for (const std::string& ln : lines) out << ln << "\n";
+    return out.str();
+}
+
 } // namespace
 
 std::string decompile(
@@ -6246,6 +6364,79 @@ te.pushSlots = &pushSlots;
                 emitBlock(fall, depth);
                 return;
             }
+            // Structured if without else: one arm is a single block that
+            // flows unconditionally into the join, and the join is reached
+            // only from this branch and that arm.  The goto/label pair then
+            // becomes `if (!cond) { arm }` with the join emitted inline.
+            // Irreducible shapes (multiple extra predecessors, loop
+            // headers, already-emitted arms) keep the goto form.
+            if (be.hasCond && !be.cond.empty() && target != fall &&
+                !emitted.count(target) && !emitted.count(fall) &&
+                cfg.blockAt(target) && cfg.blockAt(fall)) {
+                auto tryArm = [&](const CfgBlock* arm,
+                                  const CfgBlock* join,
+                                  bool armOnCond) -> bool {
+                    // The arm must flow into the join: either an explicit
+                    // jump or a plain fallthrough (call/other tail).  An arm
+                    // that ends in another conditional or a return is not a
+                    // straight-line arm.
+                    if (arm->succs.size() != 1 || arm->succs[0] != join->start)
+                        return false;
+                    if (arm->isCondBranch() || arm->isRet() ||
+                        arm->isTailCall())
+                        return false;
+                    if (cfg.predecessors(arm->start).size() != 1 ||
+                        cfg.predecessors(join->start).size() != 2 ||
+                        cfg.loopByHeader(arm->start) ||
+                        cfg.loopByHeader(join->start))
+                        return false;
+                    BlockEmitter armBody(*arm);
+                    armBody.indent = depth + 2;
+                    armBody.nameOf = nameOf;
+                    armBody.guardSlotOf = guardSlotOf;
+                    armBody.signatureOf = signatureOf;
+                    armBody.callerSignature = callerSignature;
+                    armBody.fieldAccessors = fieldAccessors;
+                    armBody.callResultTypes = callResultTypes;
+                    armBody.virtualCallSites = virtualCallSites;
+                    armBody.architecture = architecture;
+                    armBody.useRecoveredRuntime = useRecoveredRuntime;
+                    armBody.stackModel = stackModel;
+                    armBody.globals = globals;
+                    armBody.spBias = frameBias;
+                    armBody.entryBlock = !useRecoveredRuntime &&
+                                         (arm->start == start);
+                    armBody.liveFlags = &liveFlags;
+                    armBody.liveOut = livenessEnabled
+                        ? findLiveSet(liveOut, arm->start) : nullptr;
+                    armBody.liveOutCall = livenessEnabled
+                        ? findLiveSet(liveOutCall, arm->start) : nullptr;
+                    armBody.callArgsLocal = livenessEnabled
+                        ? findLiveSet(callArgsLocal, arm->start) : nullptr;
+                    armBody.readPos = livenessEnabled
+                        ? findReadPos(blockReadPos, arm->start) : nullptr;
+                    armBody.writePos = livenessEnabled
+                        ? findWritePos(blockWritePos, arm->start) : nullptr;
+                    armBody.memRead = read;
+                    armBody.pushSlots = &pushSlots;
+                    armBody.emit();
+                    const std::string condition =
+                        armOnCond ? be.cond : "!(" + be.cond + ")";
+                    for (int i = 0; i <= depth; ++i) out << "    ";
+                    out << "if (" << condition << ") {\n"
+                        << armBody.out.str();
+                    for (int i = 0; i <= depth; ++i) out << "    ";
+                    out << "}\n";
+                    emitted.insert(arm->start);
+                    frameBias = std::min(frameBias, armBody.spBias);
+                    emitBlock(join->start, depth);
+                    return true;
+                };
+                const CfgBlock* tb2 = cfg.blockAt(target);
+                const CfgBlock* fb2 = cfg.blockAt(fall);
+                if (tryArm(tb2, fb2, true)) return;
+                if (tryArm(fb2, tb2, false)) return;
+            }
             if (!cfg.blockAt(target) && danglingLabels.insert(target).second) {
                 for (int i = 0; i <= depth; ++i) out << "    ";
                 out << labelName(target) << ":;\n";
@@ -6359,6 +6550,17 @@ te.pushSlots = &pushSlots;
             if (suppressBackedgeTo && term->target == *suppressBackedgeTo) {
                 // Structured loop backedge: the while/do-while condition
                 // already covers it - emit nothing.
+                return;
+            }
+            // Single-predecessor forward jump: the target has no other way
+            // in and is not a loop header, so it is emitted next in line -
+            // the goto/label pair is pure noise.  Multi-entry targets keep
+            // the goto (irreducible shapes included).
+            if (cfg.blockAt(term->target) && !emitted.count(term->target) &&
+                term->target != b->start &&
+                cfg.predecessors(term->target).size() == 1 &&
+                !cfg.loopByHeader(term->target)) {
+                emitBlock(term->target, depth);
                 return;
             }
             if (!cfg.blockAt(term->target) &&
@@ -7010,10 +7212,10 @@ std::string decompileTyped(
     // ret_val liveness and alias copies to attribute spilled call-result
     // dereferences, which the MidIR cannot see (the CALL output never
     // enters post-call register state).
-    return simplifyStackPointer(collapseAbiPrologue(
+    return collapseDegenerateBranches(simplifyStackPointer(collapseAbiPrologue(
         propagateLocalConstants(recoverCallResultMembers(
             foldAssignBeforeReturn(out.str()), functionName)),
-        architecture, effectiveSignature));
+        architecture, effectiveSignature)));
 }
 
 } // namespace centrifuge

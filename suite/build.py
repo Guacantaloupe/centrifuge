@@ -19,9 +19,12 @@ OUT = ROOT / "out"
 REPORT = ROOT / "report"
 CENTRIFUGE = REPO / "build" / "Release" / "centrifuge.exe"
 SPEC_X64 = REPO / "sleigh" / "x86-64.slaspec"
+SPEC_ARM64 = REPO / "sleigh" / "aarch64.slaspec"
+SPEC_RISCV64 = REPO / "sleigh" / "riscv64.slaspec"
 
 CLANG = r"C:\msys64\clang64\bin\clang.exe"
 CLANGXX = r"C:\msys64\clang64\bin\clang++.exe"
+CLANGARM64_SYSROOT = r"C:\msys64\clangarm64"
 GCC = r"C:\msys64\mingw64\bin\gcc.exe"
 GXX = r"C:\msys64\mingw64\bin\g++.exe"
 VSDEV = (r'call "C:\Program Files\Microsoft Visual Studio\2022\Community'
@@ -38,8 +41,13 @@ CONFIGS = {
     "gcc-o0-x64":    {"kind": "gcc", "opt": "-O0"},
     "gcc-o2-x64":    {"kind": "gcc", "opt": "-O2"},
     "gcc-o3-x64":    {"kind": "gcc", "opt": "-O3"},
-    "clang-o2-arm64": {"kind": "clang-arm64", "opt": "-O2", "available": False},
+    "clang-o2-arm64": {"kind": "clang-arm64", "opt": "-O2"},
     "gcc-o2-riscv64": {"kind": "gcc-riscv64", "opt": "-O2", "available": False},
+}
+
+SPEC_BY_CONFIG = {
+    "clang-o2-arm64": SPEC_ARM64,
+    "gcc-o2-riscv64": SPEC_RISCV64,
 }
 
 SIG_RE = re.compile(r"^(?P<decl>.+?) @ 0x(?P<addr>[0-9A-Fa-f]+)(?P<flags>.*)$")
@@ -151,6 +159,15 @@ def compile_one(src: Path, cfg_name: str, cfg: dict, exe: Path,
         compiler = CLANGXX if is_cpp else CLANG
         stdflag = "-std=c++17" if is_cpp else "-std=c11"
         res = run([compiler, opt, stdflag, "-w", "-o", str(exe), str(src)],
+                  env=tool_env(str(Path(CLANG).parent)))
+    elif kind == "clang-arm64":
+        # msys2 clang with the clangarm64 sysroot cross-compiles PE/ARM64
+        # (links with lld; needs the clang64 bin dir on PATH for the tools)
+        compiler = CLANGXX if is_cpp else CLANG
+        stdflag = "-std=c++17" if is_cpp else "-std=c11"
+        res = run([compiler, "--target=aarch64-w64-mingw32", opt, stdflag,
+                   "-w", "--sysroot=" + CLANGARM64_SYSROOT, "-fuse-ld=lld",
+                   "-o", str(exe), str(src)],
                   env=tool_env(str(Path(CLANG).parent)))
     elif kind == "gcc":
         compiler = GXX if is_cpp else GCC
@@ -312,7 +329,8 @@ def main():
         if err:
             return fam, cfg_name, {"status": "compile-error", "error": err}
         try:
-            info = analyze(exe, SPEC_X64, suite_names, addr2name,
+            spec = SPEC_BY_CONFIG.get(cfg_name, SPEC_X64)
+            info = analyze(exe, spec, suite_names, addr2name,
                            suite_classes)
             info["status"] = "ok"
         except subprocess.TimeoutExpired:

@@ -27,6 +27,8 @@ CLANGXX = r"C:\msys64\clang64\bin\clang++.exe"
 CLANGARM64_SYSROOT = r"C:\msys64\clangarm64"
 GCC = r"C:\msys64\mingw64\bin\gcc.exe"
 GXX = r"C:\msys64\mingw64\bin\g++.exe"
+RISCV_GCC = r"C:\msys64\mingw64\bin\riscv64-unknown-elf-gcc.exe"
+RISCV_GXX = r"C:\msys64\mingw64\bin\riscv64-unknown-elf-c++.exe"
 VSDEV = (r'call "C:\Program Files\Microsoft Visual Studio\2022\Community'
          r'\Common7\Tools\VsDevCmd.bat" -arch=x64 >nul && ')
 
@@ -42,7 +44,7 @@ CONFIGS = {
     "gcc-o2-x64":    {"kind": "gcc", "opt": "-O2"},
     "gcc-o3-x64":    {"kind": "gcc", "opt": "-O3"},
     "clang-o2-arm64": {"kind": "clang-arm64", "opt": "-O2"},
-    "gcc-o2-riscv64": {"kind": "gcc-riscv64", "opt": "-O2", "available": False},
+    "gcc-o2-riscv64": {"kind": "gcc-riscv64", "opt": "-O2"},
 }
 
 SPEC_BY_CONFIG = {
@@ -169,6 +171,15 @@ def compile_one(src: Path, cfg_name: str, cfg: dict, exe: Path,
                    "-w", "--sysroot=" + CLANGARM64_SYSROOT, "-fuse-ld=lld",
                    "-o", str(exe), str(src)],
                   env=tool_env(str(Path(CLANG).parent)))
+    elif kind == "gcc-riscv64":
+        # bare-metal riscv64 gcc (newlib); output is an ELF64 the Centrifuge
+        # ELF loader picks up.  cc1 needs mingw64/bin on PATH for
+        # libisl/libmpc/libmpfr.
+        compiler = RISCV_GXX if is_cpp else RISCV_GCC
+        stdflag = "-std=c++17" if is_cpp else "-std=c11"
+        res = run([compiler, opt, stdflag, "-w", "-march=rv64imac",
+                   "-mabi=lp64", "-o", str(exe), str(src)],
+                  env=tool_env(str(Path(RISCV_GCC).parent)))
     elif kind == "gcc":
         compiler = GXX if is_cpp else GCC
         stdflag = "-std=c++17" if is_cpp else "-std=c11"

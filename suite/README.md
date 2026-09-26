@@ -36,6 +36,14 @@ Latest full-matrix results (47 families × 11 configs, 517 cells): 515 ok,
 loops).  Mean signature score spans 0.21 (clang-o2-arm64, hardest ABI) to
 0.49 (gcc-o2-riscv64).
 
+`analyze-all` accepts an optional `[max-functions]` cap (entry/TLS-rooted,
+always keeps named symbols + exports before .pdata-unwind helpers).  The
+suite caps at 256: without it, MSVC /O0 binaries expose ~1700 CRT functions
+via .pdata discovery and the WS8 fixed-point pipeline exceeds the 900 s
+timeout.  Scoring only counts suite functions, so the cap does not bias
+scores; it exists because per-function analysis cost is superlinear in the
+function count.
+
 Known gaps, by design of the current p-code subset:
 - ARM64: NEON/FP instructions (v09_float column cells score lower because
   vector loads/stores and `fcmp` are not decoded) and `rbit`/`clz`

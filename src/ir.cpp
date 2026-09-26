@@ -2123,6 +2123,19 @@ bool ProgramAnalysis::buildPipeline(const Program& program,
             }
         }
     };
+    // Named functions (symbols + exports) are the reverse engineer's primary
+    // targets.  Queue them before the unwind flood so a bounded selection
+    // never crowds them out: .pdata discovery surfaces thousands of CRT
+    // helpers on MSVC images and they would otherwise eat the whole cap.
+    if (bounded) {
+        for (const Function& function : discovered) {
+            if (function.src != Function::SYMBOL &&
+                function.src != Function::EXPORT)
+                continue;
+            if (selected.size() >= maximumFunctions) break;
+            queueFunction(&function);
+        }
+    }
     // .pdata (unwind) entries are authoritative compiler-generated function
     // boundaries.  Allocator/CRT helpers (e.g. Blender's 0x140B0xxxx operator
     // new chain) usually appear here with no .data/.rdata pointer to them, so

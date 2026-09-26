@@ -233,7 +233,7 @@ void usage(const char* argv0) {
                 argv0);
     std::printf("  %s spec <spec.slaspec> <file> highir <addr> [end]\n",
                 argv0);
-    std::printf("  %s spec <spec.slaspec> <file> analyze-all [abi]\n", argv0);
+    std::printf("  %s spec <spec.slaspec> <file> analyze-all [abi] [max-functions]\n", argv0);
     std::printf("  %s spec <spec.slaspec> <file> cpp-types\n", argv0);
     std::printf("  %s spec <spec.slaspec> <file> knowledge-graph [output.json] [abi]\n",
                 argv0);
@@ -490,8 +490,10 @@ int cmdSpec(int argc, char** argv) {
     }
     if (cmd == "analyze-all") {
         const std::string abi = argc >= 6 ? argv[5] : std::string();
+        const size_t maxFunctions =
+            argc >= 7 ? std::strtoull(argv[6], nullptr, 0) : 0;
         ProgramAnalysis analysis;
-        if (!analysis.build(*prog, *eng, abi)) {
+        if (!analysis.build(*prog, *eng, abi, maxFunctions)) {
             std::fprintf(stderr, "centrifuge: program analysis failed\n");
             return 1;
         }

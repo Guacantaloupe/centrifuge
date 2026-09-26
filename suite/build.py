@@ -215,8 +215,13 @@ def parse_map(map_file: Path):
 
 def analyze(exe: Path, spec: Path, suite_names=None, addr2name=None,
             suite_classes=None) -> dict:
-    res = run([str(CENTRIFUGE), "spec", str(spec), str(exe), "analyze-all"],
-              timeout=900)
+    # Cap the analyzed function set: .pdata-based discovery surfaces ~1700
+    # CRT/unwind helpers on MSVC /O0 binaries and analyze-all becomes
+    # superlinear in the function count.  The bounded selection is rooted
+    # at the real entry point (plus TLS callbacks), so suite exports stay
+    # inside the cap; scoring only counts suite functions anyway.
+    res = run([str(CENTRIFUGE), "spec", str(spec), str(exe), "analyze-all",
+               "", "256"], timeout=900)
     text = res.stdout
     funcs = []
     lines = text.splitlines()

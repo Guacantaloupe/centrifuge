@@ -15,6 +15,8 @@ token t16 (2) {
   quad    = (1:0);
   f3c     = (15:13);
   f2c     = (12:11);
+  b12c    = (12:12);   // quadrant2 funct4 high bit (bit11 belongs to rd!)
+  f2hi    = (11:10);   // quadrant1 shamt/imm ops selector (bit12 is imm[5])
   funct6c = (15:10);
   subop   = (6:5);
   rdc     = (11:7);
@@ -53,24 +55,25 @@ attach variables [ rs18c ] [ s0 s1 a0 a1 a2 a3 a4 a5 ];
 :c.li rd, imm is quad=1 & f3c=2 & rdc:rd & i_addi:imm { rd = sext(imm, 6); };
 :c.addi16sp is quad=1 & f3c=3 & rdc=2 & i_addi16:imm { sp = sp + sext(imm, 10); };
 :c.lui rd, imm is quad=1 & f3c=3 & rdc:rd & i_lui:imm { rd = sext(imm, 6) << 12; };
-:c.srli rd, shamt is quad=1 & f3c=4 & f2c=0 & rs18c:rd & shamt6:shamt { rd = rd >> zext(shamt, 6); };
-:c.srai rd, shamt is quad=1 & f3c=4 & f2c=1 & rs18c:rd & shamt6:shamt { rd = rd s>> zext(shamt, 6); };
-:c.andi rd, imm is quad=1 & f3c=4 & f2c=2 & rs18c:rd & i_addi:imm { rd = rd & sext(imm, 6); };
-:c.sub rd, rs2 is quad=1 & f3c=4 & f2c=3 & funct6c=0x23 & subop=0 & rs18c:rd & rd8c:rs2 { rd = rd - rs2; };
-:c.xor rd, rs2 is quad=1 & f3c=4 & f2c=3 & funct6c=0x23 & subop=1 & rs18c:rd & rd8c:rs2 { rd = rd ^ rs2; };
-:c.or rd, rs2 is quad=1 & f3c=4 & f2c=3 & funct6c=0x23 & subop=2 & rs18c:rd & rd8c:rs2 { rd = rd | rs2; };
-:c.and rd, rs2 is quad=1 & f3c=4 & f2c=3 & funct6c=0x23 & subop=3 & rs18c:rd & rd8c:rs2 { rd = rd & rs2; };
-:c.addw rd, rs2 is quad=1 & f3c=4 & f2c=3 & funct6c=0x27 & rs18c:rd & rd8c:rs2 { rd = sext(rd + rs2, 32); };
+:c.srli rd, shamt is quad=1 & f3c=4 & f2hi=0 & rs18c:rd & shamt6:shamt { rd = rd >> zext(shamt, 6); };
+:c.srai rd, shamt is quad=1 & f3c=4 & f2hi=1 & rs18c:rd & shamt6:shamt { rd = rd s>> zext(shamt, 6); };
+:c.andi rd, imm is quad=1 & f3c=4 & f2hi=2 & rs18c:rd & i_addi:imm { rd = rd & sext(imm, 6); };
+:c.sub rd, rs2 is quad=1 & f3c=4 & f2hi=3 & funct6c=0x23 & subop=0 & rs18c:rd & rd8c:rs2 { rd = rd - rs2; };
+:c.xor rd, rs2 is quad=1 & f3c=4 & f2hi=3 & funct6c=0x23 & subop=1 & rs18c:rd & rd8c:rs2 { rd = rd ^ rs2; };
+:c.or rd, rs2 is quad=1 & f3c=4 & f2hi=3 & funct6c=0x23 & subop=2 & rs18c:rd & rd8c:rs2 { rd = rd | rs2; };
+:c.and rd, rs2 is quad=1 & f3c=4 & f2hi=3 & funct6c=0x23 & subop=3 & rs18c:rd & rd8c:rs2 { rd = rd & rs2; };
+:c.subw rd, rs2 is quad=1 & f3c=4 & f2hi=3 & funct6c=0x27 & subop=0 & rs18c:rd & rd8c:rs2 { rd = sext(rd - rs2, 32); };
+:c.addw rd, rs2 is quad=1 & f3c=4 & f2hi=3 & funct6c=0x27 & subop=1 & rs18c:rd & rd8c:rs2 { rd = sext(rd + rs2, 32); };
 :c.j target is quad=1 & f3c=5 & i_cj:target { goto inst_start + sext(target, 12); };
 :c.beqz rs1, target is quad=1 & f3c=6 & rs18c:rs1 & i_cb:target { if (rs1 == 0) goto inst_start + sext(target, 9); };
 :c.bnez rs1, target is quad=1 & f3c=7 & rs18c:rs1 & i_cb:target { if (rs1 != 0) goto inst_start + sext(target, 9); };
 
-:ret is quad=2 & f3c=4 & f2c=0 & rdc=1 & rs2c=0 { return; };
-:c.jr rs1 is quad=2 & f3c=4 & f2c=0 & rs2c=0 & rdc:rs1 { goto rs1; };
-:c.mv rd, rs2 is quad=2 & f3c=4 & f2c=0 & rdc:rd & rs2c:rs2 { rd = rs2; };
-:c.ebreak is quad=2 & f3c=4 & f2c=1 & rdc=0 & rs2c=0 { };
-:c.jalr rd is quad=2 & f3c=4 & f2c=1 & rs2c=0 & rdc:rd { call rd; };
-:c.add rd, rs2 is quad=2 & f3c=4 & f2c=1 & rdc:rd & rs2c:rs2 { rd = rd + rs2; };
+:ret is quad=2 & f3c=4 & b12c=0 & rdc=1 & rs2c=0 { return; };
+:c.jr rs1 is quad=2 & f3c=4 & b12c=0 & rs2c=0 & rdc:rs1 { goto rs1; };
+:c.mv rd, rs2 is quad=2 & f3c=4 & b12c=0 & rdc:rd & rs2c:rs2 { rd = rs2; };
+:c.ebreak is quad=2 & f3c=4 & b12c=1 & rdc=0 & rs2c=0 { };
+:c.jalr rd is quad=2 & f3c=4 & b12c=1 & rs2c=0 & rdc:rd { call rd; };
+:c.add rd, rs2 is quad=2 & f3c=4 & b12c=1 & rdc:rd & rs2c:rs2 { rd = rd + rs2; };
 :c.slli rd, shamt is quad=2 & f3c=0 & rdc:rd & shamt6:shamt { rd = rd << zext(shamt, 6); };
 :c.lwsp rd, imm is quad=2 & f3c=2 & rdc:rd & i_lwsp:imm { rd = sext(load(sp + zext(imm, 8), 4), 32); };
 :c.ldsp rd, imm is quad=2 & f3c=3 & rdc:rd & i_ldsp:imm { rd = load(sp + zext(imm, 9), 8); };
@@ -88,6 +91,7 @@ token t32 (4) {
   imm12  = (31:20);
   imm20  = (31:12);
   shamt  = (25:20);
+  funct6 = (31:26);
   simm12 = (31:25)@5, (11:7)@0;
   bimm12 = (31:31)@12, (7:7)@11, (30:25)@5, (11:8)@1;
   jimm20 = (31:31)@20, (19:12)@12, (20:20)@11, (30:21)@1;
@@ -100,6 +104,13 @@ attach variables [ rs2 ] [ zero ra sp gp tp t0 t1 t2 s0 s1 a0 a1 a2 a3 a4 a5 a6 
 // ---- system / misc ----
 :ecall is opcode=0x73 & funct3=0 & imm12=0 & rs1=0 & rd=0 { };
 :ebreak is opcode=0x73 & funct3=0 & imm12=1 & rs1=0 & rd=0 { };
+// CSR ops: semantics not modeled (rd = 0 keeps dataflow simple); decode + control flow only
+:csrrw rd, csr, rs1 is opcode=0x73 & funct3=1 & rd & imm12:csr & rs1 { rd = 0; };
+:csrrs rd, csr, rs1 is opcode=0x73 & funct3=2 & rd & imm12:csr & rs1 { rd = 0; };
+:csrrc rd, csr, rs1 is opcode=0x73 & funct3=3 & rd & imm12:csr & rs1 { rd = 0; };
+:csrrwi rd, csr, imm is opcode=0x73 & funct3=5 & rd & imm12:csr & rs2:imm { rd = 0; };
+:csrrsi rd, csr, imm is opcode=0x73 & funct3=6 & rd & imm12:csr & rs2:imm { rd = 0; };
+:csrrci rd, csr, imm is opcode=0x73 & funct3=7 & rd & imm12:csr & rs2:imm { rd = 0; };
 :fence is opcode=0x0F & funct3=0 { };
 :fence.i is opcode=0x0F & funct3=1 { };
 
@@ -144,9 +155,9 @@ attach variables [ rs2 ] [ zero ra sp gp tp t0 t1 t2 s0 s1 a0 a1 a2 a3 a4 a5 a6 
 :xori rd, rs1, imm is opcode=0x13 & funct3=4 & rd & rs1 & imm12:imm { rd = rs1 ^ sext(imm, 12); };
 :ori rd, rs1, imm is opcode=0x13 & funct3=6 & rd & rs1 & imm12:imm { rd = rs1 | sext(imm, 12); };
 :andi rd, rs1, imm is opcode=0x13 & funct3=7 & rd & rs1 & imm12:imm { rd = rs1 & sext(imm, 12); };
-:slli rd, rs1, shamt is opcode=0x13 & funct3=1 & funct7=0 & rd & rs1 & shamt { rd = rs1 << zext(shamt, 6); };
-:srli rd, rs1, shamt is opcode=0x13 & funct3=5 & funct7=0 & rd & rs1 & shamt { rd = rs1 >> zext(shamt, 6); };
-:srai rd, rs1, shamt is opcode=0x13 & funct3=5 & funct7=0x20 & rd & rs1 & shamt { rd = rs1 s>> zext(shamt, 6); };
+:slli rd, rs1, shamt is opcode=0x13 & funct3=1 & funct6=0 & rd & rs1 & shamt { rd = rs1 << zext(shamt, 6); };
+:srli rd, rs1, shamt is opcode=0x13 & funct3=5 & funct6=0 & rd & rs1 & shamt { rd = rs1 >> zext(shamt, 6); };
+:srai rd, rs1, shamt is opcode=0x13 & funct3=5 & funct6=0x10 & rd & rs1 & shamt { rd = rs1 s>> zext(shamt, 6); };
 
 // ---- OP-IMM-32 ----
 :addiw rd, rs1, imm is opcode=0x1B & funct3=0 & rd & rs1 & imm12:imm { rd = sext(rs1 + sext(imm, 12), 32); };

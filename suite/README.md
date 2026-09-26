@@ -33,8 +33,10 @@ with `tools/verify_riscv64_spec.py` against riscv64-unknown-elf-objdump:
 
 Latest full-matrix results (47 families × 11 configs, 517 cells): 515 ok,
 2 known analyze-timeouts on `24_image` (gcc -O2/-O3 x64 — heavy vectorized
-loops).  Mean signature score spans 0.21 (clang-o2-arm64, hardest ABI) to
-0.49 (gcc-o2-riscv64).
+loops).  Mean signature score spans 0.24 (clang-o2-arm64, hardest ABI) to
+0.61 (gcc-o3-x64); overall matrix mean is 0.46 params / 0.67 returns
+(vs 0.21–0.49 spans before the whole-program signature fixed-point
+rounds — see commits 713f484, 96238b3, 78fe567).
 
 `analyze-all` accepts an optional `[max-functions]` cap (entry/TLS-rooted,
 always keeps named symbols + exports before .pdata-unwind helpers).  The

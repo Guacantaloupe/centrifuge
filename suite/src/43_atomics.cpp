@@ -5,6 +5,12 @@
 #include <memory>
 #include <mutex>
 
+// bare-metal libstdc++ (riscv64-unknown-elf etc.) ships <mutex> but no
+// gthread backend, so std::mutex does not exist there
+#if defined(__GLIBCXX__) && !defined(_GLIBCXX_HAS_GTHREADS)
+#define CF_NO_THREADS 1
+#endif
+
 #define TAG(id) static volatile int tag_##id = __LINE__
 #define MARK(id) do { (void)tag_##id; } while (0)
 
@@ -81,6 +87,15 @@ int at_shared_ptr_use(int n) {
 TAG(at_mutex_guard_style);
 int at_mutex_guard_style(int n) {
     MARK(at_mutex_guard_style);
+#ifdef CF_NO_THREADS
+    static int shared = 0;
+    int local = 0;
+    for (int i = 0; i < n; i++) {
+        shared += i;
+        local = shared;
+    }
+    return local;
+#else
     static std::mutex m;
     static int shared = 0;
     int local = 0;
@@ -91,6 +106,7 @@ int at_mutex_guard_style(int n) {
         m.unlock();
     }
     return local;
+#endif
 }
 TAG(at_atomic_ptr);
 int at_atomic_ptr(std::atomic<int *> *p, int n) {

@@ -178,7 +178,7 @@ def compile_one(src: Path, cfg_name: str, cfg: dict, exe: Path,
         compiler = RISCV_GXX if is_cpp else RISCV_GCC
         stdflag = "-std=c++17" if is_cpp else "-std=c11"
         res = run([compiler, opt, stdflag, "-w", "-march=rv64imac",
-                   "-mabi=lp64", "-o", str(exe), str(src)],
+                   "-mabi=lp64", "-o", str(exe), str(src), "-lm"],
                   env=tool_env(str(Path(RISCV_GCC).parent)))
     elif kind == "gcc":
         compiler = GXX if is_cpp else GCC

@@ -1297,12 +1297,182 @@ FunctionSignature FunctionIR::inferSignature() const {
                 for (SsaId input : phi.inputs) grew |= used.insert(input).second;
             }
     }
+    // Consumers per value, for spill-only view detection: a register view
+    // whose only uses are STORE-value (register-save spills) carries no
+    // width information about the declared parameter - the spill preserves
+    // bits, and every semantic use goes through the reloaded value instead.
+    std::map<SsaId, std::vector<std::pair<const SsaOp*, size_t>>> consumers;
+    for (const auto& block : blocks_) {
+        for (const auto& phi : block.phis)
+            for (SsaId input : phi.inputs)
+                consumers[input].push_back({nullptr, 0});
+        for (const auto& op : block.ops)
+            for (size_t i = 0; i < op.inputs.size(); ++i)
+                consumers[op.inputs[i]].push_back({&op, i});
+    }
+    auto onlySpillStored = [&](SsaId id) {
+        const auto it = consumers.find(id);
+        if (it == consumers.end() || it->second.empty()) return false;
+        for (const auto& entry : it->second) {
+            const SsaOp* op = entry.first;
+            if (!op) return false;  // a phi merge is a semantic use
+            if (op->op == POp::STORE && entry.second >= 2) continue;
+            return false;
+        }
+        return true;
+    };
+    // The 64-bit view of an `int`-width argument is typically consumed only
+    // by phis whose web eventually terminates in 32-bit operations (or
+    // spills) - the 64-bit width is a register artifact, not a property of
+    // the declared parameter.  Accept the view as droppable when every
+    // consumer is a spill store or a phi whose inputs are all narrow
+    // (<=4 bytes), self-references, or recursively passive themselves.
+    std::map<SsaId, int> webMemo;
+    std::function<bool(SsaId, int)> passiveWeb = [&](SsaId id, int depth) {
+        if (depth > 24) return false;
+        const auto memo = webMemo.find(id);
+        if (memo != webMemo.end()) return memo->second != 0;
+        const auto it = consumers.find(id);
+        if (it == consumers.end() || it->second.empty()) {
+            webMemo[id] = 0;
+            return false;
+        }
+        for (const auto& entry : it->second) {
+            const SsaOp* op = entry.first;
+            if (!op) {
+                // Phi consumer: every input must be narrow, the value
+                // itself (loop back-edge), or recursively passive.
+                bool foundPhi = false;
+                for (const auto& block : blocks_) {
+                    for (const auto& candidate : block.phis) {
+                        if (std::find(candidate.inputs.begin(),
+                                      candidate.inputs.end(), id) ==
+                            candidate.inputs.end())
+                            continue;
+                        foundPhi = true;
+                        for (SsaId input : candidate.inputs) {
+                            if (input == id) continue;
+                            const SsaValue* iv = value(input);
+                            if (iv && iv->size > 0 && iv->size <= 4)
+                                continue;
+                            if (!passiveWeb(input, depth + 1)) {
+                                if (std::getenv("CFPARAMDEBUG") && depth == 0) {
+                                    std::string ic;
+                                    const auto ci = consumers.find(input);
+                                    if (ci != consumers.end())
+                                        for (const auto& e : ci->second) {
+                                            if (!ic.empty()) ic += ",";
+                                            ic += e.first
+                                                ? std::to_string(
+                                                      static_cast<int>(
+                                                          e.first->op))
+                                                : std::string("phi");
+                                        }
+                                    std::fprintf(stderr,
+                                        "[cfweb] id=%llu badInput=%llu "
+                                        "size=%d iconsumers=%s\n",
+                                        (unsigned long long)id,
+                                        (unsigned long long)input,
+                                        iv ? iv->size : -1,
+                                        ic.c_str());
+                                }
+                                webMemo[id] = 0;
+                                return false;
+                            }
+                        }
+                    }
+                }
+                if (!foundPhi) {
+                    webMemo[id] = 0;
+                    return false;
+                }
+                continue;
+            }
+            if (op->op == POp::STORE && entry.second >= 2) continue;
+            // Width-extending operators are evidence FOR a narrow source,
+            // not against it: the 64-bit address math in arr + sext(lo)*4
+            // consumes the extension output, never the parameter itself.
+            if (op->op == POp::INT_SEXT || op->op == POp::INT_ZEXT)
+                continue;
+            // Pure arithmetic and flag-expansion consumers (every machine
+            // cmp expands into SUB/LESS/XOR/AND/CARRY/SBORROW at the width
+            // of the *extended* value) do not by themselves prove the
+            // declared parameter is 64-bit: int params legitimately take
+            // part in 64-bit address math after sext.  Width-changing
+            // evidence (stores of the value itself count only as spills
+            // above; TRUNC would be real evidence and is NOT listed here).
+            switch (op->op) {
+            case POp::INT_ADD: case POp::INT_SUB: case POp::INT_MULT:
+            case POp::INT_LEFT: case POp::INT_RIGHT: case POp::INT_AND:
+            case POp::INT_OR: case POp::INT_XOR: case POp::INT_NEGATE:
+            case POp::INT_NOT: case POp::INT_EQUAL: case POp::INT_NOTEQUAL:
+            case POp::INT_LESS: case POp::INT_SLESS: case POp::INT_LESSEQUAL:
+            case POp::INT_SLESSEQUAL: case POp::INT_CARRY:
+            case POp::INT_SCARRY: case POp::INT_SBORROW:
+            case POp::INT_PARITY: case POp::INT_MULT_OVERFLOW:
+            case POp::INT_SMULT_OVERFLOW:
+                continue;
+            default:
+                break;
+            }
+            webMemo[id] = 0;
+            return false;
+        }
+        webMemo[id] = 1;
+        return true;
+    };
+    // True when some other used view of the same register has semantic
+    // uses - only then may a spill-only view be dropped from the merge
+    // (otherwise an /O0 body whose only access is the home spill would
+    // lose the parameter entirely).
+    auto hasSemanticSibling = [&](uint64_t offset, SsaId self) {
+        for (const auto& param : parameters_) {
+            if (param.first.first != offset || param.second == self ||
+                !used.count(param.second))
+                continue;
+            if (!onlySpillStored(param.second)) return true;
+        }
+        return false;
+    };
+    if (std::getenv("CFPARAMDEBUG"))
+        for (const auto& param : parameters_) {
+            if (!used.count(param.second)) continue;
+            std::string useList;
+            const auto cit = consumers.find(param.second);
+            if (cit != consumers.end())
+                for (const auto& entry : cit->second) {
+                    if (!useList.empty()) useList += ",";
+                    if (!entry.first) {
+                        useList += "phi";
+                        continue;
+                    }
+                    useList += std::to_string(static_cast<int>(entry.first->op));
+                    if (entry.first->op == POp::STORE)
+                        useList += "[" + std::to_string(entry.second) + "]";
+                }
+            std::fprintf(stderr, "[cfparam] off=%llu size=%d vtype=%s spillOnly=%d passive=%d uses=%s\n",
+                         (unsigned long long)param.first.first,
+                         values_.at(param.second).size,
+                         values_.at(param.second).type.name().c_str(),
+                         (int)onlySpillStored(param.second),
+                         (int)passiveWeb(param.second, 0),
+                         useList.c_str());
+        }
     for (const auto& arg : abiArgs) {
         DataType mergedType;
         SsaId representative = 0;
         int widestBytes = 0;
         for (const auto& param : parameters_) {
             if (param.first.first != arg.first || !used.count(param.second)) continue;
+            // A 64-bit view that exists only inside a passive phi/spill web
+            // while a narrower view of the same argument does the real work
+            // is a register-width artifact, not evidence the parameter is
+            // 64-bit (classic `int` argument: only ecx is ever
+            // compared/extended; the 64-bit live-in feeds spill slots and
+            // range phis whose other inputs are all 32-bit).
+            if (passiveWeb(param.second, 0) &&
+                hasSemanticSibling(arg.first, param.second))
+                continue;
             const SsaValue& v = values_.at(param.second);
             DataType viewType = v.type.kind == TypeKind::UNKNOWN
                 ? DataType{TypeKind::UNSIGNED_INT, v.size * 8, 1}

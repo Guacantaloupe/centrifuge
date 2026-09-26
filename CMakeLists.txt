@@ -61,6 +61,7 @@ add_library(centrifuge_core STATIC
   src/cpp_recovery.cpp
   src/stack_recovery.cpp
   src/symbolic.cpp
+  src/semantics.cpp
   src/calling_convention.cpp
   src/import_prototype.cpp
   src/global_recovery.cpp
@@ -128,6 +129,9 @@ target_link_libraries(test_x86_flags PRIVATE centrifuge_core)
 add_executable(test_ir tests/test_ir.cpp)
 target_link_libraries(test_ir PRIVATE centrifuge_core)
 
+add_executable(test_semantics tests/test_semantics.cpp)
+target_link_libraries(test_semantics PRIVATE centrifuge_core)
+
 add_executable(test_loaders tests/test_loaders.cpp)
 target_link_libraries(test_loaders PRIVATE centrifuge_core)
 
@@ -175,6 +179,9 @@ if(BUILD_TESTING)
 
   add_test(NAME function_ir COMMAND test_ir)
   set_tests_properties(function_ir PROPERTIES LABELS "unit;analysis")
+
+  add_test(NAME semantics COMMAND test_semantics)
+  set_tests_properties(semantics PROPERTIES LABELS "unit;analysis")
 
   add_test(
     NAME stack_recovery

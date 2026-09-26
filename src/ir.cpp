@@ -2679,10 +2679,15 @@ bool ProgramAnalysis::buildPipeline(const Program& program,
                 if (previouslyDiscovered && !bounded)
                     selected.push_back(target);
                 else {
+                    // Clamp the insert position: once the pop_back below
+                    // keeps the vector at maximumFunctions, an unclamped
+                    // running index walks past end() and emplace reads
+                    // out of bounds (heap-buffer-overflow).
+                    const size_t pos = std::min(insertion, selected.size());
                     selected.insert(
-                        selected.begin() +
-                            static_cast<std::ptrdiff_t>(insertion++),
+                        selected.begin() + static_cast<std::ptrdiff_t>(pos),
                         target);
+                    ++insertion;
                     if (bounded && selected.size() > maximumFunctions)
                         selected.pop_back();
                 }
@@ -3362,10 +3367,15 @@ bool ProgramAnalysis::buildPipeline(const Program& program,
                 if (previouslyDiscovered && !bounded)
                     selected.push_back(target);
                 else {
+                    // Clamp the insert position: once the pop_back below
+                    // keeps the vector at maximumFunctions, an unclamped
+                    // running index walks past end() and emplace reads
+                    // out of bounds (heap-buffer-overflow).
+                    const size_t pos = std::min(insertion, selected.size());
                     selected.insert(
-                        selected.begin() +
-                            static_cast<std::ptrdiff_t>(insertion++),
+                        selected.begin() + static_cast<std::ptrdiff_t>(pos),
                         target);
+                    ++insertion;
                     if (bounded && selected.size() > maximumFunctions)
                         selected.pop_back();
                 }

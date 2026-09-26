@@ -645,11 +645,15 @@ std::optional<Program> loadPeImpl(const std::vector<uint8_t>& d,
         const uint32_t excSize = rd32(d, dataDirOff + 3 * 8 + 4);
         const auto excOff = ps.rvaToOffset(excRva);
         if (excRva && excSize && excOff) {
-            if (excSize % 12 != 0 || !rangeInFile(*excOff, excSize, d.size())) {
+            // Entry size is 12 bytes for both x64 and ARM64, but ARM64
+            // linkers may pad .pdata to a section alignment — accept a
+            // trailing partial record instead of rejecting the file.
+            if (!rangeInFile(*excOff, excSize, d.size())) {
                 err = "invalid PE exception directory";
                 return std::nullopt;
             }
             const uint32_t count = excSize / 12;
+            const bool archX64 = p.arch == "x86-64" || p.arch == "x86";
             for (uint32_t i = 0; i < count; ++i) {
                 const size_t entry = *excOff + static_cast<size_t>(i) * 12;
                 const uint32_t beginRva = rd32(d, entry);
@@ -665,7 +669,11 @@ std::optional<Program> loadPeImpl(const std::vector<uint8_t>& d,
                     return std::nullopt;
                 }
                 const auto unwindOff = ps.rvaToOffset(unwindRva);
-                if (unwindOff && rangeInFile(*unwindOff, 4, d.size())) {
+                // UNWIND_INFO flag/handler layout is x86-64 specific; ARM64
+                // packs unwind data into a single 32-bit word (epilog scope
+                // codes).  Only x64 gets handler/chained-record recovery.
+                if (archX64 && unwindOff &&
+                    rangeInFile(*unwindOff, 4, d.size())) {
                     const uint8_t flags = d[*unwindOff] >> 3;
                     const uint8_t codeCount = d[*unwindOff + 2];
                     const size_t slots = (static_cast<size_t>(codeCount) + 1) & ~size_t{1};

@@ -1364,6 +1364,7 @@ bool SleighEngine::disassemble(
         xc.regReg = xc.rmReg = 0;
         bool ok = true;
         int usedTok = 0;
+        const char* dbgFail = nullptr;
         opValues.clear();
         opFields.clear();
         magicExports.clear();
@@ -1376,6 +1377,7 @@ bool SleighEngine::disassemble(
         }
         for (const auto& t : c.terms) {
             const std::string& fn = t.field;
+            dbgFail = fn.c_str();
             if (isMagic(fn)) {
                 if (fn == "vex") {
                     if (!xc.vex) { ok = false; break; }
@@ -1528,7 +1530,16 @@ bool SleighEngine::disassemble(
             usedTok = std::max(usedTok, tokens_[f->token].size);
             const uint64_t v = fieldValue(*f);
             if (t.kind == SpecCtor::Term::FIELD_EQ) {
-                if (v != t.value) { ok = false; break; }
+                if (v != t.value) {
+                    if (std::getenv("SLEIGH_DBG"))
+                        std::fprintf(stderr, "    %s: %s exp=%llu got=%llu (msb=%d lsb=%d)\n",
+                                     c.name.c_str(), fn.c_str(),
+                                     (unsigned long long)t.value,
+                                     (unsigned long long)v,
+                                     f->pieces.empty() ? -1 : f->pieces[0].msb,
+                                     f->pieces.empty() ? -1 : f->pieces[0].lsb);
+                    ok = false; break;
+                }
                 // x86: advance the imm cursor past matched opcode bytes
                 if (archX86_) {
                     if (fn == "opcode") xc.cursor = std::max(xc.cursor, 1);
@@ -1545,6 +1556,10 @@ bool SleighEngine::disassemble(
             insnSize = archX86_ ? (xc.prefixLen + xc.cursor)
                                 : std::max(usedTok, 1);
             break;
+        }
+        if (std::getenv("SLEIGH_DBG")) {
+            std::fprintf(stderr, "  MISS %s @ %s\n", c.name.c_str(),
+                         dbgFail ? dbgFail : "?");
         }
     }
     if (!matched) return false;

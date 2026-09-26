@@ -357,6 +357,12 @@ struct AnalyzedCallSite {
     bool returnArithmetic = false;   // result feeds integer arithmetic
     bool returnBoolean = false;      // result feeds a conditional
     int returnWidthBytes = 0;
+    // Every consumer of the call result is width-narrowing (SUBPIECE /
+    // extension / comparison / conditional) - no 64-bit arithmetic, store
+    // of the raw value, or dereference.  Unanimous narrow consumption
+    // across all call sites is evidence the callee returns a <=32-bit
+    // quantity even when the callee body alone cannot prove it.
+    bool returnOnlyNarrowUses = false;
     bool indirect = false;
 };
 

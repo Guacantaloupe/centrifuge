@@ -2927,6 +2927,26 @@ bool ProgramAnalysis::buildPipeline(const Program& program,
                     for (SsaId input : useOp.inputs)
                         if (input) uses[input].push_back(&useOp);
                 }
+            // Indexed consumers (with input positions, phis included) and
+            // loads-by-address for the return-consumption spill matching.
+            std::map<SsaId, std::vector<std::pair<const SsaOp*, size_t>>>
+                consumersIdx;
+            std::map<SsaId, std::vector<const SsaOp*>> loadsByAddr;
+            for (const SsaBlock& useBlock : ir.blocks()) {
+                for (const SsaOp& phi : useBlock.phis)
+                    for (SsaId input : phi.inputs)
+                        if (input)
+                            consumersIdx[input].push_back({&phi, 0});
+                for (const SsaOp& useOp : useBlock.ops) {
+                    if (useOp.removed) continue;
+                    for (size_t i = 0; i < useOp.inputs.size(); ++i)
+                        if (useOp.inputs[i])
+                            consumersIdx[useOp.inputs[i]].push_back(
+                                {&useOp, i});
+                    if (useOp.op == POp::LOAD && useOp.inputs.size() >= 2)
+                        loadsByAddr[useOp.inputs[1]].push_back(&useOp);
+                }
+            }
             for (const SsaBlock& block : ir.blocks())
                 for (const SsaOp& operation : block.ops) {
                     if (operation.op != POp::CALL &&
@@ -3062,30 +3082,145 @@ bool ProgramAnalysis::buildPipeline(const Program& program,
                             constantValue(operation.inputs[index]));
                     }
                     // Return-value consumption: find uses of the call output
-                    // through the prebuilt use index.
+                    // through the prebuilt use index.  COPY hops and phi
+                    // merges are followed transparently - if every use of
+                    // the copied/merged value is narrow, the call result is
+                    // only narrowly consumed.  A STORE of the result as the
+                    // stored value is a register spill: it is transparent
+                    // when every reload from the same slot address is
+                    // itself narrowly consumed (a dead spill is transparent
+                    // outright).  Only address-position LOAD/STORE uses
+                    // (result used as a pointer) count as dereference.
                     if (operation.output) {
                         const auto foundUses = uses.find(operation.output);
-                        if (foundUses != uses.end())
-                            for (const SsaOp* useOp : foundUses->second) {
-                                callSite.returnsValue = true;
-                                if (useOp->op == POp::LOAD ||
-                                    useOp->op == POp::STORE) {
-                                    callSite.returnDereferenced = true;
-                                } else if (useOp->op == POp::INT_ADD ||
-                                           useOp->op == POp::INT_SUB ||
-                                           useOp->op == POp::INT_MULT ||
-                                           useOp->op == POp::INT_DIV ||
-                                           useOp->op == POp::INT_AND ||
-                                           useOp->op == POp::INT_OR ||
-                                           useOp->op == POp::INT_XOR ||
-                                           useOp->op == POp::INT_LEFT ||
-                                           useOp->op == POp::INT_RIGHT) {
-                                    callSite.returnArithmetic = true;
-                                } else if (useOp->op == POp::CBRANCH ||
-                                           useOp->op == POp::BRANCH) {
-                                    callSite.returnBoolean = true;
+                        if (foundUses != uses.end() &&
+                            !foundUses->second.empty()) {
+                            callSite.returnsValue = true;
+                            std::set<SsaId> visited;
+                            const bool rnDbg =
+                                std::getenv("RETNARROWDEBUG") != nullptr;
+                            auto narrowCheck =
+                                [&](auto&& self, SsaId valueId) -> bool {
+                                if (!visited.insert(valueId).second)
+                                    return true;
+                                const auto it =
+                                    consumersIdx.find(valueId);
+                                if (it == consumersIdx.end()) return true;
+                                for (const auto& entry : it->second) {
+                                    const SsaOp* useOp = entry.first;
+                                    const size_t idx = entry.second;
+                                    if (useOp->op == POp::STORE) {
+                                        if (idx >= 2) {
+                                            // Spill store of the value
+                                            // itself: follow the reloads.
+                                            if (useOp->inputs.size() >= 2) {
+                                                const auto ls = loadsByAddr.find(
+                                                    useOp->inputs[1]);
+                                                if (ls != loadsByAddr.end())
+                                                    for (const SsaOp* load :
+                                                         ls->second)
+                                                        if (!load->output ||
+                                                            !self(self,
+                                                                  load->output)) {
+                                                            if (rnDbg)
+                                                                std::fprintf(
+                                                                    stderr,
+                                                                    "[rn-block] value 0x%llx reload-blocked\n",
+                                                                    (unsigned long long)valueId);
+                                                            return false;
+                                                        }
+                                            }
+                                            continue;
+                                        }
+                                        // Result is the store ADDRESS.
+                                        callSite.returnDereferenced = true;
+                                        return false;
+                                    }
+                                    if (useOp->op == POp::LOAD) {
+                                        // Result is the load address.
+                                        callSite.returnDereferenced = true;
+                                        return false;
+                                    }
+                                    if (useOp->op == POp::INT_CARRY ||
+                                        useOp->op == POp::INT_SCARRY ||
+                                        useOp->op == POp::INT_SBORROW) {
+                                        // Flag-expansion noise from an
+                                        // add/sub that has a narrow value
+                                        // output: the carry output feeds
+                                        // branches, not the value web.
+                                        continue;
+                                    }
+                                    if (useOp->op == POp::INT_ADD ||
+                                        useOp->op == POp::INT_SUB ||
+                                        useOp->op == POp::INT_MULT ||
+                                        useOp->op == POp::INT_DIV ||
+                                        useOp->op == POp::INT_AND ||
+                                        useOp->op == POp::INT_OR ||
+                                        useOp->op == POp::INT_XOR ||
+                                        useOp->op == POp::INT_LEFT ||
+                                        useOp->op == POp::INT_RIGHT) {
+                                        callSite.returnArithmetic = true;
+                                        if (rnDbg)
+                                            std::fprintf(stderr,
+                                                "[rn-block] value 0x%llx arith op=%d\n",
+                                                (unsigned long long)valueId,
+                                                (int)useOp->op);
+                                        return false;
+                                    }
+                                    if (useOp->op == POp::CBRANCH ||
+                                        useOp->op == POp::BRANCH) {
+                                        callSite.returnBoolean = true;
+                                        continue;
+                                    }
+                                    switch (useOp->op) {
+                                    case POp::SUBPIECE:
+                                    case POp::INT_SEXT:
+                                    case POp::INT_ZEXT:
+                                    case POp::INT_EQUAL:
+                                    case POp::INT_NOTEQUAL:
+                                    case POp::INT_LESS:
+                                    case POp::INT_SLESS:
+                                    case POp::INT_LESSEQUAL:
+                                    case POp::INT_SLESSEQUAL:
+                                    case POp::BOOL_NEGATE:
+                                    case POp::BOOL_XOR:
+                                    case POp::BOOL_AND:
+                                    case POp::BOOL_OR:
+                                        continue;
+                                    case POp::COPY:
+                                        // Transparent width-preserving hop:
+                                        // judge the copy's own consumers.
+                                        if (useOp->output &&
+                                            !self(self, useOp->output))
+                                            return false;
+                                        continue;
+                                    default:
+                                        if (useOp->phi) {
+                                            // Phi merge: sound to follow -
+                                            // if all uses of the merged
+                                            // value are narrow, every input
+                                            // is only narrowly consumed.
+                                            if (useOp->output &&
+                                                !self(self, useOp->output))
+                                                return false;
+                                            continue;
+                                        }
+                                        // Unknown uses keep the result
+                                        // conservatively wide.
+                                        if (rnDbg)
+                                            std::fprintf(stderr,
+                                                "[rn-block] value 0x%llx op=%d phi=%d idx=%zu\n",
+                                                (unsigned long long)valueId,
+                                                (int)useOp->op,
+                                                (int)useOp->phi, idx);
+                                        return false;
+                                    }
                                 }
-                            }
+                                return true;
+                            };
+                            callSite.returnOnlyNarrowUses =
+                                narrowCheck(narrowCheck, operation.output);
+                        }
                         const SsaValue* result = ir.value(operation.output);
                         if (result) callSite.returnWidthBytes = result->size;
                     }
@@ -3366,6 +3501,9 @@ bool ProgramAnalysis::buildPipeline(const Program& program,
             bool returnDereferenced = false;
             bool returnBoolean = false;
             bool returnArithmetic = false;
+            // Every call site that observes the result consumes it through
+            // width-narrowing ops only.
+            bool allReturnsNarrow = true;
             // WS8: register offset -> global addresses passed as constants.
             std::map<uint64_t, std::set<uint64_t>> pointsTo;
         };
@@ -3402,6 +3540,8 @@ bool ProgramAnalysis::buildPipeline(const Program& program,
                             merged.type = mergeType(merged.type, info.type);
                     }
                     ev.anyReturnValue |= site.returnsValue;
+                    ev.allReturnsNarrow &=
+                        (!site.returnsValue || site.returnOnlyNarrowUses);
                     ev.returnDereferenced |= site.returnDereferenced;
                     ev.returnBoolean |= site.returnBoolean;
                     ev.returnArithmetic |= site.returnArithmetic;
@@ -3513,6 +3653,41 @@ bool ProgramAnalysis::buildPipeline(const Program& program,
                     if (sig.returnComponents.size() == 1)
                         sig.returnComponents[0] = sig.returnType;
                     changed = true;
+                } else if (kv.second.sites > 0 && kv.second.anyReturnValue &&
+                           kv.second.allReturnsNarrow &&
+                           !kv.second.returnDereferenced &&
+                           !tailDispatchers.count(kv.first) &&
+                           ((sig.returnType.kind == TypeKind::UNSIGNED_INT &&
+                             sig.returnType.bits == 64 && !sig.returnType.detail) ||
+                            (sig.returnType.kind == TypeKind::SIGNED_INT &&
+                             sig.returnType.bits == 64 && !sig.returnType.detail))) {
+                    // Every caller consumes the result only through
+                    // width-narrowing ops (subpiece/sext/zext/compare/bool):
+                    // the 64-bit ABI slot carries a 32-bit value.
+                    const TypeKind narrowKind = sig.returnType.kind;
+                    sig.returnType = {narrowKind, 32, 1};
+                    if (sig.returnComponents.size() == 1)
+                        sig.returnComponents[0] = sig.returnType;
+                    changed = true;
+                    if (std::getenv("RETNARROWDEBUG"))
+                        std::fprintf(stderr,
+                            "[retnarrow] callee 0x%llx -> %s32\n",
+                            (unsigned long long)kv.first,
+                            narrowKind == TypeKind::SIGNED_INT ? "int" : "uint");
+                } else if (std::getenv("RETNARROWDEBUG") &&
+                           kv.second.sites > 0 && kv.second.anyReturnValue &&
+                           !kv.second.returnDereferenced &&
+                           !tailDispatchers.count(kv.first) &&
+                           ((sig.returnType.kind == TypeKind::UNSIGNED_INT &&
+                             sig.returnType.bits == 64 && !sig.returnType.detail) ||
+                            (sig.returnType.kind == TypeKind::SIGNED_INT &&
+                             sig.returnType.bits == 64 && !sig.returnType.detail))) {
+                    std::fprintf(stderr,
+                        "[retnarrow] blocked 0x%llx sites=%zu anyRet=%d "
+                        "allNarrow=%d\n",
+                        (unsigned long long)kv.first, kv.second.sites,
+                        (int)kv.second.anyReturnValue,
+                        (int)kv.second.allReturnsNarrow);
                 }
                 // WS8: install the constant-argument points-to evidence on
                 // the callee - each set entry names a global object the

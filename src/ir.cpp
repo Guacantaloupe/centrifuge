@@ -757,6 +757,40 @@ void FunctionIR::seedSignatureTypes(
                 output->second.type =
                     mergeType(output->second.type, sig->second.returnType);
         }
+    // Seed 3 (callee -> caller, parameters): a direct call's argument
+    // values take the callee's refined parameter types.  Wrapper and
+    // forwarder functions therefore inherit the types of the functions
+    // they forward to, and the WS8 outer fixed point carries them back
+    // into the wrapper's own signature.  CALL inputs after the target are
+    // the ABI argument registers in abiArguments() order (entry live-ins
+    // materialize every argument register whenever a function contains a
+    // call), so positional alignment is exact for direct calls.
+    const auto callAbi = abiArguments(arch_, callingConvention_);
+    for (MidBlock& block : blocks_)
+        for (SsaOp& op : block.ops) {
+            if ((op.op != POp::CALL && op.op != POp::CALLIND) ||
+                op.inputs.size() < 2)
+                continue;
+            const MidValue* targetValue = value(op.inputs[0]);
+            if (!targetValue || !targetValue->constant) continue;
+            const auto sig = calleeSignatures.find(*targetValue->constant);
+            if (sig == calleeSignatures.end()) continue;
+            const size_t nargs =
+                std::min(op.inputs.size() - 1, callAbi.size());
+            for (size_t i = 0; i < nargs; ++i) {
+                const FunctionParameter* param = nullptr;
+                for (const FunctionParameter& p : sig->second.parameters)
+                    if (!p.onStack && p.registerOffset == callAbi[i].first) {
+                        param = &p;
+                        break;
+                    }
+                if (!param || param->type.bits == 0) continue;
+                const auto input = values_.find(op.inputs[1 + i]);
+                if (input != values_.end())
+                    input->second.type =
+                        mergeType(input->second.type, param->type);
+            }
+        }
 }
 
 void FunctionIR::inferTypes() {
@@ -933,6 +967,42 @@ void FunctionIR::inferTypes() {
                             if (op.op == POp::INT_ADD && !bConstant && aConstant)
                                 changed |= constrain(op.inputs[1],
                                     {TypeKind::POINTER, 64, 1});
+                            // Scaled-index addressing (base + index*scale)
+                            // leaves both ADD inputs non-constant, so the
+                            // rules above stay silent and the base never
+                            // learns it is a pointer.  When the result is
+                            // provably an address, discriminate by width:
+                            // a value that looks integer-narrow (<=32 bits)
+                            // is the index, the other input is the base.
+                            // Both-64-bit ambiguous cases conservatively
+                            // promote both: used as an address, at least
+                            // one of them is a pointer, and mergeType can
+                            // only widen, never corrupt an existing type.
+                            if (op.op == POp::INT_ADD && !aConstant &&
+                                !bConstant) {
+                                auto integerish = [&](const SsaValue* v) {
+                                    if (!v) return false;
+                                    if (v->type.bits != 0 &&
+                                        v->type.bits <= 32 &&
+                                        v->type.kind != TypeKind::POINTER)
+                                        return true;
+                                    return v->size > 0 && v->size <= 4;
+                                };
+                                const bool aInt = integerish(a);
+                                const bool bInt = integerish(b);
+                                if (aInt && !bInt)
+                                    changed |= constrain(op.inputs[0],
+                                        {TypeKind::POINTER, 64, 1});
+                                else if (bInt && !aInt)
+                                    changed |= constrain(op.inputs[1],
+                                        {TypeKind::POINTER, 64, 1});
+                                else if (!aInt && !bInt) {
+                                    changed |= constrain(op.inputs[0],
+                                        {TypeKind::POINTER, 64, 1});
+                                    changed |= constrain(op.inputs[1],
+                                        {TypeKind::POINTER, 64, 1});
+                                }
+                            }
                         }
                     }
                     break;

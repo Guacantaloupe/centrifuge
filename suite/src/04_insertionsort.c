@@ -1,4 +1,5 @@
 /* 04. InsertionSort family. */
+#include <stdint.h>
 #include <stddef.h>
 
 #define TAG(id) static volatile int tag_##id = __LINE__

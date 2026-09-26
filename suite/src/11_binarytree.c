@@ -1,4 +1,5 @@
 /* 11. Binary Tree family. */
+#include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
 

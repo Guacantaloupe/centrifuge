@@ -1,4 +1,5 @@
 /* 10. Linked List family. */
+#include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
 

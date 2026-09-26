@@ -1,4 +1,5 @@
 /* 05. Selection / Bubble / Shell family. */
+#include <stdint.h>
 #include <stddef.h>
 
 #define TAG(id) static volatile int tag_##id = __LINE__
@@ -88,7 +89,8 @@ void shell_shell_gaps(int *a, int n) {
 TAG(shell_knuth);
 void shell_knuth(int *a, int n) {
     MARK(shell_knuth);
-    for (int gap = 1; gap * 3 + 1 < n; gap = gap * 3 + 1)
+    int gap = 1;
+    for (; gap * 3 + 1 < n; gap = gap * 3 + 1)
         ;
     for (; gap > 0; gap = (gap - 1) / 3)
         for (int i = gap; i < n; i++) {

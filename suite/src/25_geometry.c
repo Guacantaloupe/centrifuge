@@ -1,4 +1,5 @@
 /* 25. Geometry family. */
+#include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <math.h>

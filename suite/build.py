@@ -31,7 +31,7 @@ VSDEV = (r'call "C:\Program Files\Microsoft Visual Studio\2022\Community'
 CONFIGS = {
     "msvc-o0-x64":   {"kind": "msvc", "opt": "/Od"},
     "msvc-o2-x64":   {"kind": "msvc", "opt": "/O2"},
-    "msvc-o3-x64":   {"kind": "msvc", "opt": "/O3"},
+    "msvc-o3-x64":   {"kind": "msvc", "opt": "/Ox"},  # MSVC has no /O3; /Ox = full opt
     "clang-o0-x64":  {"kind": "clang", "opt": "-O0"},
     "clang-o2-x64":  {"kind": "clang", "opt": "-O2"},
     "clang-o3-x64":  {"kind": "clang", "opt": "-O3"},
@@ -48,7 +48,7 @@ STAT_RE = re.compile(
     r"callers=(?P<callers>\d+) callees=(?P<callees>\d+)")
 PARAM_DEFAULT_RE = re.compile(r"^(u?int64_t|uint64_t) arg\d+$")
 DEF_RE = re.compile(
-    r"^\s*(?:static\s+)?[A-Za-z_][\w\s\*]*?\b(\w+)\s*\([^;{}]*\)\s*(?:\{|$)")
+    r"^\s*[A-Za-z_][\w\s\*]*?\b(\w+)\s*\([^;{}]*\)\s*(?:\{|$)")
 CONTROL = {"if", "for", "while", "switch", "return", "sizeof"}
 
 
@@ -56,6 +56,8 @@ def defined_names(src: Path):
     names = set()
     classes = set()
     for line in src.read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("static"):
+            continue  # internal linkage: cannot be exported or named on MSVC
         m = DEF_RE.match(line)
         if m and m.group(1) not in CONTROL:
             names.add(m.group(1))
@@ -260,6 +262,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--family", default="")
     ap.add_argument("--config", default="")
+    ap.add_argument("--merge", action="store_true",
+                    help="merge into existing report.json (batched runs)")
     ap.add_argument("--configs", action="store_true",
                     help="list configs and exit")
     args = ap.parse_args()
@@ -271,6 +275,9 @@ def main():
 
     OUT.mkdir(exist_ok=True)
     REPORT.mkdir(exist_ok=True)
+    results = {}
+    if args.merge and (REPORT / "report.json").exists():
+        results = json.loads((REPORT / "report.json").read_text())
     families = sorted((ROOT / "src").glob("*.*"))
     if args.family:
         wanted_f = args.family.split(",")
@@ -283,9 +290,8 @@ def main():
         wanted = args.config.split(",")
         configs = [c for c in configs if c in wanted]
 
-    results = {}
     for src in families:
-        results[src.stem] = {}
+        results.setdefault(src.stem, {})
     jobs = [(src, cfg_name) for src in families for cfg_name in configs]
     import concurrent.futures as cf
 
@@ -314,18 +320,23 @@ def main():
         return fam, cfg_name, info
 
     with cf.ThreadPoolExecutor(max_workers=6) as pool:
-        for fam, cfg_name, info in pool.map(run_job, jobs):
+        futs = [pool.submit(run_job, j) for j in jobs]
+        for fut in cf.as_completed(futs):
+            fam, cfg_name, info = fut.result()
             results[fam][cfg_name] = info
             print(f"{fam} {cfg_name}: {info.get('status')}", flush=True)
+            # incremental write so a killed batch keeps finished cells
+            (REPORT / "report.json").write_text(json.dumps(results, indent=1))
 
     (REPORT / "report.json").write_text(json.dumps(results, indent=1))
 
-    cols = configs
+    cols = list(CONFIGS)
     lines = ["# Decompilation quality report", "",
              "cell = params typed % (signature recovery)", "",
              "| family | " + " | ".join(cols) + " |",
              "|---|" + "---|" * len(cols)]
-    for fam, per in results.items():
+    for fam in sorted(results):
+        per = results[fam]
         row = [fam]
         for c in cols:
             r = per.get(c, {})
